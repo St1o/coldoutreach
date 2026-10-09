@@ -272,7 +272,10 @@ class RateLimiterTest(unittest.TestCase):
 # ---- закрытая выгрузка «новые компании» (/leads) ----
 
 import datetime
+import io
 import tempfile
+
+import openpyxl
 
 import leads
 from leads_job import LeadsJob
@@ -373,13 +376,16 @@ class LeadsWebTest(unittest.TestCase):
         self.assertIn("[1/1] 7707083004: ok", data["log"])
         self.assertEqual(self.calls, [(datetime.date(2026, 10, 9), 5)])
 
+        self.assertEqual(data["header"], ["Название", "ФИО директора", "Почта", "Основной ОКВЭД"])
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", ""]])        # таблица на странице
+
         status, headers, body = self.request("/api/leads/download")
         self.assertEqual(status, 200)
-        self.assertIn("text/csv", headers["Content-Type"])
-        self.assertIn('filename="leads_2026-10-09.csv"', headers["Content-Disposition"])
-        self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
-        self.assertIn("Название;ФИО директора;Почта".encode(), body)
-        self.assertIn("ФИРМА;Иванов Иван;a@b.ru".encode(), body)
+        self.assertIn("spreadsheetml.sheet", headers["Content-Type"])
+        self.assertIn('filename="leads_2026-10-09.xlsx"', headers["Content-Disposition"])
+        sheet = openpyxl.load_workbook(io.BytesIO(body)).active
+        self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
+                         [["Название", "ФИО директора", "Почта", "Основной ОКВЭД"], ["ФИРМА", "Иванов Иван", "a@b.ru", None]])
 
     def test_empty_date_means_today_in_moscow(self):
         job = self.start()

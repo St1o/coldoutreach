@@ -145,6 +145,15 @@ def count(state: dict, status: str) -> int:
     return sum(1 for entry in state.values() if entry["status"] == status)
 
 
+WEB_HEADER = FIELDS + [OKVED_FIELD]
+
+
+def table_rows(state: dict) -> list:
+    """Строки таблицы для сайта и Excel-файла: организации с почтой, в порядке проверки."""
+    return [[entry["name"], entry["director"], entry["email"], entry.get("okved", "")]
+            for entry in state.values() if entry["status"] == OK]
+
+
 def _wait(seconds: float, should_stop, sleep) -> bool:
     """Ждёт, проверяя каждую секунду, не попросили ли остановиться. True - остановили."""
     remaining = seconds

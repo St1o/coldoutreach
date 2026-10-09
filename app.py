@@ -38,6 +38,7 @@ from leads_job import JobRunning, LeadsJob
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "index.html")
 LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
@@ -285,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "Таблицы пока нет.")
         else:
             name, content = table
-            self._send(200, content, "text/csv; charset=utf-8",
+            self._send(200, content, XLSX_TYPE,
                        [("Content-Disposition", f'attachment; filename="{name}"')])
 
     def do_POST(self):

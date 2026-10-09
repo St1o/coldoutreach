@@ -58,6 +58,13 @@
     color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
   }
   textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .table-wrap { max-height: 360px; overflow: auto; margin: 0 0 12px; border: 1px solid var(--line); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th, td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: break-word; }
+  td:nth-child(3) { white-space: nowrap; }          /* почта не переносится посреди адреса */
+  th { position: sticky; top: 0; background: var(--card); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  .note { color: var(--muted); font-size: .85rem; margin: 8px 0 0; }
   pre {
     margin: 0; padding: 12px; max-height: 260px; overflow: auto; font-size: .8rem;
     background: var(--bg); border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
@@ -68,7 +75,7 @@
 <body>
 <main>
   <h1>Новые компании: ФИО и почта</h1>
-  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора и почта берутся из API Checko; в таблицу попадают только организации с почтой.</p>
+  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора, почта и вид деятельности берутся из API Checko; в таблицу попадают только организации с почтой. Таблица заполняется на этой странице по мере проверки.</p>
 
   <form id="form" class="card" autocomplete="off">
     <div class="field">
@@ -102,8 +109,10 @@
       <div><b id="n-no">0</b><span>без почты</span></div>
       <div><b id="n-retry">0</b><span>проверить позже</span></div>
     </div>
+    <div id="table-wrap" class="table-wrap" hidden><table id="rows"></table></div>
     <pre id="log"></pre>
     <p><button id="download" type="button" hidden>Скачать таблицу</button></p>
+    <p id="download-note" class="note" hidden>Файл Excel (.xlsx). В Google Таблицы: Файл → Импортировать → Загрузить.</p>
   </section>
 </main>
 
@@ -142,8 +151,28 @@ async function api(path, options) {
   return response;
 }
 
+let lastRows = '';
+function renderTable(header, rows) {
+  const key = JSON.stringify(rows);
+  if (key === lastRows) return;                    // ничего не изменилось - не перерисовываем
+  lastRows = key;
+  const table = $('rows');
+  table.replaceChildren();
+  const head = table.createTHead().insertRow();
+  header.forEach((title) => { const th = document.createElement('th'); th.textContent = title; head.append(th); });
+  const body = table.createTBody();
+  rows.forEach((row) => {
+    const tr = body.insertRow();
+    row.forEach((value) => { tr.insertCell().textContent = value; });   // textContent: чужой текст не станет разметкой
+  });
+  const wrap = $('table-wrap');
+  wrap.hidden = rows.length === 0;
+  wrap.scrollTop = wrap.scrollHeight;              // свежие строки видно сразу
+}
+
 function render(data) {
   $('progress').hidden = false;
+  renderTable(data.header || [], data.rows || []);
   $('n-ok').textContent = data.counts.ok;
   $('n-no').textContent = data.counts.no_email;
   $('n-retry').textContent = data.counts.retry;
@@ -151,6 +180,7 @@ function render(data) {
   log.textContent = data.log.join('\n');
   log.scrollTop = log.scrollHeight;
   $('download').hidden = !data.has_table;
+  $('download-note').hidden = !data.has_table;
 }
 
 async function poll(quiet) {
@@ -230,7 +260,7 @@ $('download').addEventListener('click', async () => {
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     const match = (response.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
-    link.download = match ? match[1] : 'leads.csv';
+    link.download = match ? match[1] : 'leads.xlsx';
     document.body.append(link);
     link.click();
     link.remove();

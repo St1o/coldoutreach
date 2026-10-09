@@ -13,6 +13,7 @@ from datetime import date
 from typing import Optional
 
 import leads
+import xlsx_table
 from checko_api import CheckoApi
 from checko_updates import PastedPages
 
@@ -102,24 +103,28 @@ class LeadsJob:
             state, message = self._state, self._message
             target, limit, out = self._target, self._limit, self._out
         counts = {leads.OK: 0, leads.NO_EMAIL: 0, leads.RETRY: 0}
+        rows = []
         if out:
             saved = leads.load_state(leads.state_path(out))
             counts = {status: leads.count(saved, status) for status in counts}
+            rows = leads.table_rows(saved)
         return {
             "state": state,
             "message": message,
             "date": target.isoformat() if target else "",
             "limit": limit,
             "counts": counts,
+            "header": leads.WEB_HEADER,
+            "rows": rows,                      # таблица целиком: страница показывает её по мере заполнения
             "log": list(self._lines),
             "has_table": bool(out and os.path.exists(out) and counts[leads.OK]),
             "api_available": self.api_available,
         }
 
     def table(self):
-        """(имя файла, содержимое CSV) или None."""
+        """(имя файла .xlsx, содержимое) или None, если выгрузку ещё не запускали."""
         out = self._out
         if not out or not os.path.exists(out):
             return None
-        with open(out, "rb") as fh:
-            return os.path.basename(out), fh.read()
+        rows = leads.table_rows(leads.load_state(leads.state_path(out)))
+        return os.path.splitext(os.path.basename(out))[0] + ".xlsx", xlsx_table.build(leads.WEB_HEADER, rows)
