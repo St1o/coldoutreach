@@ -4,7 +4,7 @@ from datetime import date
 import requests
 
 from checko_updates import (
-    CheckoBlocked, CheckoClient, CheckoError, page_url_template, parse_page,
+    CheckoBlocked, CheckoClient, CheckoError, PastedPages, items_from_text, page_url_template, parse_page,
 )
 from egrul_inn_search import validate_inn
 
@@ -171,6 +171,38 @@ class NewCompaniesTest(unittest.TestCase):
         client, _ = make_client({BASE: requests.ConnectionError("нет сети")})
         with self.assertRaises(CheckoError):
             client.new_companies(date(2026, 10, 9), pause=0)
+
+
+PASTED = (
+    "Новые организации\nОрганизации с 1 по 100 из 2000\n"
+    "1. ООО <<ТАТЬЯНА>> & Ко\n624992, Свердловская область, д. 23\n"
+    "Дата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН {a}\n"
+    "2.\tООО \"ФИРМА\"\n620042, г. Екатеринбург\n"
+    "Дата регистрации\t9 октября 2026 года\tОГРН 1269600032888\tИНН {b}\n"
+    "3. ООО \"СТАРАЯ\"\nДата регистрации 8 октября 2026 года ОГРН 1269600032855 ИНН {c}\n"
+    "4. ООО \"ДУБЛЬ\"\nДата регистрации 9 октября 2026 года ОГРН 1269600032888 ИНН {b}\n"
+).format(a=INNS[1], b=INNS[2], c=INNS[3])
+
+
+class PastedPagesTest(unittest.TestCase):
+    def test_plain_text_with_angle_brackets_in_names(self):
+        items = items_from_text(PASTED)
+        self.assertEqual([i.inn for i in items], [INNS[1], INNS[2], INNS[3], INNS[2]])
+
+    def test_filters_by_date_and_removes_duplicates(self):
+        found = PastedPages(PASTED).new_companies(date(2026, 10, 9))
+        self.assertEqual([c.inn for c in found], [INNS[1], INNS[2]])
+        self.assertEqual([c.inn for c in PastedPages(PASTED).new_companies(date(2026, 10, 8))], [INNS[3]])
+
+    def test_several_pages_pasted_one_after_another(self):
+        text = PASTED + "\n" + PASTED.replace(INNS[1], INNS[4]).replace("9 октября", "8 октября")
+        found = PastedPages(text).new_companies(date(2026, 10, 9))
+        self.assertEqual([c.inn for c in found], [INNS[1], INNS[2]])
+
+    def test_nothing_for_the_day(self):
+        self.assertEqual(PastedPages(PASTED).new_companies(date(2026, 10, 1)), [])
+        self.assertEqual(PastedPages("").new_companies(date(2026, 10, 9)), [])
+        self.assertEqual(PastedPages("просто текст без организаций").new_companies(date(2026, 10, 9)), [])
 
 
 if __name__ == "__main__":

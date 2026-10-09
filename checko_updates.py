@@ -86,15 +86,10 @@ class _PageParser(HTMLParser):
             self._link_text.append(data)
 
 
-def parse_page(html: str):
-    """-> (список NewCompany, ссылки пагинации [(адрес, номер)])."""
-    parser = _PageParser()
-    parser.feed(html)
-    parser.close()
-    text = " ".join(" ".join(parser.chunks).split())
-
+def items_from_text(text: str) -> list:
+    """Строки «Дата регистрации ... ОГРН ... ИНН ...» из видимого текста страницы."""
     items = []
-    for match in ITEM_RE.finditer(text):
+    for match in ITEM_RE.finditer(" ".join(text.split())):
         day, month, year, ogrn, inn = match.groups()
         month_no = MONTHS.get(month.lower())
         if not month_no or not validate_inn(inn):
@@ -104,6 +99,15 @@ def parse_page(html: str):
         except ValueError:
             continue
         items.append(NewCompany(inn=inn, ogrn=ogrn, reg_date=reg_date))
+    return items
+
+
+def parse_page(html: str):
+    """-> (список NewCompany, ссылки пагинации [(адрес, номер)])."""
+    parser = _PageParser()
+    parser.feed(html)
+    parser.close()
+    items = items_from_text(" ".join(parser.chunks))
 
     # Названия: ссылки на организации по порядку; берём, только если их ровно столько же, сколько строк
     names = [text_ for href, text_ in parser.links
@@ -177,4 +181,20 @@ class CheckoClient:
                 break               # дальше только более старые регистрации
             if page < max_pages:
                 time.sleep(pause)
+        return found
+
+
+class PastedPages:
+    """Те же организации из текста, который пользователь скопировал со страниц Checko в
+    своём браузере (Ctrl+A, Ctrl+C). Нужен, когда Checko не отдаёт страницы серверу."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def new_companies(self, target: date, max_pages: int = 25) -> list:
+        found, seen = [], set()
+        for item in items_from_text(self.text):
+            if item.reg_date == target and item.inn not in seen:
+                seen.add(item.inn)
+                found.append(item)
         return found

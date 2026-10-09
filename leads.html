@@ -48,6 +48,14 @@
   .counts { display: flex; gap: 20px; flex-wrap: wrap; margin: 0 0 12px; }
   .counts b { font-size: 1.4rem; display: block; }
   .counts span { color: var(--muted); font-size: .85rem; }
+  details { margin: 0 0 14px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { color: var(--muted); font-size: .9rem; margin: 8px 0; }
+  textarea {
+    width: 100%; min-height: 120px; padding: 12px 14px; font: inherit; font-size: .85rem;
+    color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  }
+  textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   pre {
     margin: 0; padding: 12px; max-height: 260px; overflow: auto; font-size: .8rem;
     background: var(--bg); border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
@@ -75,6 +83,14 @@
         <input id="limit" type="number" min="0" max="2000" value="5">
       </div>
     </div>
+    <details id="paste">
+      <summary>Checko не пускает сервер? Вставьте текст страниц сами</summary>
+      <p>Откройте <b>checko.ru/company/updates</b> в своём браузере, нажмите Ctrl+A, затем Ctrl+C и вставьте
+         сюда (Ctrl+V). Если нужный день занимает несколько страниц, откройте вторую, третью и так далее и
+         добавляйте их текст сюда же, пока даты не станут вчерашними. Сервер возьмёт из текста организации
+         за выбранный день.</p>
+      <textarea id="text" spellcheck="false" placeholder="Текст страниц Checko…"></textarea>
+    </details>
     <button id="start" type="submit">Запустить</button>
     <p id="status" role="status" aria-live="polite"></p>
   </form>
@@ -135,6 +151,9 @@ async function poll() {
     } else {
       $('start').disabled = false;
       const kind = data.state === 'done' ? 'ok' : (data.state === 'idle' ? '' : 'error');
+      if (data.state === 'stopped' && data.log.join(' ').includes('Checko недоступен')) {
+        $('paste').open = true;
+      }
       setStatus(data.message || '', kind);
     }
   } catch (error) {
@@ -152,7 +171,7 @@ $('form').addEventListener('submit', async (event) => {
     await api('/api/leads/start', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
-      body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0) }),
+      body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0), text: $('text').value }),
     });
     poll();
   } catch (error) {

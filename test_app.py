@@ -4,6 +4,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 from app import RateLimiter, Service, make_server
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord, EgrulTimeout
@@ -290,6 +291,7 @@ class LeadsWebTest(unittest.TestCase):
 
     def fake_run(self, target, out, limit=0, log=print, **kwargs):
         self.calls.append((target, limit))
+        self.kwargs = kwargs
         log("Найдено организаций: 1")
         if self.gate:
             self.gate.wait(5)
@@ -399,8 +401,28 @@ class LeadsWebTest(unittest.TestCase):
             self.assertEqual(self.request("/api/leads/start", "POST", body)[0], 400, body)
         self.assertEqual(self.request("/api/leads/start", "POST", b"not json")[0], 400)
         self.assertEqual(self.request("/api/leads/start", "POST", b"")[0], 400)
-        self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 3000 + b"}")[0], 400)
+        with mock.patch("app.MAX_BODY", 500):                  # слишком большое тело запроса
+            self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 600 + b"}")[0], 400)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"text": 123})[0], 400)
         self.assertEqual(self.calls, [])
+
+    def test_pasted_text_replaces_checko(self):
+        from checko_updates import PastedPages
+        job = self.start()
+        text = ("Дата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН 7707083004 "
+                "Дата регистрации 8 октября 2026 года ОГРН 1269600032855 ИНН 7707083011")
+        self.assertEqual(self.request("/api/leads/start", "POST",
+                                      {"date": "2026-10-09", "limit": 0, "text": text})[0], 202)
+        job.join(5)
+        checko = self.kwargs["checko"]
+        self.assertIsInstance(checko, PastedPages)
+        self.assertEqual([c.inn for c in checko.new_companies(datetime.date(2026, 10, 9))], ["7707083004"])
+
+    def test_without_pasted_text_checko_is_read_by_the_server(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "text": "   \n "})
+        job.join(5)
+        self.assertNotIn("checko", self.kwargs)
 
     def test_stop_and_error_states(self):
         job = self.start()

@@ -38,7 +38,7 @@ from leads_job import JobRunning, LeadsJob
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "index.html")
 LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
-MAX_BODY = 2048
+MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
 CSP = ("default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -305,11 +305,14 @@ class Handler(BaseHTTPRequestHandler):
             limit = int(body.get("limit") or 0)
             if not 0 <= limit <= 2000:
                 raise ValueError
+            text = body.get("text") or ""
+            if not isinstance(text, str):
+                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
-            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество от 0 до 2000.")
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество от 0 до 2000, текст не больше 2 МБ.")
             return
         try:
-            job.start(target, limit)
+            job.start(target, limit, text)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return
