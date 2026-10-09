@@ -7,6 +7,7 @@ from datetime import date
 from unittest import mock
 
 import leads
+from checko_api import CheckoApiError, CheckoApiNotFound, CheckoApiQuotaExceeded
 from checko_updates import CheckoBlocked, CheckoError, NewCompany
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord
 from egrul_pdf import ExtractError
@@ -72,7 +73,7 @@ def companies(*inns):
     return [NewCompany(inn=i, ogrn="1" * 13, reg_date=DAY, name=f"checko {i}") for i in inns]
 
 
-class LeadsTest(unittest.TestCase):
+class LeadsCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -97,6 +98,9 @@ class LeadsTest(unittest.TestCase):
     def standard_egrul(self):
         return FakeEgrul({A: (b"with-email", ""), B: (b"no-email", ""), C: None})
 
+
+
+class LeadsTest(LeadsCase):
     # ---- результат ----
 
     def test_only_companies_with_email_are_in_the_table(self):
@@ -240,6 +244,78 @@ class LeadsTest(unittest.TestCase):
     def test_nothing_found_still_writes_an_empty_table(self):
         self.assertEqual(self.run_leads(self.standard_egrul(), FakeChecko([])), 0)
         self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+
+
+class FakeApi:
+    """Подставной API Checko: по ИНН отдаёт готовый ответ или бросает ошибку."""
+
+    def __init__(self, table):
+        self.table = table
+        self.asked = []
+
+    def company(self, inn):
+        self.asked.append(inn)
+        result = self.table[inn]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def api_payload(email="", register=True, fio="Иванов Иван Иванович"):
+    body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
+    if email and register:
+        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": email}}
+    elif email:
+        body["data"]["Контакты"] = {"Емэйл": [email]}
+    return body
+
+
+class ApiSourceTest(LeadsCase):
+    """Тот же конвейер, но данные идут из API Checko, а не из выписок ФНС."""
+
+    def run_api(self, api, checko=None, **kwargs):
+        return self.run_leads(FakeEgrul({}), checko, process=lambda c: leads.process_company_api(api, c), **kwargs)
+
+    def test_statuses_and_table(self):
+        api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
+        self.assertEqual(self.run_api(api), 0)
+        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"],
+                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru"]])
+        statuses = {inn: e["status"] for inn, e in self.state().items()}
+        self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
+        self.assertIn("нет в Checko", self.state()[C]["note"])
+
+    def test_contact_email_is_marked(self):
+        self.run_api(FakeApi({A: api_payload("c@example.ru", register=False)}), FakeChecko(companies(A)))
+        self.assertEqual(self.state()[A]["status"], leads.OK)
+        self.assertIn("не из ЕГРЮЛ", self.state()[A]["note"])
+
+    def test_rerun_asks_only_for_what_is_pending(self):
+        first = FakeApi({A: api_payload("a@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
+        self.run_api(first)
+        second = FakeApi({C: api_payload("c@example.ru")})
+        self.run_api(second)
+        self.assertEqual(second.asked, [C])
+        self.assertEqual(len(self.read_csv()), 3)
+
+    def test_exhausted_quota_stops_the_run_and_keeps_results(self):
+        api = FakeApi({A: api_payload("a@example.ru"), B: CheckoApiQuotaExceeded("лимит"), C: api_payload("c@example.ru")})
+        self.assertEqual(self.run_api(api), 6)
+        self.assertEqual(api.asked, [A, B])                      # на третью уже не пошли
+        self.assertEqual(len(self.read_csv()), 2)
+        self.assertIn("Лимит API Checko исчерпан", "\n".join(self.logs))
+
+    def test_errors_in_a_row_stop_the_run(self):
+        api = FakeApi({i: CheckoApiError("HTTP 500") for i in (A, B, C)})
+        self.assertEqual(self.run_api(api, max_errors_in_a_row=2), 5)
+        self.assertEqual(api.asked, [A, B])
+
+    def test_log_has_no_personal_data(self):
+        self.run_api(FakeApi({A: api_payload("secret@example.ru", fio="Тайный Человек"), B: api_payload(""), C: api_payload("")}))
+        text = "\n".join(self.logs)
+        for secret in ("secret@example.ru", "Тайный", "ФИРМА"):
+            self.assertNotIn(secret, text)
+
 
 
 class HelpersTest(unittest.TestCase):

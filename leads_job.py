@@ -13,6 +13,7 @@ from datetime import date
 from typing import Optional
 
 import leads
+from checko_api import CheckoApi
 from checko_updates import PastedPages
 
 MIN_TOKEN_LENGTH = 12
@@ -23,9 +24,11 @@ STATE_LABELS = {
         "повторно не проверяются."),
     3: "Checko недоступен с этого сервера, подробности в журнале ниже.",
     4: "Остановлено вами. Готовая часть сохранена.",
+    6: "Лимит запросов API Checko исчерпан. Готовая часть сохранена: продолжите завтра или смените тариф.",
     5: "Остановлено: несколько ошибок подряд, сайт ФНС отвечает не как обычно. Причина в журнале ниже; повторите позже.",
 }
 CAPTCHA_WAIT = 600          # секунд: при капче ФНС ждём и продолжаем
+API_PAUSE = 0.3             # секунд между запросами к API Checko (лимит API - 32 в секунду)
 
 
 class JobRunning(Exception):
@@ -33,9 +36,11 @@ class JobRunning(Exception):
 
 
 class LeadsJob:
-    def __init__(self, token: str = "", run=leads.run, out_dir: Optional[str] = None):
+    def __init__(self, token: str = "", run=leads.run, out_dir: Optional[str] = None,
+                 api_key: str = "", api=None):
         self.token = token if len(token or "") >= MIN_TOKEN_LENGTH else ""
         self._run = run
+        self._api = api or (CheckoApi(api_key) if api_key else None)
         self._out_dir = out_dir or tempfile.gettempdir()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -48,6 +53,10 @@ class LeadsJob:
         self._out: Optional[str] = None
 
     @property
+    def api_available(self) -> bool:
+        return self._api is not None
+
+    @property
     def enabled(self) -> bool:
         return bool(self.token)
 
@@ -55,7 +64,8 @@ class LeadsJob:
         return self.enabled and hmac.compare_digest(
             (candidate or "").encode("utf-8"), self.token.encode("utf-8"))
 
-    def start(self, target: date, limit: int, text: str = "", pause: float = 6.0) -> None:
+    def start(self, target: date, limit: int, text: str = "", pause: float = 6.0,
+              source: str = "egrul") -> None:
         with self._lock:
             if self._state == "running":
                 raise JobRunning()
@@ -64,11 +74,14 @@ class LeadsJob:
             self._target, self._limit = target, limit
             self._out = os.path.join(self._out_dir, f"leads_{target.isoformat()}.csv")
             self._lines.clear()
-            self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text, pause), daemon=True)
+            self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text, pause, source), daemon=True)
             self._thread.start()
 
-    def _work(self, target, limit, out, text="", pause=6.0):
+    def _work(self, target, limit, out, text="", pause=6.0, source="egrul"):
         extra = {"checko": PastedPages(text)} if text.strip() else {}
+        if source == "api":                         # API не ограничивает капчей: пауза нужна только для вежливости
+            extra["process"] = lambda company: leads.process_company_api(self._api, company)
+            pause = API_PAUSE
         try:
             code = self._run(target, out, limit=limit, pause=pause, log=self._lines.append,
                             captcha_wait=CAPTCHA_WAIT, should_stop=self._stop.is_set, **extra)
@@ -107,6 +120,7 @@ class LeadsJob:
             "counts": counts,
             "log": list(self._lines),
             "has_table": bool(out and os.path.exists(out) and counts[leads.OK]),
+            "api_available": self.api_available,
         }
 
     def table(self):

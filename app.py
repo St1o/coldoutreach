@@ -315,11 +315,18 @@ class Handler(BaseHTTPRequestHandler):
             pause = float(body.get("pause") or 6)
             if not 1 <= pause <= 60:
                 raise ValueError
+            source = body.get("source") or ("api" if job.api_available else "egrul")
+            if source not in ("api", "egrul"):
+                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
             self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, пауза 1-60 с, текст до 2 МБ.")
             return
+        if source == "api" and not job.api_available:
+            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY на сервере "
+                             "или выберите источник «Выписки ФНС».")
+            return
         try:
-            job.start(target, limit, text, pause)
+            job.start(target, limit, text, pause, source)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return
@@ -379,12 +386,13 @@ def main(argv=None):
                         help="сколько прокси хостинга стоит перед сайтом (0 - нет)")
     args = parser.parse_args(argv)
 
-    leads_job = LeadsJob(env("LEADS_TOKEN", ""))
+    leads_job = LeadsJob(env("LEADS_TOKEN", ""), api_key=env("CHECKO_API_KEY", ""))
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
                          RateLimiter(args.rate_limit), args.trusted_proxies, leads_job)
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
     if leads_job.enabled:
-        print("Страница /leads включена (пароль из LEADS_TOKEN).")
+        print("Страница /leads включена (пароль из LEADS_TOKEN)."
+              + (" Источник API Checko доступен." if leads_job.api_available else ""))
     elif env("LEADS_TOKEN"):
         print("LEADS_TOKEN короче 12 знаков: страница /leads отключена.")
     try:

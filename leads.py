@@ -24,6 +24,9 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
+from checko_api import (
+    CheckoApiError, CheckoApiNotFound, CheckoApiQuotaExceeded, parse_company,
+)
 from checko_updates import CheckoBlocked, CheckoClient, CheckoError
 from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
@@ -70,6 +73,29 @@ def process_company(client: EgrulClient, company) -> dict:
     entry["email"] = data.email
     entry["director"] = data.director or director_from_search(record.director)
     entry["status"] = OK if data.email else NO_EMAIL
+    return entry
+
+
+def process_company_api(api, company) -> dict:
+    """Одна организация через API Checko -> запись состояния. Исчерпанный лимит пробрасывается."""
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    try:
+        info = parse_company(api.company(company.inn))
+    except CheckoApiQuotaExceeded:
+        raise
+    except CheckoApiNotFound:
+        entry["note"] = "нет в Checko (возможно, ещё не появилась)"
+        return entry
+    except CheckoApiError as exc:
+        entry["note"] = f"ошибка: {exc}"[:200]
+        return entry
+
+    entry["name"] = info.name or company.name
+    entry["director"] = info.director
+    entry["email"] = info.email
+    entry["status"] = OK if info.email else NO_EMAIL
+    if info.email and not info.email_from_register:
+        entry["note"] = "почта из контактов Checko, не из ЕГРЮЛ"
     return entry
 
 
@@ -128,15 +154,19 @@ def _wait(seconds: float, should_stop, sleep) -> bool:
 
 def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: int = 25,
         checko=None, egrul=None, log=print, captcha_wait: float = 0.0, captcha_retries: int = 6,
-        should_stop=lambda: False, sleep=time.sleep, max_errors_in_a_row: int = 5) -> int:
+        should_stop=lambda: False, sleep=time.sleep, max_errors_in_a_row: int = 5,
+        process=None) -> int:
     """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
     4 - остановлено пользователем, 5 - слишком много ошибок подряд (ФНС отвечает не как обычно:
-    дальше стучаться бессмысленно).
+    дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko.
+
+    process(company) -> запись состояния: по умолчанию выписки ФНС (egrul), можно подставить API.
 
     captcha_wait > 0: при капче ждать столько секунд и пробовать ту же организацию снова
     (не больше captcha_retries раз подряд); пауза - это ожидание, а не обход ограничения."""
     checko = checko or CheckoClient()
     egrul = egrul or EgrulClient()
+    process = process or (lambda company: process_company(egrul, company))
 
     log(f"Ищем на Checko организации, зарегистрированные {target.isoformat()}...")
     try:
@@ -165,7 +195,11 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         entry, attempts = None, 0
         while entry is None:
             try:
-                entry = process_company(egrul, company)
+                entry = process(company)
+            except CheckoApiQuotaExceeded as exc:
+                log(f"Лимит API Checko исчерпан ({exc}). Результат сохранён: продолжите завтра или пополните тариф.")
+                code = 6
+                break
             except EgrulCaptchaRequired:
                 attempts += 1
                 if not captcha_wait or attempts > captcha_retries:
