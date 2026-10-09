@@ -1,0 +1,180 @@
+"""Новые организации за день -> таблица: название, ФИО директора, почта.
+
+Алгоритм:
+    1. Со страницы https://checko.ru/company/updates собрать ИНН организаций,
+       зарегистрированных в нужный день (checko_updates).
+    2. Для каждого ИНН найти организацию на egrul.nalog.ru и скачать выписку (egrul_inn_search).
+    3. Открыть выписку (PDF), взять ФИО руководителя и почту (egrul_pdf).
+    4. В таблицу попадают только организации с почтой.
+
+Результат - CSV (открывается в Excel) и служебный файл *.state.json рядом: в нём статус
+каждой организации. Он сохраняется после каждой организации, поэтому при остановке
+(капча, обрыв) готовое не пропадает, а повторный запуск продолжает с того же места.
+Организации без почты второй раз не проверяются; ошибки и «ещё нет в ЕГРЮЛ» - проверяются.
+
+Запуск:
+    python leads.py                          # сегодня (по Москве)
+    python leads.py --date 2026-10-09 --limit 50
+"""
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+
+from checko_updates import CheckoBlocked, CheckoClient, CheckoError
+from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
+from egrul_pdf import ExtractError, parse_extract, pdf_to_text
+
+FIELDS = ["Название", "ФИО директора", "Почта"]
+
+OK = "ok"                # есть почта - идёт в таблицу
+NO_EMAIL = "no_email"    # выписка получена, почты нет - в таблицу не идёт и повторно не проверяется
+RETRY = "retry"          # ошибка или ещё нет в ЕГРЮЛ - проверим при следующем запуске
+
+
+def today_moscow() -> date:
+    return datetime.now(timezone(timedelta(hours=3))).date()
+
+
+def director_from_search(raw: str) -> str:
+    """Руководитель из строки поиска egrul («Должность: ФИО») - запасной вариант."""
+    return raw.split(":", 1)[-1].strip() if raw else ""
+
+
+def process_company(client: EgrulClient, company) -> dict:
+    """Одна организация -> запись состояния. Капча пробрасывается наверх."""
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    try:
+        records = client.search_by_inn(company.inn)
+        if not records:
+            entry["note"] = "нет в ЕГРЮЛ (возможно, ещё не обновился)"
+            return entry
+        record = max(records, key=lambda r: r.is_active)
+        entry["name"] = record.short_name or record.name or company.name
+        pdf = client.download_extract(record)
+    except EgrulCaptchaRequired:
+        raise
+    except EgrulError as exc:
+        entry["note"] = f"ошибка: {exc}"[:200]
+        return entry
+
+    try:
+        data = parse_extract(pdf_to_text(pdf))
+    except ExtractError as exc:
+        entry["note"] = f"ошибка разбора выписки: {exc}"[:200]
+        return entry
+
+    entry["email"] = data.email
+    entry["director"] = data.director or director_from_search(record.director)
+    entry["status"] = OK if data.email else NO_EMAIL
+    return entry
+
+
+def state_path(out: str) -> str:
+    return os.path.splitext(out)[0] + ".state.json"
+
+
+def _write_atomic(path: str, write) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".part"
+    write(tmp)
+    os.replace(tmp, path)
+
+
+def load_state(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_results(out: str, state: dict) -> None:
+    """Служебный файл и таблица (только организации с почтой) перезаписываются целиком."""
+    def write_state(tmp):
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+
+    def write_csv(tmp):
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:    # BOM: Excel читает кириллицу
+            writer = csv.writer(fh, delimiter=";")
+            writer.writerow(FIELDS)
+            for entry in state.values():
+                if entry["status"] == OK:
+                    writer.writerow([entry["name"], entry["director"], entry["email"]])
+
+    _write_atomic(state_path(out), write_state)
+    _write_atomic(out, write_csv)
+
+
+def count(state: dict, status: str) -> int:
+    return sum(1 for entry in state.values() if entry["status"] == status)
+
+
+def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: int = 25,
+        checko=None, egrul=None, log=print) -> int:
+    """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен."""
+    checko = checko or CheckoClient()
+    egrul = egrul or EgrulClient()
+
+    log(f"Ищем на Checko организации, зарегистрированные {target.isoformat()}...")
+    try:
+        companies = checko.new_companies(target, max_pages=max_pages)
+    except CheckoBlocked as exc:
+        log(f"Checko недоступен: {exc}")
+        return 3
+    except CheckoError as exc:
+        log(f"Ошибка при чтении Checko: {exc}")
+        return 3
+    log(f"Найдено организаций: {len(companies)}")
+
+    state = load_state(state_path(out))
+    todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]
+    if state:
+        log(f"Уже проверено раньше: {len(companies) - len(todo)}; осталось: {len(todo)}")
+    if limit:
+        todo = todo[:limit]
+
+    code = 0
+    for number, company in enumerate(todo, 1):
+        if number > 1:
+            time.sleep(pause)               # не нагружаем сайт ФНС
+        try:
+            entry = process_company(egrul, company)
+        except EgrulCaptchaRequired:
+            log("ФНС просит капчу - останавливаемся. Результат сохранён, повторите позже.")
+            code = 2
+            break
+        state[company.inn] = entry
+        save_results(out, state)
+        # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
+        log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
+            + (f" ({entry['note']})" if entry["note"] else ""))
+
+    save_results(out, state)                # файл создаётся и когда обработать нечего
+    log(f"Готово. В таблице {out}: {count(state, OK)} организаций с почтой. "
+        f"Без почты (не включены): {count(state, NO_EMAIL)}. "
+        f"Проверить повторно: {count(state, RETRY)}.")
+    return code
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Новые организации за день: название, ФИО директора, почта")
+    parser.add_argument("--date", type=date.fromisoformat, default=None,
+                        help="дата регистрации ГГГГ-ММ-ДД (по умолчанию сегодня по Москве)")
+    parser.add_argument("--out", help="CSV-файл (по умолчанию leads_<дата>.csv)")
+    parser.add_argument("--limit", type=int, default=0, help="сколько организаций проверить за запуск (0 - все)")
+    parser.add_argument("--pause", type=float, default=2.0, help="пауза между организациями, с")
+    parser.add_argument("--max-pages", type=int, default=25, help="сколько страниц Checko просматривать")
+    args = parser.parse_args(argv)
+
+    target = args.date or today_moscow()
+    out = args.out or f"leads_{target.isoformat()}.csv"
+    return run(target, out, args.limit, args.pause, args.max_pages)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

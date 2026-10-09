@@ -1,0 +1,188 @@
+import csv
+import json
+import os
+import tempfile
+import unittest
+from datetime import date
+from unittest import mock
+
+import leads
+from checko_updates import CheckoBlocked, CheckoError, NewCompany
+from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord
+from egrul_pdf import ExtractError
+
+DAY = date(2026, 10, 9)
+A, B, C = "7707083004", "7707083011", "7707083029"      # с почтой / без почты / ещё нет в ЕГРЮЛ
+
+WITH_EMAIL = ("Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
+              "Сведения о лице, имеющем право без доверенности действовать от имени юридического лица\n"
+              "26 Фамилия\nИмя\nОтчество\nИВАНОВ\nИВАН\nИВАНОВИЧ\n27 ИНН 1\n")
+NO_EMAIL = WITH_EMAIL.split("11 ГРН\n")[1]
+NO_DIRECTOR = "Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
+PDFS = {b"with-email": WITH_EMAIL, b"no-email": NO_EMAIL, b"no-director": NO_DIRECTOR}
+
+
+class FakeChecko:
+    def __init__(self, companies=None, error=None):
+        self.companies, self.error = companies or [], error
+
+    def new_companies(self, target, max_pages=25):
+        if self.error:
+            raise self.error
+        return self.companies
+
+
+class FakeEgrul:
+    """Подставной клиент ЕГРЮЛ: по ИНН отдаёт запись и «PDF» (маркер из PDFS)."""
+
+    def __init__(self, table, errors=None):
+        self.table = table                  # ИНН -> (маркер PDF, director из поиска) либо None (нет в ЕГРЮЛ)
+        self.errors = errors or {}
+        self.searched = []
+
+    def search_by_inn(self, inn):
+        self.searched.append(inn)
+        if inn in self.errors:
+            raise self.errors[inn]
+        if self.table.get(inn) is None:
+            return []
+        marker, director = self.table[inn]
+        return [EgrulRecord(inn=inn, name=f"ООО ФИРМА {inn}", short_name=f"ФИРМА {inn}",
+                            director=director, token=marker.decode())]
+
+    def download_extract(self, record):
+        return record.token.encode()
+
+
+def companies(*inns):
+    return [NewCompany(inn=i, ogrn="1" * 13, reg_date=DAY, name=f"checko {i}") for i in inns]
+
+
+class LeadsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "out", "leads.csv")
+        self.logs = []
+        patcher = mock.patch("leads.pdf_to_text", side_effect=lambda pdf: PDFS[pdf])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_leads(self, egrul, checko=None, **kwargs):
+        checko = checko or FakeChecko(companies(A, B, C))
+        return leads.run(DAY, self.out, pause=0, checko=checko, egrul=egrul, log=self.logs.append, **kwargs)
+
+    def read_csv(self):
+        with open(self.out, encoding="utf-8-sig", newline="") as fh:
+            return list(csv.reader(fh, delimiter=";"))
+
+    def state(self):
+        with open(leads.state_path(self.out), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def standard_egrul(self):
+        return FakeEgrul({A: (b"with-email", ""), B: (b"no-email", ""), C: None})
+
+    # ---- результат ----
+
+    def test_only_companies_with_email_are_in_the_table(self):
+        self.assertEqual(self.run_leads(self.standard_egrul()), 0)
+        self.assertEqual(self.read_csv(), [
+            ["Название", "ФИО директора", "Почта"],
+            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"],
+        ])
+        statuses = {inn: e["status"] for inn, e in self.state().items()}
+        self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
+
+    def test_csv_is_excel_friendly(self):
+        self.run_leads(self.standard_egrul())
+        with open(self.out, "rb") as fh:
+            raw = fh.read()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))      # BOM
+        self.assertIn("Название;ФИО директора;Почта".encode(), raw)
+
+    def test_director_falls_back_to_search_result(self):
+        egrul = FakeEgrul({A: (b"no-director", "Генеральный директор: Петров Пётр Петрович")})
+        self.run_leads(egrul, FakeChecko(companies(A)))
+        self.assertEqual(self.read_csv()[1][1], "Петров Пётр Петрович")
+
+    def test_company_with_email_is_kept_even_without_director(self):
+        self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))
+        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru"])
+
+    def test_log_has_no_personal_data(self):
+        self.run_leads(self.standard_egrul())
+        text = "\n".join(self.logs)
+        for secret in ("Иванов", "sales@example.ru", "ФИРМА"):
+            self.assertNotIn(secret, text)
+        self.assertIn(A, text)
+
+    # ---- повторный запуск ----
+
+    def test_rerun_checks_only_what_needs_it(self):
+        self.run_leads(self.standard_egrul())
+        second = self.standard_egrul()
+        self.run_leads(second)
+        self.assertEqual(second.searched, [C])            # A и B повторно не проверяются
+
+    def test_retry_company_appears_when_registry_catches_up(self):
+        self.run_leads(self.standard_egrul())
+        later = FakeEgrul({A: (b"with-email", ""), B: (b"no-email", ""), C: (b"with-email", "")})
+        self.run_leads(later)
+        self.assertEqual([row[0] for row in self.read_csv()[1:]], [f"ФИРМА {A}", f"ФИРМА {C}"])
+
+    def test_error_is_retried_next_time(self):
+        egrul = FakeEgrul({A: (b"with-email", "")}, errors={A: EgrulError("таймаут")})
+        self.run_leads(egrul, FakeChecko(companies(A)))
+        self.assertEqual(self.state()[A]["status"], leads.RETRY)
+        self.assertIn("таймаут", self.state()[A]["note"])
+        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+        fixed = FakeEgrul({A: (b"with-email", "")})
+        self.run_leads(fixed, FakeChecko(companies(A)))
+        self.assertEqual(len(self.read_csv()), 2)
+
+    def test_unreadable_pdf_is_retry_not_no_email(self):
+        with mock.patch("leads.pdf_to_text", side_effect=ExtractError("битый")):
+            self.run_leads(FakeEgrul({A: (b"with-email", "")}), FakeChecko(companies(A)))
+        self.assertEqual(self.state()[A]["status"], leads.RETRY)
+
+    # ---- остановки ----
+
+    def test_captcha_stops_and_keeps_what_is_done(self):
+        egrul = FakeEgrul({A: (b"with-email", ""), B: (b"with-email", ""), C: (b"with-email", "")},
+                          errors={B: EgrulCaptchaRequired("капча")})
+        self.assertEqual(self.run_leads(egrul), 2)
+        self.assertEqual(egrul.searched, [A, B])           # на C уже не пошли
+        self.assertEqual(len(self.read_csv()), 2)           # A сохранён
+        self.assertIn(A, self.state())
+        self.assertNotIn(B, self.state())
+
+    def test_limit(self):
+        egrul = self.standard_egrul()
+        self.run_leads(egrul, limit=2)
+        self.assertEqual(egrul.searched, [A, B])
+
+    def test_checko_blocked_and_error(self):
+        for error in (CheckoBlocked("403"), CheckoError("вёрстка")):
+            self.assertEqual(self.run_leads(self.standard_egrul(), FakeChecko(error=error)), 3)
+
+    def test_nothing_found_still_writes_an_empty_table(self):
+        self.assertEqual(self.run_leads(self.standard_egrul(), FakeChecko([])), 0)
+        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+
+
+class HelpersTest(unittest.TestCase):
+    def test_director_from_search(self):
+        self.assertEqual(leads.director_from_search("Директор: Иванов Иван"), "Иванов Иван")
+        self.assertEqual(leads.director_from_search("Иванов Иван"), "Иванов Иван")
+        self.assertEqual(leads.director_from_search(""), "")
+
+    def test_state_path(self):
+        self.assertEqual(leads.state_path("a/leads_2026-10-09.csv"), "a/leads_2026-10-09.state.json")
+
+    def test_today_moscow_is_a_date(self):
+        self.assertIsInstance(leads.today_moscow(), date)
+
+
+if __name__ == "__main__":
+    unittest.main()

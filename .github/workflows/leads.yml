@@ -1,0 +1,51 @@
+name: Новые компании - ФИО и почта
+
+# Вкладка Actions -> «Новые компании - ФИО и почта» -> Run workflow.
+# Готовая таблица (leads.csv) появится внизу страницы запуска в разделе Artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Дата регистрации ГГГГ-ММ-ДД (пусто - сегодня по Москве)"
+        required: false
+        type: string
+      limit:
+        description: "Сколько организаций проверить за запуск (0 - все)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  leads:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Собрать таблицу
+        env:
+          DATE: ${{ inputs.date }}       # через переменные окружения, не подстановкой в команду
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          args=()
+          if [ -n "$DATE" ]; then args+=(--date "$DATE"); fi
+          python leads.py "${args[@]}" --limit "${LIMIT:-0}" --out out/leads.csv
+
+      # Таблица сохраняется и после остановки на капче (код выхода 2): готовое не пропадает.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: leads
+          path: out/leads.csv
+          if-no-files-found: warn
+          retention-days: 7
