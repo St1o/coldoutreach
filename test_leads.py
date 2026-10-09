@@ -261,8 +261,13 @@ class FakeApi:
         return result
 
 
-def api_payload(email="", register=True, fio="Иванов Иван Иванович"):
+OKVED = {"Код": "62.01", "Наим": "Разработка компьютерного программного обеспечения", "Версия": "2014"}
+
+
+def api_payload(email="", register=True, fio="Иванов Иван Иванович", okved=OKVED):
     body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
+    if okved:
+        body["data"]["ОКВЭД"] = okved
     if email and register:
         body["source_data"] = {"СвАдрЭлПочты": {"E-mail": email}}
     elif email:
@@ -279,8 +284,9 @@ class ApiSourceTest(LeadsCase):
     def test_statuses_and_table(self):
         api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.assertEqual(self.run_api(api), 0)
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"],
-                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru"]])
+        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта", "Основной ОКВЭД"],
+                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru",
+                                            "Разработка компьютерного программного обеспечения"]])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
         self.assertIn("нет в Checko", self.state()[C]["note"])
@@ -289,6 +295,11 @@ class ApiSourceTest(LeadsCase):
         self.run_api(FakeApi({A: api_payload("c@example.ru", register=False)}), FakeChecko(companies(A)))
         self.assertEqual(self.state()[A]["status"], leads.OK)
         self.assertIn("не из ЕГРЮЛ", self.state()[A]["note"])
+
+    def test_missing_okved_is_noted_and_left_empty(self):
+        self.run_api(FakeApi({A: api_payload("a@example.ru", okved=None)}), FakeChecko(companies(A)))
+        self.assertEqual(self.read_csv()[1][3], "")
+        self.assertIn("ОКВЭД не найден", self.state()[A]["note"])
 
     def test_rerun_asks_only_for_what_is_pending(self):
         first = FakeApi({A: api_payload("a@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})

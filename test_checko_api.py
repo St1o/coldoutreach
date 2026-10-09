@@ -73,6 +73,13 @@ class ParseCompanyTest(unittest.TestCase):
         info = parse_company(payload(Руковод=[], УпрОрг={"НаимПолн": "УК ООО"}))
         self.assertEqual(info.director, "")
 
+    def test_main_okved_is_the_activity_name_without_the_code(self):
+        okved = {"Код": "62.01", "Наим": "Разработка компьютерного программного обеспечения", "Версия": "2014"}
+        self.assertEqual(parse_company(payload(ОКВЭД=okved)).okved, "Разработка компьютерного программного обеспечения")
+        self.assertEqual(parse_company(payload(ОКВЭД={"Код": "62.01"})).okved, "")
+        self.assertEqual(parse_company(payload()).okved, "")
+        self.assertEqual(parse_company(payload(ОКВЭД=[1, 2])).okved, "")
+
     def test_falls_back_to_full_name(self):
         self.assertTrue(parse_company(payload(НаимСокр="")).name.startswith("ОБЩЕСТВО"))
 

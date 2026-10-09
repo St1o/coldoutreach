@@ -6,6 +6,7 @@
 Из ответа берутся:
     * название  - data.НаимСокр / data.НаимПолн;
     * директор  - data.Руковод[].ФИО (первый с ФИО);
+    * ОКВЭД     - название основного вида деятельности, data.ОКВЭД.Наим (код в таблицу не нужен);
     * почта     - сначала из исходных данных ЕГРЮЛ (source_data, это та же почта, что в выписке),
                   иначе из data.Контакты.Емэйл (контакты «из открытых источников», могут быть
                   неполными или устаревшими - такие случаи помечаются).
@@ -44,6 +45,7 @@ class CheckoApiQuotaExceeded(CheckoApiError):
 class CompanyInfo:
     name: str = ""
     director: str = ""
+    okved: str = ""                        # название основного вида деятельности: «Разработка компьютерного программного обеспечения»
     email: str = ""
     email_from_register: bool = False      # True - почта из ЕГРЮЛ, False - из контактов Checko
 
@@ -79,9 +81,15 @@ def _register_email(node) -> str:
     return ""
 
 
+def _main_okved(data: dict) -> str:
+    main = data.get("ОКВЭД")
+    name = main.get("Наим") if isinstance(main, dict) else None
+    return name.strip() if isinstance(name, str) else ""
+
+
 def parse_company(payload: dict) -> CompanyInfo:
     data = payload.get("data") or {}
-    info = CompanyInfo(name=data.get("НаимСокр") or data.get("НаимПолн") or "")
+    info = CompanyInfo(name=data.get("НаимСокр") or data.get("НаимПолн") or "", okved=_main_okved(data))
 
     for person in data.get("Руковод") or []:
         fio = (person.get("ФИО") or "").strip()

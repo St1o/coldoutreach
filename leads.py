@@ -32,6 +32,7 @@ from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
 
 FIELDS = ["Название", "ФИО директора", "Почта"]
+OKVED_FIELD = "Основной ОКВЭД"      # колонка есть, только если данные из API Checko (выписки ФНС ОКВЭД не разбирают)
 
 OK = "ok"                # есть почта - идёт в таблицу
 NO_EMAIL = "no_email"    # выписка получена, почты нет - в таблицу не идёт и повторно не проверяется
@@ -78,7 +79,7 @@ def process_company(client: EgrulClient, company) -> dict:
 
 def process_company_api(api, company) -> dict:
     """Одна организация через API Checko -> запись состояния. Исчерпанный лимит пробрасывается."""
-    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    entry = {"status": RETRY, "name": company.name, "director": "", "okved": "", "email": "", "note": ""}
     try:
         info = parse_company(api.company(company.inn))
     except CheckoApiQuotaExceeded:
@@ -92,10 +93,15 @@ def process_company_api(api, company) -> dict:
 
     entry["name"] = info.name or company.name
     entry["director"] = info.director
+    entry["okved"] = info.okved
     entry["email"] = info.email
     entry["status"] = OK if info.email else NO_EMAIL
+    notes = []
     if info.email and not info.email_from_register:
-        entry["note"] = "почта из контактов Checko, не из ЕГРЮЛ"
+        notes.append("почта из контактов Checko, не из ЕГРЮЛ")
+    if not info.okved:
+        notes.append("ОКВЭД не найден в ответе API")
+    entry["note"] = "; ".join(notes)
     return entry
 
 
@@ -124,13 +130,16 @@ def save_results(out: str, state: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False)
 
+    with_okved = any("okved" in entry for entry in state.values())
+
     def write_csv(tmp):
         with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:    # BOM: Excel читает кириллицу
             writer = csv.writer(fh, delimiter=";")
-            writer.writerow(FIELDS)
+            writer.writerow(FIELDS + ([OKVED_FIELD] if with_okved else []))
             for entry in state.values():
                 if entry["status"] == OK:
-                    writer.writerow([entry["name"], entry["director"], entry["email"]])
+                    row = [entry["name"], entry["director"], entry["email"]]
+                    writer.writerow(row + ([entry.get("okved", "")] if with_okved else []))
 
     _write_atomic(state_path(out), write_state)
     _write_atomic(out, write_csv)
