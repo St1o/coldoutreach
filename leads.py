@@ -160,14 +160,12 @@ def _wait(seconds: float, should_stop, sleep) -> bool:
 def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: int = 25,
         checko=None, egrul=None, log=print, captcha_wait: float = 0.0, captcha_retries: int = 6,
         should_stop=lambda: False, sleep=time.sleep, max_errors_in_a_row: int = 5,
-        process=None, skip=frozenset(), on_result=None) -> int:
+        process=None) -> int:
     """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
     4 - остановлено пользователем, 5 - слишком много ошибок подряд (ФНС отвечает не как обычно:
     дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko.
 
     process(company) -> запись состояния: по умолчанию выписки ФНС (egrul), можно подставить API.
-    skip - ИНН, которые уже проверены где-то ещё (например, в Google-таблице): по ним запросов нет.
-    on_result(company, entry) вызывается после каждой организации со статусом ok / no_email.
 
     captcha_wait > 0: при капче ждать столько секунд и пробовать ту же организацию снова
     (не больше captcha_retries раз подряд); пауза - это ожидание, а не обход ограничения."""
@@ -187,8 +185,8 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
     log(f"Найдено организаций: {len(companies)}; названий в списке: {sum(1 for c in companies if c.name)}")
 
     state = load_state(state_path(out))
-    todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY and c.inn not in skip]
-    if state or skip:
+    todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]
+    if state:
         log(f"Уже проверено раньше: {len(companies) - len(todo)}; осталось: {len(todo)}")
     if limit:
         todo = todo[:limit]
@@ -222,8 +220,6 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
             break
         state[company.inn] = entry
         save_results(out, state)
-        if on_result and entry["status"] in (OK, NO_EMAIL):
-            on_result(company, entry)
         # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
         log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
             + (f" ({entry['note']})" if entry["note"] else ""))

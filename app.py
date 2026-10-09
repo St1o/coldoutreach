@@ -34,7 +34,6 @@ from egrul_inn_search import (
 )
 from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
-from sheets_sync import SheetsSync
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "index.html")
@@ -380,15 +379,13 @@ def main(argv=None):
                         help="сколько прокси хостинга стоит перед сайтом (0 - нет)")
     args = parser.parse_args(argv)
 
-    sheets = SheetsSync(env("SHEETS_URL"), env("SHEETS_TOKEN")) if env("SHEETS_URL") and env("SHEETS_TOKEN") else None
-    leads_job = LeadsJob(env("LEADS_TOKEN", ""), api_key=env("CHECKO_API_KEY", ""), sheets=sheets)
+    leads_job = LeadsJob(env("LEADS_TOKEN", ""), api_key=env("CHECKO_API_KEY", ""))
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
                          RateLimiter(args.rate_limit), args.trusted_proxies, leads_job)
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
     if leads_job.enabled:
         print("Страница /leads включена (пароль из LEADS_TOKEN)."
-              + (" Источник API Checko доступен." if leads_job.api_available else "")
-              + (" Запись в Google-таблицу включена." if sheets else ""))
+              + (" Источник API Checko доступен." if leads_job.api_available else ""))
     elif env("LEADS_TOKEN"):
         print("LEADS_TOKEN короче 12 знаков: страница /leads отключена.")
     try:

@@ -303,14 +303,6 @@ class ApiSourceTest(LeadsCase):
         self.assertEqual(self.read_csv()[1][3], "")
         self.assertIn("ОКВЭД не найден", self.state()[A]["note"])
 
-    def test_skipped_inns_are_not_requested_and_results_are_reported(self):
-        api = FakeApi({A: api_payload("a@example.ru"), B: api_payload("b@example.ru"), C: api_payload("")})
-        reported = []
-        self.run_api(api, skip={A}, on_result=lambda company, entry: reported.append((company.inn, entry["status"])))
-        self.assertEqual(api.asked, [B, C])                       # по пропущенному ИНН платного запроса нет
-        self.assertEqual(reported, [(B, leads.OK), (C, leads.NO_EMAIL)])
-        self.assertIn("Уже проверено раньше: 1; осталось: 2", self.logs)
-
     def test_rerun_asks_only_for_what_is_pending(self):
         first = FakeApi({A: api_payload("a@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.run_api(first)
