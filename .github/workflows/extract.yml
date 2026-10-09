@@ -1,0 +1,42 @@
+name: Выписка по ИНН
+
+# Запуск вручную: вкладка Actions -> «Выписка по ИНН» -> Run workflow -> ввести ИНН.
+# Готовые PDF появятся внизу страницы запуска в разделе Artifacts (архив vypiski).
+on:
+  workflow_dispatch:
+    inputs:
+      inn:
+        description: "ИНН (один или несколько через пробел)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Скачать выписки
+        env:
+          INNS: ${{ inputs.inn }}      # через переменную окружения, не подстановкой в команду
+        run: |
+          read -r -a inns <<< "$INNS"
+          python egrul_inn_search.py "${inns[@]}" --pdf-dir vypiski
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vypiski
+          path: vypiski/*.pdf
+          if-no-files-found: error
+          retention-days: 7
