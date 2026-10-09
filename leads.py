@@ -96,12 +96,8 @@ def process_company_api(api, company) -> dict:
     entry["okved"] = info.okved
     entry["email"] = info.email
     entry["status"] = OK if info.email else NO_EMAIL
-    notes = []
-    if info.email and not info.email_from_register:
-        notes.append("почта из контактов Checko, не из ЕГРЮЛ")
     if not info.okved:
-        notes.append("ОКВЭД не найден в ответе API")
-    entry["note"] = "; ".join(notes)
+        entry["note"] = "ОКВЭД не найден в ответе API"
     return entry
 
 

@@ -38,32 +38,25 @@ class FakeSession:
 
 
 class ParseCompanyTest(unittest.TestCase):
-    def test_name_director_and_email_from_the_register(self):
-        body = payload(Контакты={"Емэйл": ["other@site.ru"]})
-        body["source_data"] = {"СвЮЛ": {"СвАдрЭлПочты": {"@attributes": {"E-mail": "REG@Example.RU"}}}}
-        info = parse_company(body)
-        self.assertEqual((info.name, info.director), ("ООО ФИРМА", "Иванов Иван Иванович"))
-        self.assertEqual((info.email, info.email_from_register), ("reg@example.ru", True))   # ЕГРЮЛ важнее контактов
-
-    def test_register_email_as_plain_attribute(self):
-        body = payload()
-        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": "a@b.ru", "ГРНДата": {"ГРН": "123"}}}
-        self.assertEqual(parse_company(body).email, "a@b.ru")
-
-    def test_falls_back_to_contacts_and_says_so(self):
+    def test_name_director_and_email_from_the_contacts(self):
         info = parse_company(payload(Контакты={"Тел": ["+7 1"], "Емэйл": ["Sales@Example.ru", "x@y.ru"]}))
-        self.assertEqual((info.email, info.email_from_register), ("sales@example.ru", False))
+        self.assertEqual((info.name, info.director), ("ООО ФИРМА", "Иванов Иван Иванович"))
+        self.assertEqual(info.email, "sales@example.ru")
 
-    def test_no_email_anywhere(self):
-        body = payload(Контакты={"Тел": ["+7 1"]})
-        body["source_data"] = {"СвЮЛ": {"Наим": "ФИРМА"}}
-        info = parse_company(body)
-        self.assertEqual((info.email, info.email_from_register), ("", False))
+    def test_the_register_source_is_not_used(self):
+        body = payload(Контакты={"Емэйл": ["other@site.ru"]})
+        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": "register@example.ru"}}
+        self.assertEqual(parse_company(body).email, "other@site.ru")
+        body = payload()
+        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": "register@example.ru"}}
+        self.assertEqual(parse_company(body).email, "")
+
+    def test_no_email(self):
+        self.assertEqual(parse_company(payload(Контакты={"Тел": ["+7 1"]})).email, "")
+        self.assertEqual(parse_company(payload()).email, "")
 
     def test_tax_office_address_is_not_a_company_email(self):
-        body = payload()
-        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": "inspector@nalog.ru"}}
-        self.assertEqual(parse_company(body).email, "")
+        self.assertEqual(parse_company(payload(Контакты={"Емэйл": ["inspector@nalog.ru"]})).email, "")
 
     def test_uppercase_director_is_normalised_and_first_with_name_wins(self):
         body = payload(Руковод=[{"ФИО": ""}, {"ФИО": "ПЕТРОВ ПЁТР ПЕТРОВИЧ"}, {"ФИО": "Сидоров Сидор"}])
@@ -89,12 +82,12 @@ class CheckoApiTest(unittest.TestCase):
         session = FakeSession(response, error)
         return CheckoApi(KEY, session), session
 
-    def test_request_asks_for_the_register_source(self):
+    def test_request_has_only_the_key_and_the_inn(self):
         api, session = self.api(FakeResponse(payload()))
         api.company("7707083893")
         url, params = session.calls[0]
         self.assertEqual(url, "https://api.checko.ru/v2/company")
-        self.assertEqual(params, {"key": KEY, "inn": "7707083893", "source": "true"})
+        self.assertEqual(params, {"key": KEY, "inn": "7707083893"})
 
     def test_ok(self):
         api, _ = self.api(FakeResponse(payload()))

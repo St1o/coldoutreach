@@ -1,20 +1,18 @@
 """Официальный API Checko: сведения об организации по ИНН (без капчи, по ключу).
 
-Запрос:  GET https://api.checko.ru/v2/company?key=<КЛЮЧ>&inn=<ИНН>&source=true
-Ответ:   {"data": {...}, "source_data": {...}, "meta": {"status": "ok"|"error", "message": ...}}
+Запрос:  GET https://api.checko.ru/v2/company?key=<КЛЮЧ>&inn=<ИНН>
+Ответ:   {"data": {...}, "meta": {"status": "ok"|"error", "message": ...}}
 
 Из ответа берутся:
     * название  - data.НаимСокр / data.НаимПолн;
     * директор  - data.Руковод[].ФИО (первый с ФИО);
     * ОКВЭД     - название основного вида деятельности, data.ОКВЭД.Наим (код в таблицу не нужен);
-    * почта     - сначала из исходных данных ЕГРЮЛ (source_data, это та же почта, что в выписке),
-                  иначе из data.Контакты.Емэйл (контакты «из открытых источников», могут быть
-                  неполными или устаревшими - такие случаи помечаются).
+    * почта     - data.Контакты.Емэйл (контакты Checko «из открытых источников»); исходные данные
+                  ЕГРЮЛ (source_data) не запрашиваются и не используются.
 
 Ключ в адрес запроса попадает, поэтому во всех сообщениях об ошибках он заменяется на ***.
 Лимит API - 32 запроса в секунду с адреса, бесплатно 100 запросов в сутки (по документации Checko).
 """
-import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,7 +22,6 @@ from egrul_pdf import find_email
 
 API_URL = "https://api.checko.ru/v2/company"
 
-_EMAIL_KEY_RE = re.compile(r"почт|e-?mail", re.IGNORECASE)
 _NOT_FOUND_WORDS = ("не найден",)
 _QUOTA_WORDS = ("лимит", "баланс", "средств", "превыш")
 
@@ -47,7 +44,6 @@ class CompanyInfo:
     director: str = ""
     okved: str = ""                        # название основного вида деятельности: «Разработка компьютерного программного обеспечения»
     email: str = ""
-    email_from_register: bool = False      # True - почта из ЕГРЮЛ, False - из контактов Checko
 
 
 def _strings(node):
@@ -60,25 +56,6 @@ def _strings(node):
     elif isinstance(node, list):
         for value in node:
             yield from _strings(value)
-
-
-def _register_email(node) -> str:
-    """Почта из исходных данных ЕГРЮЛ: значения у ключей вида «...Почт...» / «E-mail»."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if _EMAIL_KEY_RE.search(str(key)):
-                email = find_email(" ".join(_strings(value)))
-                if email:
-                    return email
-            email = _register_email(value)
-            if email:
-                return email
-    elif isinstance(node, list):
-        for item in node:
-            email = _register_email(item)
-            if email:
-                return email
-    return ""
 
 
 def _main_okved(data: dict) -> str:
@@ -97,11 +74,8 @@ def parse_company(payload: dict) -> CompanyInfo:
             info.director = fio.title() if fio.isupper() else fio
             break
 
-    info.email = _register_email(payload.get("source_data"))
-    info.email_from_register = bool(info.email)
-    if not info.email:
-        contacts = (data.get("Контакты") or {}).get("Емэйл") or []
-        info.email = find_email(" ".join(_strings(contacts)))
+    contacts = (data.get("Контакты") or {}).get("Емэйл") or []
+    info.email = find_email(" ".join(_strings(contacts)))
     return info
 
 
@@ -118,7 +92,7 @@ class CheckoApi:
         """Ответ API по ИНН (JSON). Бросает CheckoApiNotFound / CheckoApiQuotaExceeded / CheckoApiError."""
         try:
             response = self.session.get(
-                API_URL, params={"key": self.key, "inn": inn, "source": "true"}, timeout=self.timeout)
+                API_URL, params={"key": self.key, "inn": inn}, timeout=self.timeout)
         except requests.RequestException as exc:
             raise CheckoApiError(f"Нет связи с API Checko: {self._scrub(exc)}"[:200]) from None
 
