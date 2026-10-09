@@ -230,6 +230,10 @@ class PastedPagesTest(unittest.TestCase):
         found = PastedPages(text).new_companies(date(2026, 10, 9))
         self.assertEqual([c.inn for c in found], [INNS[1], INNS[2]])
 
+    def test_dates_found_in_the_text(self):
+        self.assertEqual(PastedPages(PASTED).dates(), {date(2026, 10, 9): 3, date(2026, 10, 8): 1})
+        self.assertEqual(PastedPages("текст без организаций").dates(), {})
+
     def test_nothing_for_the_day(self):
         self.assertEqual(PastedPages(PASTED).new_companies(date(2026, 10, 1)), [])
         self.assertEqual(PastedPages("").new_companies(date(2026, 10, 9)), [])

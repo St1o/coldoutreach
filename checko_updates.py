@@ -213,6 +213,13 @@ class PastedPages:
     def __init__(self, text: str):
         self.text = text
 
+    def dates(self) -> dict:
+        """{дата регистрации: сколько организаций} во вставленном тексте."""
+        counts = {}
+        for item in items_from_text(self.text):
+            counts[item.reg_date] = counts.get(item.reg_date, 0) + 1
+        return counts
+
     def new_companies(self, target: date, max_pages: int = 25) -> list:
         found, seen = [], set()
         for item in items_from_text(self.text, names=True):

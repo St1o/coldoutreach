@@ -87,8 +87,8 @@
     </div>
     <div class="row">
       <div class="field">
-        <label for="date">Дата регистрации <span class="hint">ГГГГ-ММ-ДД, пусто — сегодня</span></label>
-        <input id="date" placeholder="2026-10-09" pattern="\d{4}-\d{2}-\d{2}">
+        <label for="date">Дата регистрации <span class="hint">ГГГГ-ММ-ДД</span></label>
+        <input id="date" placeholder="ГГГГ-ММ-ДД" pattern="\d{4}-\d{2}-\d{2}">
       </div>
       <div class="field">
         <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
@@ -98,6 +98,7 @@
     <div class="field">
       <label for="text">Текст с Checko <span class="hint">откройте checko.ru/company/updates, Ctrl+A, Ctrl+C и вставьте сюда; если день занимает несколько страниц, добавьте текст остальных</span></label>
       <textarea id="text" spellcheck="false" placeholder="Текст страницы Checko…"></textarea>
+      <p id="dates-hint" class="note" hidden></p>
     </div>
     <button id="start" type="submit">Запустить</button>
     <button id="stop" type="button" class="secondary" hidden>Остановить</button>
@@ -253,6 +254,38 @@ $('forget').addEventListener('click', () => {
   $('token').value = '';
   setStatus('Пароль удалён из этого браузера.');
 });
+
+// Дата: по умолчанию сегодня (по Москве). Вставили текст - берём самую свежую дату из него, если дату не меняли руками.
+const MONTHS = { января: 1, февраля: 2, марта: 3, апреля: 4, мая: 5, июня: 6, июля: 7, августа: 8, сентября: 9,
+                 октября: 10, ноября: 11, декабря: 12 };
+let dateTouched = false;
+try { $('date').value = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Moscow' }).format(new Date()); } catch (e) { /* пусто = сегодня на сервере */ }
+
+function datesInText(text) {
+  const counts = {};
+  const pattern = /Дата регистрации\s+(\d{1,2})\s+([а-яё]+)\s+(\d{4})/gi;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const month = MONTHS[match[2].toLowerCase()];
+    if (!month) continue;
+    const iso = match[3] + '-' + String(month).padStart(2, '0') + '-' + String(match[1]).padStart(2, '0');
+    counts[iso] = (counts[iso] || 0) + 1;
+  }
+  return counts;
+}
+
+function updateDatesHint() {
+  const counts = datesInText($('text').value);
+  const days = Object.keys(counts).sort().reverse();
+  const hint = $('dates-hint');
+  hint.hidden = !days.length;
+  if (!days.length) return;
+  if (!dateTouched && !counts[$('date').value]) $('date').value = days[0];
+  hint.textContent = 'В тексте организации за: ' + days.map((day) => day + ' (' + counts[day] + ')').join(', ') + '.'
+    + (counts[$('date').value] ? '' : ' За выбранную дату в тексте организаций нет: укажите одну из этих дат.');
+}
+$('text').addEventListener('input', updateDatesHint);
+$('date').addEventListener('input', () => { dateTouched = true; updateDatesHint(); });
 
 const saved = savedPassword();
 if (saved) {                                    // пароль уже вводили: подставляем и показываем текущее состояние

@@ -176,7 +176,8 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         process=None) -> int:
     """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
     4 - остановлено пользователем, 5 - слишком много ошибок подряд (ФНС отвечает не как обычно:
-    дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko.
+    дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko, 7 - во вставленном тексте нет
+    организаций за выбранную дату (есть за другие).
 
     process(company) -> запись состояния: по умолчанию выписки ФНС (egrul), можно подставить API.
 
@@ -196,6 +197,12 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         log(f"Ошибка при чтении Checko: {exc}")
         return 3
     log(f"Найдено организаций: {len(companies)}; названий в списке: {sum(1 for c in companies if c.name)}")
+    other_dates = checko.dates() if not companies and hasattr(checko, "dates") else {}
+    if other_dates:
+        listed = ", ".join(f"{day.isoformat()} ({number})" for day, number in sorted(other_dates.items(), reverse=True))
+        log(f"В вставленном тексте нет организаций за {target.isoformat()}. Есть за: {listed}. "
+            "Укажите одну из этих дат в поле «Дата регистрации».")
+        return 7
 
     state = load_state(state_path(out))
     todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]

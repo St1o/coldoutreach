@@ -338,6 +338,26 @@ class ApiSourceTest(LeadsCase):
 
 
 
+class PastedTextDateTest(LeadsCase):
+    def test_text_without_the_chosen_date_says_which_dates_it_has(self):
+        from checko_updates import PastedPages
+        text = (f"1.\tООО А\nадрес\nДата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН {A}\n"
+                f"2.\tООО Б\nадрес\nДата регистрации 8 октября 2026 года ОГРН 1269600032855 ИНН {B}\n")
+        api = FakeApi({})
+        code = leads.run(date(2026, 10, 10), self.out, pause=0, checko=PastedPages(text), egrul=FakeEgrul({}),
+                         log=self.logs.append, process=lambda c: leads.process_company_api(api, c))
+        self.assertEqual(code, 7)
+        self.assertEqual(api.asked, [])
+        self.assertTrue(any("нет организаций за 2026-10-10" in line and "2026-10-09 (1), 2026-10-08 (1)" in line
+                            for line in self.logs))
+
+    def test_empty_text_or_a_site_without_companies_is_not_an_error(self):
+        from checko_updates import PastedPages
+        self.assertEqual(self.run_leads(FakeEgrul({}), FakeChecko([])), 0)
+        self.assertEqual(leads.run(DAY, self.out, pause=0, checko=PastedPages("пусто"), egrul=FakeEgrul({}),
+                                   log=self.logs.append), 0)
+
+
 class HelpersTest(unittest.TestCase):
     def test_director_from_search(self):
         self.assertEqual(leads.director_from_search("Директор: Иванов Иван"), "Иванов Иван")
