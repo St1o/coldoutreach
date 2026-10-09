@@ -268,11 +268,13 @@ def leads_company(inn, name):
     return NewCompany(inn=inn, ogrn="1" * 13, reg_date=DAY, name=name)
 
 
-def api_payload(email="", fio="Иванов Иван Иванович", okved=OKVED):
+def api_payload(email="", register=True, fio="Иванов Иван Иванович", okved=OKVED):
     body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
     if okved:
         body["data"]["ОКВЭД"] = okved
-    if email:
+    if email and register:
+        body["source_data"] = {"СвАдрЭлПочты": {"E-mail": email}}
+    elif email:
         body["data"]["Контакты"] = {"Емэйл": [email]}
     return body
 
@@ -297,6 +299,11 @@ class ApiSourceTest(LeadsCase):
         listed = [leads_company(A, "ООО ИЗ СПИСКА"), leads_company(B, "")]
         self.run_api(FakeApi({A: api_payload("a@example.ru"), B: api_payload("b@example.ru")}), FakeChecko(listed))
         self.assertEqual([row[0] for row in self.read_csv()[1:]], ["ООО ИЗ СПИСКА", "ООО ФИРМА"])
+
+    def test_contact_email_is_marked(self):
+        self.run_api(FakeApi({A: api_payload("c@example.ru", register=False)}), FakeChecko(companies(A)))
+        self.assertEqual(self.state()[A]["status"], leads.OK)
+        self.assertIn("не из ЕГРЮЛ", self.state()[A]["note"])
 
     def test_missing_okved_is_noted_and_left_empty(self):
         self.run_api(FakeApi({A: api_payload("a@example.ru", okved=None)}), FakeChecko(companies(A)))
