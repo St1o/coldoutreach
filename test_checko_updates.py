@@ -189,6 +189,21 @@ class PastedPagesTest(unittest.TestCase):
         items = items_from_text(PASTED)
         self.assertEqual([i.inn for i in items], [INNS[1], INNS[2], INNS[3], INNS[2]])
 
+    def test_names_are_taken_from_the_pasted_text(self):
+        found = PastedPages(PASTED).new_companies(date(2026, 10, 9))
+        self.assertEqual([c.name for c in found], ["ООО <<ТАТЬЯНА>> & Ко", 'ООО "ФИРМА"'])
+
+    def test_number_on_its_own_line_and_no_header_text_in_the_name(self):
+        text = ("Новые организации\nОрганизации с 1 по 100 из 2000\n"
+                f"1.\nООО \"ПЕРВАЯ\"\n620042, г. Екатеринбург, д. 2.\nДата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН {INNS[1]}\n"
+                f"2.\nАО ВТОРАЯ\nДата регистрации 9 октября 2026 года ОГРН 1269600032888 ИНН {INNS[2]}\n")
+        found = PastedPages(text).new_companies(date(2026, 10, 9))
+        self.assertEqual([c.name for c in found], ['ООО "ПЕРВАЯ"', "АО ВТОРАЯ"])
+
+    def test_name_is_left_empty_when_it_cannot_be_found(self):
+        text = (f"Организации\nООО БЕЗ НОМЕРА\nДата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН {INNS[1]}\n")
+        self.assertEqual([c.name for c in PastedPages(text).new_companies(date(2026, 10, 9))], [""])
+
     def test_filters_by_date_and_removes_duplicates(self):
         found = PastedPages(PASTED).new_companies(date(2026, 10, 9))
         self.assertEqual([c.inn for c in found], [INNS[1], INNS[2]])

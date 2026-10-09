@@ -86,10 +86,32 @@ class _PageParser(HTMLParser):
             self._link_text.append(data)
 
 
-def items_from_text(text: str) -> list:
-    """Строки «Дата регистрации ... ОГРН ... ИНН ...» из видимого текста страницы."""
+_NUMBERED_RE = re.compile(r"^\s*\d{1,4}\s*[.)]\s*(.*)$")
+
+
+def _name_before(segment: str) -> str:
+    """Название организации из текста перед строкой «Дата регистрации...»: после номера «12.» в начале
+    строки (сам номер может стоять отдельной строкой). Не нашли уверенно - пустая строка."""
+    lines = [line.strip() for line in segment.splitlines() if line.strip()]
+    for index in range(len(lines) - 1, -1, -1):
+        match = _NUMBERED_RE.match(lines[index])
+        if match:
+            name = match.group(1).strip()
+            if not name and index + 1 < len(lines):
+                name = lines[index + 1]
+            return name if re.search(r"[A-Za-zА-Яа-яЁё]{2}", name) and len(name) <= 300 else ""
+    return ""
+
+
+def items_from_text(text: str, names: bool = False) -> list:
+    """Строки «Дата регистрации ... ОГРН ... ИНН ...» из видимого текста страницы.
+
+    names=True: ещё и название каждой организации (для текста, скопированного со страницы вручную)."""
     items = []
-    for match in ITEM_RE.finditer(" ".join(text.split())):
+    previous_end = 0
+    for match in ITEM_RE.finditer(text):
+        segment = text[previous_end:match.start()]
+        previous_end = match.end()
         day, month, year, ogrn, inn = match.groups()
         month_no = MONTHS.get(month.lower())
         if not month_no or not validate_inn(inn):
@@ -98,7 +120,7 @@ def items_from_text(text: str) -> list:
             reg_date = date(int(year), month_no, int(day))
         except ValueError:
             continue
-        items.append(NewCompany(inn=inn, ogrn=ogrn, reg_date=reg_date))
+        items.append(NewCompany(inn=inn, ogrn=ogrn, reg_date=reg_date, name=_name_before(segment) if names else ""))
     return items
 
 
@@ -193,7 +215,7 @@ class PastedPages:
 
     def new_companies(self, target: date, max_pages: int = 25) -> list:
         found, seen = [], set()
-        for item in items_from_text(self.text):
+        for item in items_from_text(self.text, names=True):
             if item.reg_date == target and item.inn not in seen:
                 seen.add(item.inn)
                 found.append(item)

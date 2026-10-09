@@ -264,6 +264,10 @@ class FakeApi:
 OKVED = {"Код": "62.01", "Наим": "Разработка компьютерного программного обеспечения", "Версия": "2014"}
 
 
+def leads_company(inn, name):
+    return NewCompany(inn=inn, ogrn="1" * 13, reg_date=DAY, name=name)
+
+
 def api_payload(email="", fio="Иванов Иван Иванович", okved=OKVED):
     body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
     if okved:
@@ -283,11 +287,16 @@ class ApiSourceTest(LeadsCase):
         api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.assertEqual(self.run_api(api), 0)
         self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта", "Основной ОКВЭД"],
-                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru",
+                                           [f"checko {A}", "Иванов Иван Иванович", "sales@example.ru",
                                             "Разработка компьютерного программного обеспечения"]])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
         self.assertIn("нет в Checko", self.state()[C]["note"])
+
+    def test_name_comes_from_the_checko_list_and_the_api_name_is_only_a_fallback(self):
+        listed = [leads_company(A, "ООО ИЗ СПИСКА"), leads_company(B, "")]
+        self.run_api(FakeApi({A: api_payload("a@example.ru"), B: api_payload("b@example.ru")}), FakeChecko(listed))
+        self.assertEqual([row[0] for row in self.read_csv()[1:]], ["ООО ИЗ СПИСКА", "ООО ФИРМА"])
 
     def test_missing_okved_is_noted_and_left_empty(self):
         self.run_api(FakeApi({A: api_payload("a@example.ru", okved=None)}), FakeChecko(companies(A)))

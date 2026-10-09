@@ -91,7 +91,7 @@ def process_company_api(api, company) -> dict:
         entry["note"] = f"ошибка: {exc}"[:200]
         return entry
 
-    entry["name"] = info.name or company.name
+    entry["name"] = company.name or info.name      # название из списка Checko; из API - только если в списке его нет
     entry["director"] = info.director
     entry["okved"] = info.okved
     entry["email"] = info.email
@@ -182,7 +182,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
     except CheckoError as exc:
         log(f"Ошибка при чтении Checko: {exc}")
         return 3
-    log(f"Найдено организаций: {len(companies)}")
+    log(f"Найдено организаций: {len(companies)}; названий в списке: {sum(1 for c in companies if c.name)}")
 
     state = load_state(state_path(out))
     todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]
