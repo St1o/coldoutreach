@@ -42,11 +42,7 @@
   }
   button:disabled { opacity: .6; cursor: progress; }
   button.secondary { color: var(--text); background: transparent; border: 1px solid var(--line); margin-left: 8px; }
-  select {
-    width: 100%; padding: 12px 14px; font: inherit; color: var(--text);
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-  }
-  select:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  input:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   #status { margin: 14px 0 0; color: var(--muted); min-height: 1.5em; }
   #status.ok { color: var(--ok); }
   #status.error { color: var(--error); }
@@ -75,7 +71,7 @@
 <body>
 <main>
   <h1>Новые компании: ФИО и почта</h1>
-  <p class="sub">Организации, зарегистрированные в выбранный день. В таблицу попадают только те, у кого в выписке указана почта.</p>
+  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора и почта берутся из API Checko; в таблицу попадают только организации с почтой.</p>
 
   <form id="form" class="card" autocomplete="off">
     <div class="field">
@@ -83,14 +79,6 @@
       <input id="token" name="password" type="password" autocomplete="current-password" required>
       <label class="check"><input id="remember" type="checkbox" checked> Запомнить пароль в этом браузере
         <button id="forget" class="link" type="button">Забыть</button></label>
-    </div>
-    <div class="field">
-      <label for="source">Откуда брать ФИО и почту</label>
-      <select id="source">
-        <option value="">Автоматически: API Checko, если на сервере задан ключ</option>
-        <option value="api">API Checko (быстро, без капчи; нужен ключ)</option>
-        <option value="egrul">Выписки ФНС с egrul.nalog.ru (медленно, возможна капча)</option>
-      </select>
     </div>
     <div class="row">
       <div class="field">
@@ -100,10 +88,6 @@
       <div class="field">
         <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
         <input id="limit" type="number" min="0" max="2000" value="5">
-      </div>
-      <div class="field">
-        <label for="pause">Пауза, с <span class="hint">для выписок ФНС</span></label>
-        <input id="pause" type="number" min="1" max="60" value="6">
       </div>
     </div>
     <details id="paste">
@@ -213,7 +197,7 @@ $('form').addEventListener('submit', async (event) => {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
       body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0),
-                            pause: Number($('pause').value || 6), source: $('source').value, text: $('text').value }),
+                            text: $('text').value }),
     });
     rememberPassword($('remember').checked);
     poll();

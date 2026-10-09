@@ -307,7 +307,7 @@ class LeadsWebTest(unittest.TestCase):
         log("[1/1] 7707083004: ok")
         return self.code
 
-    def start(self, token=TOKEN, api_key=""):
+    def start(self, token=TOKEN, api_key="KEY"):
         job = LeadsJob(token, run=self.fake_run, out_dir=self.tmp.name, api_key=api_key)
         server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
                              leads_job=job)
@@ -409,8 +409,6 @@ class LeadsWebTest(unittest.TestCase):
         with mock.patch("app.MAX_BODY", 500):                  # слишком большое тело запроса
             self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 600 + b"}")[0], 400)
         self.assertEqual(self.request("/api/leads/start", "POST", {"text": 123})[0], 400)
-        for pause in (0.5, 61, "долго"):
-            self.assertEqual(self.request("/api/leads/start", "POST", {"pause": pause})[0], 400, pause)
         self.assertEqual(self.calls, [])
 
     def test_stop_button(self):
@@ -429,60 +427,33 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)      # снова можно
         job.join(5)
 
-    def test_export_waits_out_a_captcha(self):
+    def test_export_can_be_stopped(self):
         job = self.start()
         self.request("/api/leads/start", "POST", {"limit": 1})
         job.join(5)
-        self.assertEqual(self.kwargs["captcha_wait"], 600)
         self.assertTrue(callable(self.kwargs["should_stop"]))
 
-    # ---- источник данных: API Checko или выписки ФНС ----
+    # ---- источник данных: всегда API Checko ----
 
     def test_status_tells_whether_api_is_configured(self):
-        self.start()
+        self.start(api_key="")
         self.assertFalse(json.loads(self.request("/api/leads/status")[2])["api_available"])
         self.start(api_key="KEY")
         self.assertTrue(json.loads(self.request("/api/leads/status")[2])["api_available"])
 
-    def test_default_source_is_api_when_the_key_is_set(self):
-        job = self.start(api_key="KEY")
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20})
+    def test_export_always_goes_through_the_api_with_a_short_pause(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20, "source": "egrul"})   # лишние поля не нужны
         job.join(5)
         self.assertIn("process", self.kwargs)
-        self.assertEqual(self.kwargs["pause"], 0.3)             # API без капчи: пауза короткая, не 20 с
+        self.assertEqual(self.kwargs["pause"], 0.05)            # API без капчи: лимит 32 в секунду, мы не больше 20
 
-    def test_default_source_without_a_key_is_the_register_extracts(self):
-        job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20})
-        job.join(5)
-        self.assertNotIn("process", self.kwargs)
-        self.assertEqual(self.kwargs["pause"], 20)
-
-    def test_explicit_extracts_even_with_a_key(self):
-        job = self.start(api_key="KEY")
-        self.request("/api/leads/start", "POST", {"limit": 1, "source": "egrul"})
-        job.join(5)
-        self.assertNotIn("process", self.kwargs)
-
-    def test_api_source_without_a_key_is_refused_with_a_hint(self):
-        self.start()
-        status, _, body = self.request("/api/leads/start", "POST", {"source": "api"})
+    def test_without_a_key_the_export_is_refused_with_a_hint(self):
+        self.start(api_key="")
+        status, _, body = self.request("/api/leads/start", "POST", {"limit": 1})
         self.assertEqual(status, 400)
         self.assertIn("CHECKO_API_KEY", json.loads(body)["error"])
         self.assertEqual(self.calls, [])
-
-    def test_unknown_source_is_rejected(self):
-        self.start(api_key="KEY")
-        self.assertEqual(self.request("/api/leads/start", "POST", {"source": "foo"})[0], 400)
-
-    def test_pause_is_passed_to_the_export(self):
-        job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 12})
-        job.join(5)
-        self.assertEqual(self.kwargs["pause"], 12)
-        self.request("/api/leads/start", "POST", {"limit": 1})
-        job.join(5)
-        self.assertEqual(self.kwargs["pause"], 6)             # по умолчанию 6 секунд
 
     def test_pasted_text_replaces_checko(self):
         from checko_updates import PastedPages

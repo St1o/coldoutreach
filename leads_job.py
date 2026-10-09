@@ -19,16 +19,12 @@ from checko_updates import PastedPages
 MIN_TOKEN_LENGTH = 12
 STATE_LABELS = {
     0: "Готово.",
-    2: ("ФНС потребовала капчу: это защита от частых запросов. Выгрузка остановлена, готовая часть "
-        "сохранена. Подождите, поставьте паузу побольше и запустите снова: проверенные организации "
-        "повторно не проверяются."),
     3: "Checko недоступен с этого сервера, подробности в журнале ниже.",
     4: "Остановлено вами. Готовая часть сохранена.",
     6: "Лимит запросов API Checko исчерпан. Готовая часть сохранена: продолжите завтра или смените тариф.",
-    5: "Остановлено: несколько ошибок подряд, сайт ФНС отвечает не как обычно. Причина в журнале ниже; повторите позже.",
+    5: "Остановлено: несколько ошибок подряд. Причина в журнале ниже (проверьте CHECKO_API_KEY); повторите позже.",
 }
-CAPTCHA_WAIT = 600          # секунд: при капче ФНС ждём и продолжаем
-API_PAUSE = 0.3             # секунд между запросами к API Checko (лимит API - 32 в секунду)
+API_PAUSE = 0.05            # секунд между запросами к API Checko: не больше 20 в секунду при лимите API 32
 
 
 class JobRunning(Exception):
@@ -64,8 +60,7 @@ class LeadsJob:
         return self.enabled and hmac.compare_digest(
             (candidate or "").encode("utf-8"), self.token.encode("utf-8"))
 
-    def start(self, target: date, limit: int, text: str = "", pause: float = 6.0,
-              source: str = "egrul") -> None:
+    def start(self, target: date, limit: int, text: str = "") -> None:
         with self._lock:
             if self._state == "running":
                 raise JobRunning()
@@ -74,17 +69,15 @@ class LeadsJob:
             self._target, self._limit = target, limit
             self._out = os.path.join(self._out_dir, f"leads_{target.isoformat()}.csv")
             self._lines.clear()
-            self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text, pause, source), daemon=True)
+            self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text), daemon=True)
             self._thread.start()
 
-    def _work(self, target, limit, out, text="", pause=6.0, source="egrul"):
+    def _work(self, target, limit, out, text=""):
         extra = {"checko": PastedPages(text)} if text.strip() else {}
-        if source == "api":                         # API не ограничивает капчей: пауза нужна только для вежливости
-            extra["process"] = lambda company: leads.process_company_api(self._api, company)
-            pause = API_PAUSE
         try:
-            code = self._run(target, out, limit=limit, pause=pause, log=self._lines.append,
-                            captcha_wait=CAPTCHA_WAIT, should_stop=self._stop.is_set, **extra)
+            code = self._run(target, out, limit=limit, pause=API_PAUSE, log=self._lines.append,
+                             should_stop=self._stop.is_set,
+                             process=lambda company: leads.process_company_api(self._api, company), **extra)
             state = "done" if code == 0 else "stopped"
             message = STATE_LABELS.get(code, f"Завершено с кодом {code}.")
         except Exception as exc:        # любая неожиданность не должна оставлять «идёт»

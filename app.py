@@ -312,21 +312,14 @@ class Handler(BaseHTTPRequestHandler):
             text = body.get("text") or ""
             if not isinstance(text, str):
                 raise ValueError
-            pause = float(body.get("pause") or 6)
-            if not 1 <= pause <= 60:
-                raise ValueError
-            source = body.get("source") or ("api" if job.api_available else "egrul")
-            if source not in ("api", "egrul"):
-                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
-            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, пауза 1-60 с, текст до 2 МБ.")
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, текст до 2 МБ.")
             return
-        if source == "api" and not job.api_available:
-            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY на сервере "
-                             "или выберите источник «Выписки ФНС».")
+        if not job.api_available:
+            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY в настройках сервера.")
             return
         try:
-            job.start(target, limit, text, pause, source)
+            job.start(target, limit, text)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return
