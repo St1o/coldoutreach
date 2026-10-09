@@ -128,9 +128,10 @@ def _wait(seconds: float, should_stop, sleep) -> bool:
 
 def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: int = 25,
         checko=None, egrul=None, log=print, captcha_wait: float = 0.0, captcha_retries: int = 6,
-        should_stop=lambda: False, sleep=time.sleep) -> int:
+        should_stop=lambda: False, sleep=time.sleep, max_errors_in_a_row: int = 5) -> int:
     """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
-    4 - остановлено пользователем.
+    4 - остановлено пользователем, 5 - слишком много ошибок подряд (ФНС отвечает не как обычно:
+    дальше стучаться бессмысленно).
 
     captcha_wait > 0: при капче ждать столько секунд и пробовать ту же организацию снова
     (не больше captcha_retries раз подряд); пауза - это ожидание, а не обход ограничения."""
@@ -156,6 +157,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         todo = todo[:limit]
 
     code = 0
+    errors_in_a_row = 0
     for number, company in enumerate(todo, 1):
         if should_stop() or (number > 1 and _wait(pause, should_stop, sleep)):   # пауза: не нагружаем ФНС
             code = 4
@@ -182,6 +184,12 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
         log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
             + (f" ({entry['note']})" if entry["note"] else ""))
+        errors_in_a_row = errors_in_a_row + 1 if entry["note"].startswith("ошибка") else 0
+        if errors_in_a_row >= max_errors_in_a_row:
+            log(f"{errors_in_a_row} ошибок подряд - останавливаемся: сайт ФНС отвечает не как обычно. "
+                "Причина в строках выше; повторите позже.")
+            code = 5
+            break
     if code == 4:
         log("Остановлено по запросу. Результат сохранён.")
 

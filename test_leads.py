@@ -212,6 +212,22 @@ class LeadsTest(unittest.TestCase):
         self.assertEqual(egrul.searched, [A])
         self.assertEqual(len(self.read_csv()), 2)                 # заголовок и A
 
+    def test_stops_after_a_series_of_errors(self):
+        table = {A: (b"with-email", ""), B: (b"with-email", ""), C: (b"with-email", "")}
+        errors = {i: EgrulError("400 Client Error") for i in table}
+        egrul = FakeEgrul(table, errors=errors)
+        code = self.run_leads(egrul, FakeChecko(companies(A, B, C)), max_errors_in_a_row=2)
+        self.assertEqual(code, 5)
+        self.assertEqual(egrul.searched, [A, B])                  # на третью уже не пошли
+        self.assertIn("2 ошибок подряд", "\n".join(self.logs))
+        self.assertEqual(self.state()[A]["status"], leads.RETRY)  # ошибки проверятся при повторе
+
+    def test_one_error_between_good_ones_does_not_stop(self):
+        egrul = FakeEgrul({A: (b"with-email", ""), B: (b"with-email", ""), C: (b"with-email", "")},
+                          errors={B: EgrulError("таймаут")})
+        self.assertEqual(self.run_leads(egrul, max_errors_in_a_row=2), 0)
+        self.assertEqual(egrul.searched, [A, B, C])
+
     def test_limit(self):
         egrul = self.standard_egrul()
         self.run_leads(egrul, limit=2)

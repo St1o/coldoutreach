@@ -148,6 +148,39 @@ class SearchByInnTest(unittest.TestCase):
             client.search_by_inn("7707083893")
 
 
+class FailedResponse(FakeResponse):
+    """Ответ с ошибкой HTTP, у которого есть тело (как у настоящего requests)."""
+
+    def __init__(self, status, text="", payload=None):
+        super().__init__(payload, status)
+        self.text = text
+
+    def raise_for_status(self):
+        error = requests.HTTPError(f"{self.status_code} Client Error")
+        error.response = self
+        raise error
+
+
+class ErrorBodyTest(unittest.TestCase):
+    def test_error_shows_what_the_site_answered(self):
+        client, _ = make_client([FailedResponse(400, text="  Bad request:\n  query is blocked  ")], [])
+        with self.assertRaises(EgrulError) as ctx:
+            client.search_by_inn("7707083893")
+        self.assertIn("400", str(ctx.exception))
+        self.assertIn("ответ сайта: Bad request: query is blocked", str(ctx.exception))
+
+    def test_captcha_in_the_body_of_an_error_response(self):
+        client, _ = make_client([FailedResponse(400, payload={"captchaRequired": True})], [])
+        with self.assertRaises(EgrulCaptchaRequired):
+            client.search_by_inn("7707083893")
+
+    def test_long_body_is_cut(self):
+        client, _ = make_client([FailedResponse(502, text="x" * 5000)], [])
+        with self.assertRaises(EgrulError) as ctx:
+            client.search_by_inn("7707083893")
+        self.assertLess(len(str(ctx.exception)), 600)
+
+
 PDF = b"%PDF-1.7 fake extract"
 
 

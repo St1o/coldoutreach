@@ -148,7 +148,24 @@ class EgrulClient:
             response.raise_for_status()
             return response
         except requests.RequestException as exc:
-            raise EgrulError(f"Ошибка запроса {method.upper()} {url}: {exc}") from exc
+            self._raise_for_failed(method, url, exc)
+
+    @staticmethod
+    def _raise_for_failed(method, url, exc):
+        """Ошибка запроса. Если сайт ответил, показываем начало его ответа (по нему видно
+        причину), а ответ с признаком капчи превращаем в EgrulCaptchaRequired."""
+        response = getattr(exc, "response", None)
+        body = ""
+        if response is not None:
+            try:
+                payload = response.json()
+                if isinstance(payload, dict) and payload.get("captchaRequired"):
+                    raise EgrulCaptchaRequired("Сайт требует капчу.") from exc
+            except ValueError:
+                pass
+            body = " ".join((getattr(response, "text", "") or "").split())[:200]
+        detail = f" | ответ сайта: {body}" if body else ""
+        raise EgrulError(f"Ошибка запроса {method.upper()} {url}: {exc}{detail}") from exc
 
     def _request_json(self, method: str, url: str, **kwargs) -> dict:
         response = self._request(method, url, **kwargs)
