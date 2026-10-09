@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Выписка из ЕГРЮЛ по ИНН</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #5d6b7c;
+    --line: #dde2e9; --accent: #1f5fd1; --accent-text: #ffffff;
+    --ok: #17703a; --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161c; --card: #1a2029; --text: #e7ebf0; --muted: #98a4b3;
+      --line: #2b3441; --accent: #5b92f0; --accent-text: #0c1320;
+      --ok: #5ccd8a; --error: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  label { display: block; font-weight: 600; margin-bottom: 8px; }
+  .row { display: flex; gap: 8px; }
+  input {
+    flex: 1; min-width: 0; padding: 12px 14px; font: inherit; letter-spacing: .05em;
+    color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  }
+  button {
+    padding: 12px 20px; font: inherit; font-weight: 600; cursor: pointer;
+    color: var(--accent-text); background: var(--accent); border: 0; border-radius: 8px;
+  }
+  button:disabled { opacity: .6; cursor: progress; }
+  input:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  #status { min-height: 1.5em; margin: 14px 0 0; color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.error { color: var(--error); }
+  #result { margin-top: 16px; }
+  #result h2 { font-size: 1.15rem; margin: 0 0 12px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 18px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .85rem;
+           border: 1px solid currentColor; }
+  .badge.active { color: var(--ok); }
+  .badge.ended { color: var(--error); }
+  @media (max-width: 480px) {
+    .row { flex-direction: column; }
+    dl { grid-template-columns: 1fr; gap: 0; }
+    dd { margin-bottom: 8px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Выписка из ЕГРЮЛ / ЕГРИП по ИНН</h1>
+  <p class="sub">Введите ИНН, нажмите «Найти», затем «Получить выписку».</p>
+
+  <form id="form" class="card" autocomplete="off">
+    <label for="inn">ИНН (10 цифр — организация, 12 — ИП)</label>
+    <div class="row">
+      <input id="inn" inputmode="numeric" maxlength="12" pattern="\d{10}|\d{12}"
+             placeholder="7707083893" required>
+      <button id="find" type="submit">Найти</button>
+    </div>
+    <p id="status" role="status" aria-live="polite"></p>
+  </form>
+
+  <section id="result" class="card" hidden>
+    <h2 id="name"></h2>
+    <dl id="fields"></dl>
+    <button id="get" type="button">Получить выписку</button>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null;
+
+function setStatus(text, kind) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = kind || '';
+}
+
+function setBusy(busy) {
+  $('find').disabled = busy;
+  $('get').disabled = busy;
+}
+
+async function callApi(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    let message = 'Ошибка ' + response.status;
+    try { message = (await response.json()).error || message; } catch (e) { /* не JSON */ }
+    throw new Error(message);
+  }
+  return response;
+}
+
+function showRecord(rec) {
+  current = rec;
+  $('name').textContent = rec.short_name || rec.name;
+  const fields = $('fields');
+  fields.textContent = '';
+  const rows = [
+    ['Полное наименование', rec.name],
+    ['ИНН', rec.inn],
+    ['ОГРН', rec.ogrn],
+    ['КПП', rec.kpp],
+    ['Руководитель', rec.director],
+    ['Дата регистрации', rec.reg_date],
+  ];
+  for (const [title, value] of rows) {
+    if (!value) continue;
+    const dt = document.createElement('dt'); dt.textContent = title;
+    const dd = document.createElement('dd'); dd.textContent = value;
+    fields.append(dt, dd);
+  }
+  const dt = document.createElement('dt'); dt.textContent = 'Статус';
+  const dd = document.createElement('dd');
+  const badge = document.createElement('span');
+  const active = !rec.end_date;
+  badge.className = 'badge ' + (active ? 'active' : 'ended');
+  badge.textContent = active ? 'действует' : 'прекращено ' + rec.end_date;
+  dd.append(badge);
+  fields.append(dt, dd);
+  $('result').hidden = false;
+}
+
+$('form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const inn = $('inn').value.trim();
+  $('result').hidden = true;
+  current = null;
+  setBusy(true);
+  setStatus('Ищем на egrul.nalog.ru…');
+  try {
+    const data = await (await callApi('/api/search?inn=' + encodeURIComponent(inn))).json();
+    if (!data.records.length) {
+      setStatus('По этому ИНН ничего не найдено.', 'error');
+      return;
+    }
+    showRecord(data.records[0]);
+    setStatus('Найдено. Нажмите «Получить выписку».', 'ok');
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('get').addEventListener('click', async () => {
+  if (!current) return;
+  setBusy(true);
+  setStatus('Формируем выписку, это может занять до минуты…');
+  try {
+    const blob = await (await callApi('/api/extract?inn=' + encodeURIComponent(current.inn))).blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = current.inn + '.pdf';
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+    setStatus('Готово: выписка скачана (' + current.inn + '.pdf).', 'ok');
+  } catch (error) {
+    setStatus(error.message, 'error');
+  } finally {
+    setBusy(false);
+  }
+});
+</script>
+</body>
+</html>
