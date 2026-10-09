@@ -47,6 +47,7 @@
   dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 18px; }
   dt { color: var(--muted); }
   dd { margin: 0; overflow-wrap: anywhere; }
+  .foot { margin: 16px 4px 0; font-size: .85rem; color: var(--muted); }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .85rem;
            border: 1px solid currentColor; }
   .badge.active { color: var(--ok); }
@@ -78,6 +79,10 @@
     <dl id="fields"></dl>
     <button id="get" type="button">Получить выписку</button>
   </section>
+
+  <p class="foot">Сведения берутся из открытого реестра ФНС (egrul.nalog.ru). Сервис неофициальный
+    и с ФНС не связан. Запросов принимается ограниченное число, поэтому при большой нагрузке
+    возможно ожидание.</p>
 </main>
 
 <script>
