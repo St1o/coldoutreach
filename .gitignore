@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 выписки/
+# таблицы компаний, письма и журнал рассылки: персональные данные, в репозиторий не попадают
+leads_*.csv
+leads_*.state.json
+outbox*.csv
+sent_mail.json
+sent_mail.json.lock
+suppress.txt

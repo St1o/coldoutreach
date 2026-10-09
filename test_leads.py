@@ -15,9 +15,15 @@ from egrul_pdf import ExtractError
 DAY = date(2026, 10, 9)
 A, B, C = "7707083004", "7707083011", "7707083029"      # с почтой / без почты / ещё нет в ЕГРЮЛ
 
+HEADER = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)"]
+OKVED = ["62.01", "Разработка компьютерного программного обеспечения"]
+
 WITH_EMAIL = ("Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
               "Сведения о лице, имеющем право без доверенности действовать от имени юридического лица\n"
-              "26 Фамилия\nИмя\nОтчество\nИВАНОВ\nИВАН\nИВАНОВИЧ\n27 ИНН 1\n")
+              "26 Фамилия\nИмя\nОтчество\nИВАНОВ\nИВАН\nИВАНОВИЧ\n27 ИНН 1\n"
+              "Сведения об основном виде деятельности\n"
+              "50 Код и наименование вида деятельности 62.01 Разработка компьютерного программного обеспечения\n"
+              "51 ГРН и дата внесения в ЕГРЮЛ записи\n")
 NO_EMAIL = WITH_EMAIL.split("11 ГРН\n")[1]
 NO_DIRECTOR = "Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
 PDFS = {b"with-email": WITH_EMAIL, b"no-email": NO_EMAIL, b"no-director": NO_DIRECTOR}
@@ -106,8 +112,8 @@ class LeadsTest(LeadsCase):
     def test_only_companies_with_email_are_in_the_table(self):
         self.assertEqual(self.run_leads(self.standard_egrul()), 0)
         self.assertEqual(self.read_csv(), [
-            ["Название", "ФИО директора", "Почта"],
-            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"],
+            HEADER,
+            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED,
         ])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
@@ -117,7 +123,7 @@ class LeadsTest(LeadsCase):
         with open(self.out, "rb") as fh:
             raw = fh.read()
         self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))      # BOM
-        self.assertIn("Название;ФИО директора;Почта".encode(), raw)
+        self.assertIn(";".join(HEADER).encode(), raw)
 
     def test_director_falls_back_to_search_result(self):
         egrul = FakeEgrul({A: (b"no-director", "Генеральный директор: Петров Пётр Петрович")})
@@ -126,7 +132,7 @@ class LeadsTest(LeadsCase):
 
     def test_company_with_email_is_kept_even_without_director(self):
         self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))
-        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru"])
+        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru", "", ""])
 
     def test_log_has_no_personal_data(self):
         self.run_leads(self.standard_egrul())
@@ -143,6 +149,27 @@ class LeadsTest(LeadsCase):
         self.run_leads(second)
         self.assertEqual(second.searched, [C])            # A и B повторно не проверяются
 
+    def test_entry_saved_before_okved_existed_is_filled_in_once(self):
+        old = {A: {"status": leads.OK, "name": "ФИРМА", "director": "Иванов", "email": "sales@example.ru", "note": ""},
+               B: {"status": leads.NO_EMAIL, "name": "Б", "director": "", "email": "", "note": ""}}
+        os.makedirs(os.path.dirname(self.out))
+        with open(leads.state_path(self.out), "w", encoding="utf-8") as fh:
+            json.dump(old, fh, ensure_ascii=False)
+        first = self.standard_egrul()
+        self.run_leads(first, FakeChecko(companies(A, B)))
+        self.assertEqual(first.searched, [A])               # без почты не трогаем, с почтой дозаполняем
+        self.assertEqual(self.read_csv()[1][3:], OKVED)
+        second = self.standard_egrul()
+        self.run_leads(second, FakeChecko(companies(A, B)))
+        self.assertEqual(second.searched, [])               # во второй раз - уже не нужно
+
+    def test_company_without_okved_is_not_asked_again(self):
+        self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))      # в этой выписке ОКВЭД нет
+        self.assertEqual(self.read_csv()[1][3:], ["", ""])
+        again = FakeEgrul({A: (b"no-director", "")})
+        self.run_leads(again, FakeChecko(companies(A)))
+        self.assertEqual(again.searched, [])
+
     def test_retry_company_appears_when_registry_catches_up(self):
         self.run_leads(self.standard_egrul())
         later = FakeEgrul({A: (b"with-email", ""), B: (b"no-email", ""), C: (b"with-email", "")})
@@ -154,7 +181,7 @@ class LeadsTest(LeadsCase):
         self.run_leads(egrul, FakeChecko(companies(A)))
         self.assertEqual(self.state()[A]["status"], leads.RETRY)
         self.assertIn("таймаут", self.state()[A]["note"])
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+        self.assertEqual(self.read_csv(), [HEADER])
         fixed = FakeEgrul({A: (b"with-email", "")})
         self.run_leads(fixed, FakeChecko(companies(A)))
         self.assertEqual(len(self.read_csv()), 2)
@@ -243,7 +270,7 @@ class LeadsTest(LeadsCase):
 
     def test_nothing_found_still_writes_an_empty_table(self):
         self.assertEqual(self.run_leads(self.standard_egrul(), FakeChecko([])), 0)
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+        self.assertEqual(self.read_csv(), [HEADER])
 
 
 class FakeApi:
@@ -262,7 +289,9 @@ class FakeApi:
 
 
 def api_payload(email="", register=True, fio="Иванов Иван Иванович"):
-    body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
+    body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}],
+                     "ОКВЭД": {"Код": OKVED[0], "Наим": OKVED[1], "Версия": "2014"}},
+            "meta": {"status": "ok"}}
     if email and register:
         body["source_data"] = {"СвАдрЭлПочты": {"E-mail": email}}
     elif email:
@@ -279,8 +308,8 @@ class ApiSourceTest(LeadsCase):
     def test_statuses_and_table(self):
         api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.assertEqual(self.run_api(api), 0)
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"],
-                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru"]])
+        self.assertEqual(self.read_csv(), [HEADER,
+                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru"] + OKVED])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
         self.assertIn("нет в Checko", self.state()[C]["note"])

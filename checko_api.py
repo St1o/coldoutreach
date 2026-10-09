@@ -6,6 +6,8 @@
 Из ответа берутся:
     * название  - data.НаимСокр / data.НаимПолн;
     * директор  - data.Руковод[].ФИО (первый с ФИО);
+    * основной ОКВЭД - data.ОКВЭД (код и название); если там пусто, из исходных данных ЕГРЮЛ
+                  (СвОКВЭДОсн: КодОКВЭД / НаимОКВЭД);
     * почта     - сначала из исходных данных ЕГРЮЛ (source_data, это та же почта, что в выписке),
                   иначе из data.Контакты.Емэйл (контакты «из открытых источников», могут быть
                   неполными или устаревшими - такие случаи помечаются).
@@ -46,6 +48,8 @@ class CompanyInfo:
     director: str = ""
     email: str = ""
     email_from_register: bool = False      # True - почта из ЕГРЮЛ, False - из контактов Checko
+    okved: str = ""                        # код основного вида деятельности, например «62.01»
+    okved_name: str = ""
 
 
 def _strings(node):
@@ -79,6 +83,49 @@ def _register_email(node) -> str:
     return ""
 
 
+def _first(node: dict, *keys) -> str:
+    for key in keys:
+        value = node.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _find_key(node, key):
+    """Первое значение по ключу во вложенной структуре (в разборе ЕГРЮЛ ключ лежит глубоко)."""
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for value in node.values():
+            found = _find_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_key(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _main_okved(payload: dict):
+    """(код, название) основного ОКВЭД. Сначала поле Checko, затем исходные данные ЕГРЮЛ."""
+    own = (payload.get("data") or {}).get("ОКВЭД")
+    if isinstance(own, dict):
+        code, name = _first(own, "Код"), _first(own, "Наим", "Наименование", "Назв")
+        if code:
+            return code, name
+    elif isinstance(own, str) and own.strip():
+        code, _, name = own.strip().partition(" ")
+        return code, name.strip()
+
+    main = _find_key(payload.get("source_data"), "СвОКВЭДОсн")
+    if isinstance(main, dict):
+        attrs = main.get("@attributes") if isinstance(main.get("@attributes"), dict) else main
+        return _first(attrs, "КодОКВЭД"), _first(attrs, "НаимОКВЭД")
+    return "", ""
+
+
 def parse_company(payload: dict) -> CompanyInfo:
     data = payload.get("data") or {}
     info = CompanyInfo(name=data.get("НаимСокр") or data.get("НаимПолн") or "")
@@ -88,6 +135,8 @@ def parse_company(payload: dict) -> CompanyInfo:
         if fio:
             info.director = fio.title() if fio.isupper() else fio
             break
+
+    info.okved, info.okved_name = _main_okved(payload)
 
     info.email = _register_email(payload.get("source_data"))
     info.email_from_register = bool(info.email)
