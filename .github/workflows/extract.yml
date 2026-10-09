@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   extract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04     # зафиксирована: ubuntu-latest с 19.10.2026 перейдёт на Ubuntu 26
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
