@@ -289,11 +289,15 @@ class Handler(BaseHTTPRequestHandler):
                        [("Content-Disposition", f'attachment; filename="{name}"')])
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/leads/start":
+        path = urlparse(self.path).path
+        if path not in ("/api/leads/start", "/api/leads/stop"):
             self._error(404, "Страница не найдена.")
             return
         job = self._leads_enabled()
         if job is None or not self._leads_authorized(job):
+            return
+        if path == "/api/leads/stop":
+            self._json(200, {"was_running": job.stop()})
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)

@@ -288,11 +288,16 @@ class LeadsWebTest(unittest.TestCase):
         self.code = 0
         self.gate = None            # Event: пока не set(), выгрузка «идёт»
         self.error = None
+        self.until_stop = False     # выгрузка идёт, пока её не попросят остановиться
 
     def fake_run(self, target, out, limit=0, log=print, **kwargs):
         self.calls.append((target, limit))
         self.kwargs = kwargs
         log("Найдено организаций: 1")
+        if self.until_stop:
+            while not kwargs["should_stop"]():
+                time.sleep(0.01)
+            return 4
         if self.gate:
             self.gate.wait(5)
         if self.error:
@@ -407,6 +412,29 @@ class LeadsWebTest(unittest.TestCase):
         for pause in (0.5, 61, "долго"):
             self.assertEqual(self.request("/api/leads/start", "POST", {"pause": pause})[0], 400, pause)
         self.assertEqual(self.calls, [])
+
+    def test_stop_button(self):
+        self.until_stop = True
+        job = self.start()
+        self.assertEqual(self.request("/api/leads/stop", "POST", {}, token=None)[0], 401)     # нужен пароль
+        self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": False})
+        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
+        self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": True})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["state"], "stopped")
+        self.assertIn("Остановлено вами", data["message"])
+        self.until_stop = False
+        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)      # снова можно
+        job.join(5)
+
+    def test_export_waits_out_a_captcha(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"limit": 1})
+        job.join(5)
+        self.assertEqual(self.kwargs["captcha_wait"], 600)
+        self.assertTrue(callable(self.kwargs["should_stop"]))
 
     def test_pause_is_passed_to_the_export(self):
         job = self.start()

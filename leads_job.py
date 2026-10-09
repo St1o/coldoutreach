@@ -22,7 +22,9 @@ STATE_LABELS = {
         "сохранена. Подождите, поставьте паузу побольше и запустите снова: проверенные организации "
         "повторно не проверяются."),
     3: "Checko недоступен с этого сервера, подробности в журнале ниже.",
+    4: "Остановлено вами. Готовая часть сохранена.",
 }
+CAPTCHA_WAIT = 600          # секунд: при капче ФНС ждём и продолжаем
 
 
 class JobRunning(Exception):
@@ -35,6 +37,7 @@ class LeadsJob:
         self._run = run
         self._out_dir = out_dir or tempfile.gettempdir()
         self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._lines = deque(maxlen=60)
         self._thread: Optional[threading.Thread] = None
         self._state = "idle"          # idle | running | done | stopped | error
@@ -56,6 +59,7 @@ class LeadsJob:
             if self._state == "running":
                 raise JobRunning()
             self._state, self._message = "running", ""
+            self._stop.clear()
             self._target, self._limit = target, limit
             self._out = os.path.join(self._out_dir, f"leads_{target.isoformat()}.csv")
             self._lines.clear()
@@ -65,13 +69,22 @@ class LeadsJob:
     def _work(self, target, limit, out, text="", pause=6.0):
         extra = {"checko": PastedPages(text)} if text.strip() else {}
         try:
-            code = self._run(target, out, limit=limit, pause=pause, log=self._lines.append, **extra)
+            code = self._run(target, out, limit=limit, pause=pause, log=self._lines.append,
+                            captcha_wait=CAPTCHA_WAIT, should_stop=self._stop.is_set, **extra)
             state = "done" if code == 0 else "stopped"
             message = STATE_LABELS.get(code, f"Завершено с кодом {code}.")
         except Exception as exc:        # любая неожиданность не должна оставлять «идёт»
             state, message = "error", f"Ошибка: {exc}"
         with self._lock:
             self._state, self._message = state, message
+
+    def stop(self) -> bool:
+        """Просит остановить идущую выгрузку (готовая часть сохраняется). True - она шла."""
+        with self._lock:
+            running = self._state == "running"
+        if running:
+            self._stop.set()
+        return running
 
     def join(self, timeout=None):
         if self._thread:

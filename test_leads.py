@@ -54,6 +54,20 @@ class FakeEgrul:
         return record.token.encode()
 
 
+class FlakyEgrul(FakeEgrul):
+    """Первые `captcha_times` обращений отвечает капчей, дальше работает как обычно."""
+
+    def __init__(self, table, captcha_times):
+        super().__init__(table)
+        self.captcha_left = captcha_times
+
+    def search_by_inn(self, inn):
+        if self.captcha_left > 0:
+            self.captcha_left -= 1
+            raise EgrulCaptchaRequired("капча")
+        return super().search_by_inn(inn)
+
+
 def companies(*inns):
     return [NewCompany(inn=i, ogrn="1" * 13, reg_date=DAY, name=f"checko {i}") for i in inns]
 
@@ -156,6 +170,47 @@ class LeadsTest(unittest.TestCase):
         self.assertEqual(len(self.read_csv()), 2)           # A сохранён
         self.assertIn(A, self.state())
         self.assertNotIn(B, self.state())
+
+    # ---- ожидание при капче и остановка ----
+
+    def test_waits_after_captcha_and_continues(self):
+        egrul = FlakyEgrul({A: (b"with-email", "")}, captcha_times=2)
+        sleeps = []
+        code = self.run_leads(egrul, FakeChecko(companies(A)), captcha_wait=600, sleep=sleeps.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(sum(sleeps), 1200)                       # дважды по 10 минут
+        self.assertEqual(self.state()[A]["status"], leads.OK)
+        text = "\n".join(self.logs)
+        self.assertIn("Ждём 10 мин", text)
+        self.assertIn("(2/6)", text)
+
+    def test_gives_up_after_too_many_captchas(self):
+        egrul = FlakyEgrul({A: (b"with-email", "")}, captcha_times=99)
+        code = self.run_leads(egrul, FakeChecko(companies(A)), captcha_wait=60, captcha_retries=2,
+                              sleep=lambda s: None)
+        self.assertEqual(code, 2)
+        self.assertNotIn(A, self.state())
+        self.assertIn("(2/2)", "\n".join(self.logs))
+
+    def test_captcha_without_wait_stops_at_once(self):
+        egrul = FlakyEgrul({A: (b"with-email", "")}, captcha_times=1)
+        self.assertEqual(self.run_leads(egrul, FakeChecko(companies(A))), 2)
+
+    def test_stop_during_captcha_wait(self):
+        egrul = FlakyEgrul({A: (b"with-email", "")}, captcha_times=99)
+        sleeps = []
+        code = self.run_leads(egrul, FakeChecko(companies(A)), captcha_wait=600, sleep=sleeps.append,
+                              should_stop=lambda: len(sleeps) >= 3)
+        self.assertEqual(code, 4)
+        self.assertEqual(len(sleeps), 3)                          # не досидели 10 минут
+        self.assertIn("Остановлено по запросу", "\n".join(self.logs))
+
+    def test_stop_between_companies_keeps_finished_ones(self):
+        egrul = FakeEgrul({A: (b"with-email", ""), B: (b"with-email", ""), C: (b"with-email", "")})
+        code = self.run_leads(egrul, should_stop=lambda: len(egrul.searched) >= 1)
+        self.assertEqual(code, 4)
+        self.assertEqual(egrul.searched, [A])
+        self.assertEqual(len(self.read_csv()), 2)                 # заголовок и A
 
     def test_limit(self):
         egrul = self.standard_egrul()

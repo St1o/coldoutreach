@@ -114,9 +114,26 @@ def count(state: dict, status: str) -> int:
     return sum(1 for entry in state.values() if entry["status"] == status)
 
 
+def _wait(seconds: float, should_stop, sleep) -> bool:
+    """Ждёт, проверяя каждую секунду, не попросили ли остановиться. True - остановили."""
+    remaining = seconds
+    while remaining > 0:
+        step = min(1.0, remaining)
+        sleep(step)
+        remaining -= step
+        if should_stop():
+            return True
+    return should_stop()
+
+
 def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: int = 25,
-        checko=None, egrul=None, log=print) -> int:
-    """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен."""
+        checko=None, egrul=None, log=print, captcha_wait: float = 0.0, captcha_retries: int = 6,
+        should_stop=lambda: False, sleep=time.sleep) -> int:
+    """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
+    4 - остановлено пользователем.
+
+    captcha_wait > 0: при капче ждать столько секунд и пробовать ту же организацию снова
+    (не больше captcha_retries раз подряд); пауза - это ожидание, а не обход ограничения."""
     checko = checko or CheckoClient()
     egrul = egrul or EgrulClient()
 
@@ -140,19 +157,33 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
 
     code = 0
     for number, company in enumerate(todo, 1):
-        if number > 1:
-            time.sleep(pause)               # не нагружаем сайт ФНС
-        try:
-            entry = process_company(egrul, company)
-        except EgrulCaptchaRequired:
-            log("ФНС просит капчу - останавливаемся. Результат сохранён, повторите позже.")
-            code = 2
+        if should_stop() or (number > 1 and _wait(pause, should_stop, sleep)):   # пауза: не нагружаем ФНС
+            code = 4
+            break
+        entry, attempts = None, 0
+        while entry is None:
+            try:
+                entry = process_company(egrul, company)
+            except EgrulCaptchaRequired:
+                attempts += 1
+                if not captcha_wait or attempts > captcha_retries:
+                    log("ФНС просит капчу - останавливаемся. Результат сохранён, повторите позже.")
+                    code = 2
+                    break
+                log(f"ФНС просит капчу. Ждём {captcha_wait / 60:g} мин и пробуем снова "
+                    f"({attempts}/{captcha_retries}).")
+                if _wait(captcha_wait, should_stop, sleep):
+                    code = 4
+                    break
+        if entry is None:
             break
         state[company.inn] = entry
         save_results(out, state)
         # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
         log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
             + (f" ({entry['note']})" if entry["note"] else ""))
+    if code == 4:
+        log("Остановлено по запросу. Результат сохранён.")
 
     save_results(out, state)                # файл создаётся и когда обработать нечего
     log(f"Готово. В таблице {out}: {count(state, OK)} организаций с почтой. "
@@ -169,11 +200,14 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="сколько организаций проверить за запуск (0 - все)")
     parser.add_argument("--pause", type=float, default=2.0, help="пауза между организациями, с")
     parser.add_argument("--max-pages", type=int, default=25, help="сколько страниц Checko просматривать")
+    parser.add_argument("--captcha-wait", type=float, default=0,
+                        help="при капче ФНС ждать столько минут и продолжать (0 - остановиться)")
     args = parser.parse_args(argv)
 
     target = args.date or today_moscow()
     out = args.out or f"leads_{target.isoformat()}.csv"
-    return run(target, out, args.limit, args.pause, args.max_pages)
+    return run(target, out, args.limit, args.pause, args.max_pages,
+               captcha_wait=args.captcha_wait * 60)
 
 
 if __name__ == "__main__":
