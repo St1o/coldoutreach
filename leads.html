@@ -53,9 +53,6 @@
   .check input { width: auto; margin: 0; }
   .link { background: none; border: 0; padding: 0; margin-left: auto; font-weight: 400; font-size: .85rem;
           color: var(--muted); text-decoration: underline; }
-  details { margin: 0 0 14px; }
-  summary { cursor: pointer; font-weight: 600; }
-  details p { color: var(--muted); font-size: .9rem; margin: 8px 0; }
   textarea {
     width: 100%; min-height: 120px; padding: 12px 14px; font: inherit; font-size: .85rem;
     color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
@@ -90,14 +87,10 @@
         <input id="limit" type="number" min="0" max="2000" value="5">
       </div>
     </div>
-    <details id="paste">
-      <summary>Checko не пускает сервер? Вставьте текст страниц сами</summary>
-      <p>Откройте <b>checko.ru/company/updates</b> в своём браузере, нажмите Ctrl+A, затем Ctrl+C и вставьте
-         сюда (Ctrl+V). Если нужный день занимает несколько страниц, откройте вторую, третью и так далее и
-         добавляйте их текст сюда же, пока даты не станут вчерашними. Сервер возьмёт из текста организации
-         за выбранный день.</p>
-      <textarea id="text" spellcheck="false" placeholder="Текст страниц Checko…"></textarea>
-    </details>
+    <div class="field">
+      <label for="text">Текст с Checko <span class="hint">откройте checko.ru/company/updates, Ctrl+A, Ctrl+C и вставьте сюда; если день занимает несколько страниц, добавьте текст остальных</span></label>
+      <textarea id="text" spellcheck="false" placeholder="Текст страницы Checko…"></textarea>
+    </div>
     <button id="start" type="submit">Запустить</button>
     <button id="stop" type="button" class="secondary" hidden>Остановить</button>
     <p id="status" role="status" aria-live="polite"></p>
@@ -176,7 +169,7 @@ async function poll(quiet) {
       $('start').disabled = false;
       const kind = data.state === 'done' ? 'ok' : (data.state === 'idle' ? '' : 'error');
       if (data.state === 'stopped' && data.log.join(' ').includes('Checko недоступен')) {
-        $('paste').open = true;
+        $('text').focus();
       }
       setStatus(data.message || '', kind);
     }
