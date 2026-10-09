@@ -308,11 +308,14 @@ class Handler(BaseHTTPRequestHandler):
             text = body.get("text") or ""
             if not isinstance(text, str):
                 raise ValueError
+            pause = float(body.get("pause") or 6)
+            if not 1 <= pause <= 60:
+                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
-            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество от 0 до 2000, текст не больше 2 МБ.")
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, пауза 1-60 с, текст до 2 МБ.")
             return
         try:
-            job.start(target, limit, text)
+            job.start(target, limit, text, pause)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return

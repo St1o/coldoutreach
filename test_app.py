@@ -404,7 +404,18 @@ class LeadsWebTest(unittest.TestCase):
         with mock.patch("app.MAX_BODY", 500):                  # слишком большое тело запроса
             self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 600 + b"}")[0], 400)
         self.assertEqual(self.request("/api/leads/start", "POST", {"text": 123})[0], 400)
+        for pause in (0.5, 61, "долго"):
+            self.assertEqual(self.request("/api/leads/start", "POST", {"pause": pause})[0], 400, pause)
         self.assertEqual(self.calls, [])
+
+    def test_pause_is_passed_to_the_export(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 12})
+        job.join(5)
+        self.assertEqual(self.kwargs["pause"], 12)
+        self.request("/api/leads/start", "POST", {"limit": 1})
+        job.join(5)
+        self.assertEqual(self.kwargs["pause"], 6)             # по умолчанию 6 секунд
 
     def test_pasted_text_replaces_checko(self):
         from checko_updates import PastedPages

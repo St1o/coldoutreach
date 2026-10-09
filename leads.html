@@ -48,6 +48,10 @@
   .counts { display: flex; gap: 20px; flex-wrap: wrap; margin: 0 0 12px; }
   .counts b { font-size: 1.4rem; display: block; }
   .counts span { color: var(--muted); font-size: .85rem; }
+  .check { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 8px 0 0; font-size: .9rem; }
+  .check input { width: auto; margin: 0; }
+  .link { background: none; border: 0; padding: 0; margin-left: auto; font-weight: 400; font-size: .85rem;
+          color: var(--muted); text-decoration: underline; }
   details { margin: 0 0 14px; }
   summary { cursor: pointer; font-weight: 600; }
   details p { color: var(--muted); font-size: .9rem; margin: 8px 0; }
@@ -71,7 +75,9 @@
   <form id="form" class="card" autocomplete="off">
     <div class="field">
       <label for="token">Пароль</label>
-      <input id="token" type="password" autocomplete="off" required>
+      <input id="token" name="password" type="password" autocomplete="current-password" required>
+      <label class="check"><input id="remember" type="checkbox" checked> Запомнить пароль в этом браузере
+        <button id="forget" class="link" type="button">Забыть</button></label>
     </div>
     <div class="row">
       <div class="field">
@@ -81,6 +87,10 @@
       <div class="field">
         <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
         <input id="limit" type="number" min="0" max="2000" value="5">
+      </div>
+      <div class="field">
+        <label for="pause">Пауза, с <span class="hint">между организациями</span></label>
+        <input id="pause" type="number" min="1" max="60" value="6">
       </div>
     </div>
     <details id="paste">
@@ -109,6 +119,17 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let timer = null;
+const STORE = 'leads-password';          // хранится только в этом браузере, на сервер не уходит иначе как в заголовке запроса
+
+function savedPassword() {
+  try { return localStorage.getItem(STORE) || ''; } catch (e) { return ''; }
+}
+function rememberPassword(on) {
+  try {
+    if (on) localStorage.setItem(STORE, $('token').value);
+    else localStorage.removeItem(STORE);
+  } catch (e) { /* хранилище недоступно - просто не запоминаем */ }
+}
 
 function setStatus(text, kind) {
   const el = $('status');
@@ -141,9 +162,13 @@ function render(data) {
   $('download').hidden = !data.has_table;
 }
 
-async function poll() {
+async function poll(quiet) {
   try {
     const data = await (await api('/api/leads/status')).json();
+    if (data.state === 'idle') {
+      $('start').disabled = false;
+      return;                                  // ничего ещё не запускали
+    }
     render(data);
     if (data.state === 'running') {
       setStatus('Идёт выгрузка за ' + data.date + '. Не закрывайте страницу: пока она открыта, сервер не засыпает.');
@@ -158,6 +183,7 @@ async function poll() {
     }
   } catch (error) {
     $('start').disabled = false;
+    if (quiet) { rememberPassword(false); $('token').value = ''; return; }   // старый пароль не подошёл
     setStatus(error.message, 'error');
   }
 }
@@ -171,14 +197,28 @@ $('form').addEventListener('submit', async (event) => {
     await api('/api/leads/start', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
-      body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0), text: $('text').value }),
+      body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0),
+                            pause: Number($('pause').value || 6), text: $('text').value }),
     });
+    rememberPassword($('remember').checked);
     poll();
   } catch (error) {
     $('start').disabled = false;
     setStatus(error.message, 'error');
   }
 });
+
+$('forget').addEventListener('click', () => {
+  rememberPassword(false);
+  $('token').value = '';
+  setStatus('Пароль удалён из этого браузера.');
+});
+
+const saved = savedPassword();
+if (saved) {                                    // пароль уже вводили: подставляем и показываем текущее состояние
+  $('token').value = saved;
+  poll(true);
+}
 
 $('download').addEventListener('click', async () => {
   try {
