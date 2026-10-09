@@ -339,14 +339,14 @@ class LeadsWebTest(unittest.TestCase):
             self.start(token)
             self.assertEqual(self.request("/leads")[0], 404)
             self.assertEqual(self.request("/api/leads/status", token="short")[0], 404)
-            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token="short")[0], 404)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1}, token="short")[0], 404)
         self.assertEqual(self.calls, [])
 
     def test_wrong_or_missing_password(self):
         self.start()
         for token in ("wrong", None):
             self.assertEqual(self.request("/api/leads/status", token=token)[0], 401)
-            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token=token)[0], 401)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1}, token=token)[0], 401)
         self.assertEqual(self.calls, [])
 
     def test_password_guessing_is_limited(self):
@@ -387,21 +387,23 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
                          [["Название", "ФИО директора", "Почта", "Основной ОКВЭД"], ["ФИРМА", "Иванов Иван", "a@b.ru", None]])
 
-    def test_empty_date_means_today_in_moscow(self):
-        job = self.start()
-        self.request("/api/leads/start", "POST", {"date": "", "limit": 0})
-        job.join(5)
-        self.assertEqual(self.calls, [(leads.today_moscow(), 0)])
+    def test_the_date_must_be_chosen_by_the_user(self):
+        self.start()
+        for body in ({"limit": 1}, {"date": "", "limit": 1}, {"date": "   "}):
+            status, _, answer = self.request("/api/leads/start", "POST", body)
+            self.assertEqual(status, 400, body)
+            self.assertIn("Укажите дату", json.loads(answer)["error"])
+        self.assertEqual(self.calls, [])                       # ни одного запроса за «сегодня» по умолчанию
 
     def test_second_start_while_running_is_rejected(self):
         self.gate = threading.Event()
         job = self.start()
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 409)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 409)
         self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
         self.gate.set()
         job.join(5)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)   # снова можно
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)   # снова можно
         job.join(5)
 
     def test_invalid_input_is_rejected(self):
@@ -414,7 +416,7 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual(self.request("/api/leads/start", "POST", b"")[0], 400)
         with mock.patch("app.MAX_BODY", 500):                  # слишком большое тело запроса
             self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 600 + b"}")[0], 400)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"text": 123})[0], 400)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "text": 123})[0], 400)
         self.assertEqual(self.calls, [])
 
     def test_stop_button(self):
@@ -422,7 +424,7 @@ class LeadsWebTest(unittest.TestCase):
         job = self.start()
         self.assertEqual(self.request("/api/leads/stop", "POST", {}, token=None)[0], 401)     # нужен пароль
         self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": False})
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
         self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": True})
         job.join(5)
@@ -430,12 +432,12 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual(data["state"], "stopped")
         self.assertIn("Остановлено вами", data["message"])
         self.until_stop = False
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)      # снова можно
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)      # снова можно
         job.join(5)
 
     def test_export_can_be_stopped(self):
         job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
         self.assertTrue(callable(self.kwargs["should_stop"]))
 
@@ -449,14 +451,14 @@ class LeadsWebTest(unittest.TestCase):
 
     def test_export_always_goes_through_the_api_with_a_short_pause(self):
         job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20, "source": "egrul"})   # лишние поля не нужны
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1, "pause": 20, "source": "egrul"})   # лишние поля не нужны
         job.join(5)
         self.assertIn("process", self.kwargs)
         self.assertEqual(self.kwargs["pause"], 0.05)            # API без капчи: лимит 32 в секунду, мы не больше 20
 
     def test_without_a_key_the_export_is_refused_with_a_hint(self):
         self.start(api_key="")
-        status, _, body = self.request("/api/leads/start", "POST", {"limit": 1})
+        status, _, body = self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         self.assertEqual(status, 400)
         self.assertIn("CHECKO_API_KEY", json.loads(body)["error"])
         self.assertEqual(self.calls, [])
@@ -482,14 +484,14 @@ class LeadsWebTest(unittest.TestCase):
     def test_stop_and_error_states(self):
         job = self.start()
         self.code = 3
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
         data = json.loads(self.request("/api/leads/status")[2])
         self.assertEqual(data["state"], "stopped")
         self.assertIn("Checko", data["message"])
 
         self.error = RuntimeError("сломалось")
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
         data = json.loads(self.request("/api/leads/status")[2])
         self.assertEqual(data["state"], "error")

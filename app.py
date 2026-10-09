@@ -32,7 +32,6 @@ from urllib.parse import parse_qs, urlparse
 from egrul_inn_search import (
     EgrulCaptchaRequired, EgrulClient, EgrulError, EgrulTimeout, validate_inn,
 )
-from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -306,7 +305,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             raw_date = str(body.get("date") or "").strip()
-            target = date.fromisoformat(raw_date) if raw_date else leads_today()
+            if not raw_date:
+                self._error(400, "Укажите дату регистрации (ГГГГ-ММ-ДД): она должна совпадать с датой в тексте с Checko.")
+                return
+            target = date.fromisoformat(raw_date)
             limit = int(body.get("limit") or 0)
             if not 0 <= limit <= 2000:
                 raise ValueError

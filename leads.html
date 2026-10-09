@@ -88,7 +88,7 @@
     <div class="row">
       <div class="field">
         <label for="date">Дата регистрации <span class="hint">ГГГГ-ММ-ДД</span></label>
-        <input id="date" placeholder="ГГГГ-ММ-ДД" pattern="\d{4}-\d{2}-\d{2}">
+        <input id="date" placeholder="ГГГГ-ММ-ДД" pattern="\d{4}-\d{2}-\d{2}" required>
       </div>
       <div class="field">
         <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
@@ -255,11 +255,9 @@ $('forget').addEventListener('click', () => {
   setStatus('Пароль удалён из этого браузера.');
 });
 
-// Дата: по умолчанию сегодня (по Москве). Вставили текст - берём самую свежую дату из него, если дату не меняли руками.
+// Дату вы выбираете сами, страница её не подставляет и не меняет. Под текстом показано только, какие даты в нём есть.
 const MONTHS = { января: 1, февраля: 2, марта: 3, апреля: 4, мая: 5, июня: 6, июля: 7, августа: 8, сентября: 9,
                  октября: 10, ноября: 11, декабря: 12 };
-let dateTouched = false;
-try { $('date').value = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Moscow' }).format(new Date()); } catch (e) { /* пусто = сегодня на сервере */ }
 
 function datesInText(text) {
   const counts = {};
@@ -280,12 +278,13 @@ function updateDatesHint() {
   const hint = $('dates-hint');
   hint.hidden = !days.length;
   if (!days.length) return;
-  if (!dateTouched && !counts[$('date').value]) $('date').value = days[0];
+  const chosen = $('date').value.trim();
   hint.textContent = 'В тексте организации за: ' + days.map((day) => day + ' (' + counts[day] + ')').join(', ') + '.'
-    + (counts[$('date').value] ? '' : ' За выбранную дату в тексте организаций нет: укажите одну из этих дат.');
+    + (!chosen ? ' Укажите дату.' : counts[chosen] ? ' Будут взяты только организации за ' + chosen + '.'
+       : ' За ' + chosen + ' в тексте организаций нет: выберите одну из этих дат.');
 }
 $('text').addEventListener('input', updateDatesHint);
-$('date').addEventListener('input', () => { dateTouched = true; updateDatesHint(); });
+$('date').addEventListener('input', updateDatesHint);
 
 const saved = savedPassword();
 if (saved) {                                    // пароль уже вводили: подставляем и показываем текущее состояние
