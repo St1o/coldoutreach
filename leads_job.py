@@ -1,0 +1,100 @@
+"""Фоновая выгрузка «новые организации -> таблица» для сайта (страница /leads).
+
+Выгрузка идёт в отдельном потоке и дольше, чем живёт один запрос, поэтому страница
+опрашивает состояние. Одновременно работает только одна выгрузка. Доступ закрыт паролем
+(переменная окружения LEADS_TOKEN, не короче 12 знаков); без пароля страница отключена.
+"""
+import hmac
+import os
+import tempfile
+import threading
+from collections import deque
+from datetime import date
+from typing import Optional
+
+import leads
+
+MIN_TOKEN_LENGTH = 12
+STATE_LABELS = {
+    0: "Готово.",
+    2: "ФНС потребовала капчу, выгрузка остановлена (готовая часть сохранена).",
+    3: "Checko недоступен с этого сервера, подробности в журнале ниже.",
+}
+
+
+class JobRunning(Exception):
+    """Выгрузка уже идёт."""
+
+
+class LeadsJob:
+    def __init__(self, token: str = "", run=leads.run, out_dir: Optional[str] = None):
+        self.token = token if len(token or "") >= MIN_TOKEN_LENGTH else ""
+        self._run = run
+        self._out_dir = out_dir or tempfile.gettempdir()
+        self._lock = threading.Lock()
+        self._lines = deque(maxlen=60)
+        self._thread: Optional[threading.Thread] = None
+        self._state = "idle"          # idle | running | done | stopped | error
+        self._message = ""
+        self._target: Optional[date] = None
+        self._limit = 0
+        self._out: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    def check_token(self, candidate: str) -> bool:
+        return self.enabled and hmac.compare_digest(
+            (candidate or "").encode("utf-8"), self.token.encode("utf-8"))
+
+    def start(self, target: date, limit: int) -> None:
+        with self._lock:
+            if self._state == "running":
+                raise JobRunning()
+            self._state, self._message = "running", ""
+            self._target, self._limit = target, limit
+            self._out = os.path.join(self._out_dir, f"leads_{target.isoformat()}.csv")
+            self._lines.clear()
+            self._thread = threading.Thread(target=self._work, args=(target, limit, self._out), daemon=True)
+            self._thread.start()
+
+    def _work(self, target, limit, out):
+        try:
+            code = self._run(target, out, limit=limit, log=self._lines.append)
+            state = "done" if code == 0 else "stopped"
+            message = STATE_LABELS.get(code, f"Завершено с кодом {code}.")
+        except Exception as exc:        # любая неожиданность не должна оставлять «идёт»
+            state, message = "error", f"Ошибка: {exc}"
+        with self._lock:
+            self._state, self._message = state, message
+
+    def join(self, timeout=None):
+        if self._thread:
+            self._thread.join(timeout)
+
+    def status(self) -> dict:
+        with self._lock:
+            state, message = self._state, self._message
+            target, limit, out = self._target, self._limit, self._out
+        counts = {leads.OK: 0, leads.NO_EMAIL: 0, leads.RETRY: 0}
+        if out:
+            saved = leads.load_state(leads.state_path(out))
+            counts = {status: leads.count(saved, status) for status in counts}
+        return {
+            "state": state,
+            "message": message,
+            "date": target.isoformat() if target else "",
+            "limit": limit,
+            "counts": counts,
+            "log": list(self._lines),
+            "has_table": bool(out and os.path.exists(out) and counts[leads.OK]),
+        }
+
+    def table(self):
+        """(имя файла, содержимое CSV) или None."""
+        out = self._out
+        if not out or not os.path.exists(out):
+            return None
+        with open(out, "rb") as fh:
+            return os.path.basename(out), fh.read()

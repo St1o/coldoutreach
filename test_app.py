@@ -268,5 +268,171 @@ class RateLimiterTest(unittest.TestCase):
         self.assertEqual(limiter.check("a"), 0.0)
 
 
+# ---- закрытая выгрузка «новые компании» (/leads) ----
+
+import datetime
+import tempfile
+
+import leads
+from leads_job import LeadsJob
+
+TOKEN = "correct-horse-battery"
+
+
+class LeadsWebTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.calls = []
+        self.code = 0
+        self.gate = None            # Event: пока не set(), выгрузка «идёт»
+        self.error = None
+
+    def fake_run(self, target, out, limit=0, log=print, **kwargs):
+        self.calls.append((target, limit))
+        log("Найдено организаций: 1")
+        if self.gate:
+            self.gate.wait(5)
+        if self.error:
+            raise self.error
+        entry = {"status": leads.OK, "name": "ФИРМА", "director": "Иванов Иван", "email": "a@b.ru", "note": ""}
+        leads.save_results(out, {"7707083004": entry})
+        log("[1/1] 7707083004: ok")
+        return self.code
+
+    def start(self, token=TOKEN):
+        job = LeadsJob(token, run=self.fake_run, out_dir=self.tmp.name)
+        server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
+                             leads_job=job)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(AppTest.stop, server)
+        self.job, self.base = job, f"http://127.0.0.1:{server.server_port}"
+        return job
+
+    def request(self, path, method="GET", body=None, token=TOKEN):
+        headers = {"X-Leads-Token": token} if token is not None else {}
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    # ---- доступ ----
+
+    def test_disabled_without_a_sufficient_token(self):
+        for token in ("", "short"):
+            self.start(token)
+            self.assertEqual(self.request("/leads")[0], 404)
+            self.assertEqual(self.request("/api/leads/status", token="short")[0], 404)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token="short")[0], 404)
+        self.assertEqual(self.calls, [])
+
+    def test_wrong_or_missing_password(self):
+        self.start()
+        for token in ("wrong", None):
+            self.assertEqual(self.request("/api/leads/status", token=token)[0], 401)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token=token)[0], 401)
+        self.assertEqual(self.calls, [])
+
+    def test_password_guessing_is_limited(self):
+        self.start()
+        codes = [self.request("/api/leads/status", token=f"guess-{i}")[0] for i in range(7)]
+        self.assertEqual(codes[:5], [401] * 5)
+        self.assertEqual(codes[5:], [429, 429])
+
+    def test_page_is_served_when_enabled(self):
+        self.start()
+        status, headers, body = self.request("/leads", token=None)      # сама страница без пароля - только форма
+        self.assertEqual(status, 200)
+        self.assertIn("Запустить".encode(), body)
+        self.assertIn("Content-Security-Policy", headers)
+
+    # ---- работа ----
+
+    def test_full_run_and_download(self):
+        job = self.start()
+        status, _, body = self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        self.assertEqual((status, json.loads(body)["date"]), (202, "2026-10-09"))
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["state"], "done")
+        self.assertEqual(data["counts"], {"ok": 1, "no_email": 0, "retry": 0})
+        self.assertTrue(data["has_table"])
+        self.assertIn("[1/1] 7707083004: ok", data["log"])
+        self.assertEqual(self.calls, [(datetime.date(2026, 10, 9), 5)])
+
+        status, headers, body = self.request("/api/leads/download")
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", headers["Content-Type"])
+        self.assertIn('filename="leads_2026-10-09.csv"', headers["Content-Disposition"])
+        self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("Название;ФИО директора;Почта".encode(), body)
+        self.assertIn("ФИРМА;Иванов Иван;a@b.ru".encode(), body)
+
+    def test_empty_date_means_today_in_moscow(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "", "limit": 0})
+        job.join(5)
+        self.assertEqual(self.calls, [(leads.today_moscow(), 0)])
+
+    def test_second_start_while_running_is_rejected(self):
+        self.gate = threading.Event()
+        job = self.start()
+        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 409)
+        self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
+        self.gate.set()
+        job.join(5)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)   # снова можно
+        job.join(5)
+
+    def test_invalid_input_is_rejected(self):
+        self.start()
+        bad = [{"date": "вчера"}, {"date": "2026-13-45"}, {"limit": -1}, {"limit": 5000}, {"limit": "много"},
+               [1, 2], "строка"]
+        for body in bad:
+            self.assertEqual(self.request("/api/leads/start", "POST", body)[0], 400, body)
+        self.assertEqual(self.request("/api/leads/start", "POST", b"not json")[0], 400)
+        self.assertEqual(self.request("/api/leads/start", "POST", b"")[0], 400)
+        self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 3000 + b"}")[0], 400)
+        self.assertEqual(self.calls, [])
+
+    def test_stop_and_error_states(self):
+        job = self.start()
+        self.code = 3
+        self.request("/api/leads/start", "POST", {"limit": 1})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["state"], "stopped")
+        self.assertIn("Checko", data["message"])
+
+        self.error = RuntimeError("сломалось")
+        self.request("/api/leads/start", "POST", {"limit": 1})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["state"], "error")
+        self.assertIn("сломалось", data["message"])
+
+    def test_download_before_any_run(self):
+        self.start()
+        self.assertEqual(self.request("/api/leads/download")[0], 404)
+        self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "idle")
+
+    def test_get_on_start_endpoint_does_nothing(self):
+        self.start()
+        self.assertEqual(self.request("/api/leads/start")[0], 404)
+        self.assertEqual(self.calls, [])
+
+    def test_public_site_is_unaffected(self):
+        self.start()
+        self.assertEqual(self.request("/healthz", token=None)[0], 200)
+        self.assertEqual(self.request("/", token=None)[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()

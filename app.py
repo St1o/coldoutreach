@@ -25,14 +25,20 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from egrul_inn_search import (
     EgrulCaptchaRequired, EgrulClient, EgrulError, EgrulTimeout, validate_inn,
 )
+from leads import today_moscow as leads_today
+from leads_job import JobRunning, LeadsJob
 
-PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+HERE = os.path.dirname(os.path.abspath(__file__))
+PAGE_PATH = os.path.join(HERE, "index.html")
+LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
+MAX_BODY = 2048
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
 CSP = ("default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -223,6 +229,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, fh.read(), "text/html; charset=utf-8")
         elif url.path == "/healthz":                  # для проверки живости на хостинге
             self._send(200, b"ok", "text/plain; charset=utf-8")
+        elif url.path == "/leads":
+            self._leads_page()
+        elif url.path in ("/api/leads/status", "/api/leads/download"):
+            self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
             wait = self.server.limiter.check(self.client_ip())
             if wait:
@@ -234,6 +244,76 @@ class Handler(BaseHTTPRequestHandler):
             self._api(url.path, inn)
         else:
             self._error(404, "Страница не найдена.")
+
+    # ---- закрытая выгрузка «новые компании» (страница /leads) ----
+
+    def _leads_enabled(self):
+        job = self.server.leads_job
+        if job is None or not job.enabled:
+            self._error(404, "Страница не найдена.")
+            return None
+        return job
+
+    def _leads_authorized(self, job):
+        """Пароль в заголовке X-Leads-Token. Подбор ограничен: 5 неудач в минуту с адреса."""
+        if job.check_token(self.headers.get("X-Leads-Token", "")):
+            return True
+        wait = self.server.auth_limiter.check(self.client_ip())
+        if wait:
+            seconds = math.ceil(wait)
+            self._error(429, f"Слишком много неверных попыток. Повторите через {seconds} с.",
+                        [("Retry-After", str(seconds))])
+        else:
+            self._error(401, "Неверный пароль.")
+        return False
+
+    def _leads_page(self):
+        if self._leads_enabled() is None:
+            return
+        with open(LEADS_PAGE_PATH, "rb") as fh:
+            self._send(200, fh.read(), "text/html; charset=utf-8")
+
+    def _leads_get(self, path):
+        job = self._leads_enabled()
+        if job is None or not self._leads_authorized(job):
+            return
+        if path == "/api/leads/status":
+            self._json(200, job.status())
+            return
+        table = job.table()
+        if table is None:
+            self._error(404, "Таблицы пока нет.")
+        else:
+            name, content = table
+            self._send(200, content, "text/csv; charset=utf-8",
+                       [("Content-Disposition", f'attachment; filename="{name}"')])
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/leads/start":
+            self._error(404, "Страница не найдена.")
+            return
+        job = self._leads_enabled()
+        if job is None or not self._leads_authorized(job):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAX_BODY:
+                raise ValueError
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw_date = str(body.get("date") or "").strip()
+            target = date.fromisoformat(raw_date) if raw_date else leads_today()
+            limit = int(body.get("limit") or 0)
+            if not 0 <= limit <= 2000:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество от 0 до 2000.")
+            return
+        try:
+            job.start(target, limit)
+        except JobRunning:
+            self._error(409, "Выгрузка уже идёт.")
+            return
+        self._json(202, {"started": True, "date": target.isoformat(), "limit": limit})
 
     def _api(self, path, inn):
         service = self.server.service
@@ -264,11 +344,14 @@ class Handler(BaseHTTPRequestHandler):
                              "(недоступен или изменился). Повторите позже.")
 
 
-def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0):
+def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0,
+                leads_job=None):
     server = ThreadingHTTPServer((host, port), Handler)
     server.service = service or Service()
     server.limiter = limiter or RateLimiter()
+    server.auth_limiter = RateLimiter(5, 60)
     server.trusted_proxies = trusted_proxies
+    server.leads_job = leads_job
     return server
 
 
@@ -286,9 +369,14 @@ def main(argv=None):
                         help="сколько прокси хостинга стоит перед сайтом (0 - нет)")
     args = parser.parse_args(argv)
 
+    leads_job = LeadsJob(env("LEADS_TOKEN", ""))
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
-                         RateLimiter(args.rate_limit), args.trusted_proxies)
+                         RateLimiter(args.rate_limit), args.trusted_proxies, leads_job)
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
+    if leads_job.enabled:
+        print("Страница /leads включена (пароль из LEADS_TOKEN).")
+    elif env("LEADS_TOKEN"):
+        print("LEADS_TOKEN короче 12 знаков: страница /leads отключена.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
