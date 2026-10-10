@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 import unittest
@@ -532,6 +533,127 @@ class LeadsWebTest(unittest.TestCase):
         self.start()
         self.assertEqual(self.request("/healthz", token=None)[0], 200)
         self.assertEqual(self.request("/", token=None)[0], 200)
+
+
+# ---- пробное письмо через mail.ru (/mail) ----
+
+import smtplib
+
+from mail_service import MailService
+
+
+class FakeMailSender:
+    user = "sender@internet.ru"
+
+    def __init__(self, outbox, error=None):
+        self.outbox, self.error = outbox, error
+
+    def send(self, msg):
+        if self.error:
+            raise self.error
+        self.outbox.append(msg)
+
+    def close(self):
+        pass
+
+
+class MailWebTest(unittest.TestCase):
+    def start(self, token=TOKEN, configured=True, error=None):
+        self.outbox = []
+        mail = MailService("sender@internet.ru" if configured else "", "secret-app-password" if configured else "",
+                           sender_factory=lambda: FakeMailSender(self.outbox, error))
+        server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
+                             leads_job=LeadsJob(token), mail_service=mail)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(AppTest.stop, server)
+        self.base = f"http://127.0.0.1:{server.server_port}"
+
+    request = LeadsWebTest.request
+
+    def test_hidden_without_a_sufficient_password(self):
+        for token in ("", "short"):
+            self.start(token)
+            self.assertEqual(self.request("/mail", token=None)[0], 404)
+            self.assertEqual(self.request("/api/mail/defaults", token="short")[0], 404)
+            self.assertEqual(self.request("/api/mail/send", "POST", {"to": "a@b.ru"}, token="short")[0], 404)
+        self.assertEqual(self.outbox, [])
+
+    def test_api_needs_the_password(self):
+        self.start()
+        self.assertEqual(self.request("/api/mail/defaults", token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/preview", "POST", {}, token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/send", "POST",
+                                      {"to": "a@b.ru", "subject": "Т", "body": "Х"}, token="wrong-password-123")[0], 401)
+        self.assertEqual(self.outbox, [])
+
+    def test_page_is_served_but_carries_no_data(self):
+        self.start()
+        status, headers, body = self.request("/mail", token=None)
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        text = body.decode("utf-8")
+        self.assertNotIn("secret-app-password", text)
+        self.assertNotIn("sender@internet.ru", text)
+        self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))      # ни одного адреса почты в самой странице
+
+    def test_defaults_give_a_ready_example(self):
+        self.start()
+        status, _, body = self.request("/api/mail/defaults")
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["configured"])
+        self.assertEqual(data["to"], "sender@internet.ru")
+        self.assertIn("ООО «Ромашка»", data["subject"])
+        self.assertNotIn("secret-app-password", body.decode("utf-8"))
+
+    def test_preview_renders_the_template(self):
+        self.start()
+        status, _, body = self.request("/api/mail/preview", "POST", {
+            "company": 'ООО "РОМАШКА"', "director": "ПЕТРОВ СЕРГЕЙ НИКОЛАЕВИЧ", "okved": "торговля",
+            "signature": "Пётр", "offer": "Есть предложение."})
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["subject"], "Вопрос для ООО «Ромашка»")
+        self.assertIn("Добрый день, Сергей Николаевич!", data["body"])
+        self.assertEqual(self.request("/api/mail/preview", "POST", {})[0], 200)        # пустая форма не ломает
+
+    def test_send_delivers_and_reports(self):
+        self.start()
+        status, _, body = self.request("/api/mail/send", "POST",
+                                       {"to": "a@b.ru", "subject": "Тема", "body": "Текст"})
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual([m["To"] for m in self.outbox], ["a@b.ru"])
+        self.assertIn("Message-ID", self.outbox[0])
+
+    def test_errors_reach_the_page_with_a_reason(self):
+        self.start(configured=False)
+        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 503)
+        self.assertIn("MAILRU_APP_PASSWORD", json.loads(body)["error"])
+        self.assertFalse(json.loads(self.request("/api/mail/defaults")[2])["configured"])
+
+        self.start(error=TimeoutError("timed out"))
+        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 504)
+        self.assertIn("Render", json.loads(body)["error"])
+
+        self.start(error=smtplib.SMTPAuthenticationError(535, b"Application password is REQUIRED"))
+        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 502)
+        self.assertNotIn("secret-app-password", json.loads(body)["error"])
+
+    def test_bad_requests(self):
+        self.start()
+        self.assertEqual(self.request("/api/mail/send", "POST", b"not json")[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", b"")[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", [1, 2])[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": 5})[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": "не адрес", "subject": "Т", "body": "Х"})[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "x" * 200_000})[0], 400)
+        self.assertEqual(self.request("/api/mail/send")[0], 404)                       # GET на отправку не работает
+        self.assertEqual(self.outbox, [])
 
 
 if __name__ == "__main__":

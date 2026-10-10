@@ -34,10 +34,15 @@ from egrul_inn_search import (
 )
 from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
+from letter_template import render_letter
+from mail_service import MailError, MailService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "index.html")
 LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
+MAIL_PAGE_PATH = os.path.join(HERE, "mail.html")
+MAIL_MAX_BODY = 100_000       # запрос страницы /mail: тема и текст одного письма
+MAIL_FIELDS = ("company", "director", "okved", "signature", "offer")
 MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
@@ -231,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain; charset=utf-8")
         elif url.path == "/leads":
             self._leads_page()
+        elif url.path == "/mail":
+            self._mail_page()
+        elif url.path == "/api/mail/defaults":
+            self._mail_defaults()
         elif url.path in ("/api/leads/status", "/api/leads/download"):
             self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
@@ -288,8 +297,55 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, content, "text/csv; charset=utf-8",
                        [("Content-Disposition", f'attachment; filename="{name}"')])
 
+    # ---- пробное письмо через mail.ru (страница /mail, тот же пароль, что у /leads) ----
+
+    def _mail_enabled(self):
+        """Служба отправки, если задан пароль страницы (LEADS_TOKEN); иначе страница скрыта (404)."""
+        job, service = self.server.leads_job, self.server.mail_service
+        if job is None or not job.enabled or service is None:
+            self._error(404, "Страница не найдена.")
+            return None
+        return service
+
+    def _mail_page(self):
+        if self._mail_enabled() is None:
+            return
+        with open(MAIL_PAGE_PATH, "rb") as fh:
+            self._send(200, fh.read(), "text/html; charset=utf-8")
+
+    def _mail_defaults(self):
+        service = self._mail_enabled()
+        if service is not None and self._leads_authorized(self.server.leads_job):
+            self._json(200, service.defaults())
+
+    def _mail_post(self, path):
+        service = self._mail_enabled()
+        if service is None or not self._leads_authorized(self.server.leads_job):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAIL_MAX_BODY:
+                raise ValueError
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict) or not all(isinstance(v, str) for v in body.values()):
+                raise ValueError
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "Некорректный запрос: нужен JSON с текстовыми полями до 100 КБ.")
+            return
+        if path == "/api/mail/preview":
+            subject, text = render_letter(**{k: body.get(k, "") for k in MAIL_FIELDS})
+            self._json(200, {"subject": subject, "body": text})
+            return
+        try:
+            self._json(200, service.send(body.get("to", ""), body.get("subject", ""), body.get("body", "")))
+        except MailError as exc:
+            self._error(exc.status, exc.message)
+
     def do_POST(self):
         path = urlparse(self.path).path
+        if path in ("/api/mail/preview", "/api/mail/send"):
+            self._mail_post(path)
+            return
         if path not in ("/api/leads/start", "/api/leads/stop"):
             self._error(404, "Страница не найдена.")
             return
@@ -362,13 +418,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0,
-                leads_job=None):
+                leads_job=None, mail_service=None):
     server = ThreadingHTTPServer((host, port), Handler)
     server.service = service or Service()
     server.limiter = limiter or RateLimiter()
     server.auth_limiter = RateLimiter(5, 60)
     server.trusted_proxies = trusted_proxies
     server.leads_job = leads_job
+    server.mail_service = mail_service
     return server
 
 
@@ -387,14 +444,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     leads_job = LeadsJob(env("LEADS_TOKEN", ""), api_key=env("CHECKO_API_KEY", ""))
+    mail_service = MailService(
+        env("MAILRU_USER", ""), env("MAILRU_APP_PASSWORD", ""), env("MAIL_FROM_NAME", ""),
+        example={"to": env("MAIL_EXAMPLE_TO", ""), "director": env("MAIL_EXAMPLE_DIRECTOR", "")})
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
-                         RateLimiter(args.rate_limit), args.trusted_proxies, leads_job)
+                         RateLimiter(args.rate_limit), args.trusted_proxies, leads_job, mail_service)
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
     if leads_job.enabled:
         print("Страница /leads включена (пароль из LEADS_TOKEN)."
               + (" Источник API Checko доступен." if leads_job.api_available else ""))
     elif env("LEADS_TOKEN"):
-        print("LEADS_TOKEN короче 12 знаков: страница /leads отключена.")
+        print("LEADS_TOKEN короче 12 знаков: страницы /leads и /mail отключены.")
+    if leads_job.enabled:
+        print("Страница /mail включена (тот же пароль)."
+              + ("" if mail_service.configured else " Отправка не настроена: нужны MAILRU_USER и MAILRU_APP_PASSWORD."))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

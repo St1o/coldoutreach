@@ -191,7 +191,7 @@ class MailruSender:
                 pass
 
 
-def _reply(exc) -> str:
+def reply_text(exc) -> str:
     """Код и текст ответа сервера (в ответе нет пароля; адрес получателя может быть)."""
     code = getattr(exc, "smtp_code", None)
     error = getattr(exc, "smtp_error", b"")
@@ -248,14 +248,14 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             try:
                 sender.send(build_message(letter, sender.user, from_name))
             except smtplib.SMTPAuthenticationError as exc:
-                log(f"mail.ru не принял логин/пароль ({_reply(exc)}). Нужен «пароль для внешних приложений», "
+                log(f"mail.ru не принял логин/пароль ({reply_text(exc)}). Нужен «пароль для внешних приложений», "
                     "а не обычный пароль от ящика. Остановлено.")
                 code = 2
                 break
             except smtplib.SMTPRecipientsRefused as exc:
                 replies = list(exc.recipients.values())
                 permanent = all(str(reply[0]).startswith("5") for reply in replies)
-                note = _reply(exc) if not replies else f"{replies[0][0]} " + replies[0][1].decode("utf-8", "replace")[:150]
+                note = reply_text(exc) if not replies else f"{replies[0][0]} " + replies[0][1].decode("utf-8", "replace")[:150]
                 if permanent:
                     state[letter.email.lower()] = {"status": REJECTED, "time": _now(), "note": note}
                     save_state(state_file, state)
@@ -270,7 +270,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                         break
                 continue
             except (smtplib.SMTPException, OSError) as exc:
-                log(f"mail.ru не принял письмо или оборвал связь ({_reply(exc)}). Останавливаемся: "
+                log(f"mail.ru не принял письмо или оборвал связь ({reply_text(exc)}). Останавливаемся: "
                     "если это лимит отправки (например 451 Ratelimit exceeded), продолжите позже, "
                     "а следующий запуск начнёт с этого письма.")
                 code = 3

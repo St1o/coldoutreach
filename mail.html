@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пробное письмо через mail.ru</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #5d6b7c;
+    --line: #dde2e9; --accent: #1f5fd1; --accent-text: #ffffff;
+    --ok: #17703a; --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161c; --card: #1a2029; --text: #e7ebf0; --muted: #98a4b3;
+      --line: #2b3441; --accent: #5b92f0; --accent-text: #0c1320;
+      --ok: #5ccd8a; --error: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  label { display: block; font-weight: 600; margin: 0 0 6px; }
+  .field { margin-bottom: 14px; }
+  .hint { font-weight: 400; color: var(--muted); font-size: .85rem; }
+  input, textarea {
+    width: 100%; padding: 12px 14px; font: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  }
+  textarea { min-height: 260px; line-height: 1.45; }
+  textarea.short { min-height: 70px; }
+  input:focus-visible, textarea:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .row { display: flex; gap: 12px; }
+  .row .field { flex: 1; }
+  button {
+    padding: 12px 20px; font: inherit; font-weight: 600; cursor: pointer;
+    color: var(--accent-text); background: var(--accent); border: 0; border-radius: 8px;
+  }
+  button:disabled { opacity: .6; cursor: progress; }
+  button.secondary { color: var(--text); background: transparent; border: 1px solid var(--line); margin-left: 8px; }
+  .link { background: none; border: 0; padding: 0; margin-left: auto; font-weight: 400; font-size: .85rem;
+          color: var(--muted); text-decoration: underline; }
+  .check { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 8px 0 0; font-size: .9rem; }
+  .check input { width: auto; margin: 0; }
+  #status { margin: 14px 0 0; color: var(--muted); min-height: 1.5em; white-space: pre-wrap; }
+  #status.ok { color: var(--ok); }
+  #status.error { color: var(--error); }
+  .banner { border: 1px solid var(--error); color: var(--error); border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+  .meta { color: var(--muted); font-size: .9rem; margin: 0 0 14px; }
+  @media (max-width: 480px) { .row { flex-direction: column; gap: 0; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Пробное письмо через mail.ru</h1>
+  <p class="sub">Проверка всей цепочки: данные компании → письмо по шаблону → отправка с вашего ящика на mail.ru.</p>
+
+  <form id="login" class="card" autocomplete="off">
+    <div class="field">
+      <label for="token">Пароль <span class="hint">тот же, что для страницы /leads</span></label>
+      <input id="token" name="password" type="password" autocomplete="current-password" required>
+      <label class="check"><input id="remember" type="checkbox" checked> Запомнить пароль в этом браузере
+        <button id="forget" class="link" type="button">Забыть</button></label>
+    </div>
+    <button id="enter" type="submit">Войти</button>
+    <p id="login-status" role="status" aria-live="polite" class="meta"></p>
+  </form>
+
+  <form id="letter" hidden autocomplete="off">
+    <div id="not-configured" class="banner" hidden>
+      Отправка не настроена. На сервере (Render → Environment) нужны <b>MAILRU_USER</b> (полный адрес ящика)
+      и <b>MAILRU_APP_PASSWORD</b> («пароль для внешних приложений», не обычный пароль от ящика).
+    </div>
+
+    <section class="card">
+      <h2>Данные компании (пример)</h2>
+      <div class="row">
+        <div class="field">
+          <label for="company">Название</label>
+          <input id="company">
+        </div>
+        <div class="field">
+          <label for="okved">Сфера (ОКВЭД)</label>
+          <input id="okved">
+        </div>
+      </div>
+      <div class="field">
+        <label for="director">ФИО директора <span class="hint">Фамилия Имя Отчество</span></label>
+        <input id="director">
+      </div>
+      <div class="field">
+        <label for="offer">Что предлагаете <span class="hint">одно-два предложения</span></label>
+        <textarea id="offer" class="short"></textarea>
+      </div>
+      <div class="field">
+        <label for="signature">Подпись <span class="hint">имя, организация, контакт</span></label>
+        <input id="signature">
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Письмо</h2>
+      <p class="meta">Отправитель: <b id="from"></b>. Письмо собирается по шаблону из полей выше; если вы поправите
+        тему или текст вручную, поля выше перестанут его менять (кнопка «Собрать заново» вернёт шаблон).</p>
+      <div class="field">
+        <label for="to">Кому</label>
+        <input id="to" type="email" required>
+      </div>
+      <div class="field">
+        <label for="subject">Тема</label>
+        <input id="subject" required>
+      </div>
+      <div class="field">
+        <label for="body">Текст</label>
+        <textarea id="body" required></textarea>
+      </div>
+      <button id="send" type="submit">Отправить</button>
+      <button id="rebuild" type="button" class="secondary">Собрать заново</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+  </form>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STORE = 'leads-password';              // тот же ключ, что на странице /leads: пароль вводится один раз
+const FIELDS = ['company', 'director', 'okved', 'signature', 'offer'];
+let edited = false;                           // тему или текст правили руками - шаблон их не трогает
+let previewTimer = null;
+let configured = false;
+
+function savedPassword() {
+  try { return localStorage.getItem(STORE) || ''; } catch (e) { return ''; }
+}
+function rememberPassword(on) {
+  try {
+    if (on) localStorage.setItem(STORE, $('token').value);
+    else localStorage.removeItem(STORE);
+  } catch (e) { /* хранилище недоступно - просто не запоминаем */ }
+}
+function setStatus(text, kind) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = kind || '';
+}
+
+async function api(path, body) {
+  const options = { headers: { 'X-Leads-Token': $('token').value } };
+  if (body !== undefined) {
+    options.method = 'POST';
+    options.headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  let data = {};
+  try { data = await response.json(); } catch (e) { /* не JSON */ }
+  if (!response.ok) throw new Error(data.error || ('Ошибка ' + response.status));
+  return data;
+}
+
+function fieldValues() {
+  const values = {};
+  FIELDS.forEach((name) => { values[name] = $(name).value; });
+  return values;
+}
+
+async function rebuild(force) {
+  if (edited && !force) return;
+  try {
+    const letter = await api('/api/mail/preview', fieldValues());
+    $('subject').value = letter.subject;
+    $('body').value = letter.body;
+    edited = false;
+  } catch (error) {
+    setStatus(error.message, 'error');
+  }
+}
+
+async function enter(auto) {
+  $('enter').disabled = true;
+  try {
+    const d = await api('/api/mail/defaults');
+    FIELDS.concat(['to', 'subject', 'body']).forEach((name) => { $(name).value = d[name]; });
+    $('from').textContent = d.from || 'не задан';
+    $('not-configured').hidden = d.configured;
+    configured = d.configured;
+    $('send').disabled = !configured;
+    $('login').hidden = true;
+    $('letter').hidden = false;
+    rememberPassword($('remember').checked);
+  } catch (error) {
+    if (auto) { rememberPassword(false); $('token').value = ''; }     // старый пароль не подошёл
+    else $('login-status').textContent = error.message;
+  }
+  $('enter').disabled = false;
+}
+
+$('login').addEventListener('submit', (event) => { event.preventDefault(); enter(false); });
+
+FIELDS.forEach((name) => $(name).addEventListener('input', () => {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => rebuild(false), 300);
+}));
+['subject', 'body'].forEach((name) => $(name).addEventListener('input', () => { edited = true; }));
+$('rebuild').addEventListener('click', () => rebuild(true));
+
+$('letter').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('send').disabled = true;
+  setStatus('Отправляем…');
+  try {
+    const result = await api('/api/mail/send', { to: $('to').value, subject: $('subject').value, body: $('body').value });
+    setStatus('Отправлено на ' + result.to + ' с ' + result.from + '.\n' + result.message
+              + '\nMessage-ID: ' + result.message_id, 'ok');
+  } catch (error) {
+    setStatus('Не отправлено: ' + error.message, 'error');
+  }
+  $('send').disabled = !configured;
+});
+
+$('forget').addEventListener('click', () => {
+  rememberPassword(false);
+  $('token').value = '';
+  $('login-status').textContent = 'Пароль удалён из этого браузера.';
+});
+
+const saved = savedPassword();
+if (saved) { $('token').value = saved; enter(true); }
+</script>
+</body>
+</html>
