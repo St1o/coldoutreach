@@ -6,3 +6,8 @@ leads_*.csv
 leads_*.state.json
 letters*.csv
 letters*.sent.json
+# локальный запуск: пароли и служебные папки PyCharm остаются на компьютере
+local.env
+.idea/
+.venv/
+venv/

@@ -6,3 +6,7 @@ test_*.py
 README.md
 vypiski
 выписки
+local.env
+.idea
+.venv
+venv

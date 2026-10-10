@@ -232,8 +232,19 @@ $('forget').addEventListener('click', () => {
   $('login-status').textContent = 'Пароль удалён из этого браузера.';
 });
 
+// Запуск через run_local.py открывает страницу со свежим паролем в ссылке (после # он на сервер не уходит)
+let fromLink = '';
+try { fromLink = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* испорченная ссылка */ }
 const saved = savedPassword();
-if (saved) { $('token').value = saved; enter(true); }
+if (fromLink) {
+  history.replaceState(null, '', location.pathname);
+  $('token').value = fromLink;
+  $('remember').checked = false;                  // пароль на один запуск запоминать незачем
+  enter(false);
+} else if (saved) {
+  $('token').value = saved;
+  enter(true);
+}
 </script>
 </body>
 </html>
