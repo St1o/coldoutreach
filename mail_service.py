@@ -14,7 +14,8 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-import mailer
+from mailing import config as mailcfg, smtp
+from mailing import table as lettertable
 from letter_template import DEFAULT_OFFER, render_letter
 
 CONNECT_TIMEOUT = 20.0
@@ -39,14 +40,14 @@ class MailError(Exception):
 class MailService:
     def __init__(self, user: str = "", password: str = "", from_name: str = "", example=None,
                  max_per_hour: int = 10, sender_factory=None, clock=time.monotonic,
-                 port: int = mailer.SMTP_PORT):
+                 port: int = smtp.SMTP_PORT):
         self.user = (user or "").strip()
         self._password = password or ""
         self.from_name = from_name
         self.example = example or {}
         self.max_per_hour = max_per_hour
         self.port = port
-        self._factory = sender_factory or (lambda: mailer.MailruSender(
+        self._factory = sender_factory or (lambda: smtp.MailruSender(
             self.user, self._password, port=port, timeout=CONNECT_TIMEOUT))
         self._clock = clock
         self._busy = threading.Lock()
@@ -54,7 +55,7 @@ class MailService:
 
     @property
     def configured(self) -> bool:
-        return mailer.check_email(self.user) and bool(self._password)
+        return mailcfg.check_email(self.user) and bool(self._password)
 
     def defaults(self) -> dict:
         """Готовый пример для формы. Адрес получателя по умолчанию - сам ящик отправителя:
@@ -85,22 +86,22 @@ class MailService:
             raise MailError(503, "Отправка не настроена: на сервере нужны переменные окружения "
                                  "MAILRU_USER (адрес ящика) и MAILRU_APP_PASSWORD (пароль для внешних приложений).")
         to, subject, body = (to or "").strip(), (subject or "").strip(), (body or "").strip()
-        if not mailer.check_email(to):
+        if not mailcfg.check_email(to):
             raise MailError(400, "Некорректный адрес получателя.")
-        if not subject or "\n" in subject or "\r" in subject or len(subject) > mailer.MAX_SUBJECT:
-            raise MailError(400, f"Тема: одна строка, от 1 до {mailer.MAX_SUBJECT} знаков.")
-        if not body or len(body) > mailer.MAX_BODY:
-            raise MailError(400, f"Текст письма: от 1 до {mailer.MAX_BODY} знаков.")
+        if not subject or "\n" in subject or "\r" in subject or len(subject) > lettertable.MAX_SUBJECT:
+            raise MailError(400, f"Тема: одна строка, от 1 до {lettertable.MAX_SUBJECT} знаков.")
+        if not body or len(body) > lettertable.MAX_BODY:
+            raise MailError(400, f"Текст письма: от 1 до {lettertable.MAX_BODY} знаков.")
         if not self._busy.acquire(blocking=False):
             raise MailError(409, "Предыдущее письмо ещё отправляется.")
         try:
             self._check_quota()
-            message = mailer.build_message(mailer.Letter(to, subject, body), self.user, self.from_name)
+            message = smtp.build_message(lettertable.Letter(to, subject, body), self.user, self.from_name)
             sender = self._factory()
             try:
                 sender.send(message)
             except smtplib.SMTPAuthenticationError as exc:
-                raise MailError(502, f"mail.ru не принял логин или пароль ({mailer.reply_text(exc)}). "
+                raise MailError(502, f"mail.ru не принял логин или пароль ({smtp.reply_text(exc)}). "
                                      "Нужен «пароль для внешних приложений», а не обычный пароль от ящика; "
                                      "MAILRU_USER - полный адрес ящика.") from exc
             except smtplib.SMTPRecipientsRefused as exc:
@@ -108,16 +109,16 @@ class MailService:
                 raise MailError(502, "mail.ru не принял адрес получателя: "
                                      f"{reply[0]} {reply[1].decode('utf-8', 'replace')[:150]}".strip()) from exc
             except smtplib.SMTPException as exc:           # раньше OSError: SMTPException - его подкласс
-                raise MailError(502, f"mail.ru отказал или оборвал связь: {mailer.reply_text(exc)}. "
+                raise MailError(502, f"mail.ru отказал или оборвал связь: {smtp.reply_text(exc)}. "
                                      "Если это лимит отправки (451), повторите позже.") from exc
             except ssl.SSLError as exc:                    # раньше OSError: SSLError - его подкласс
-                raise MailError(502, f"Не удалось проверить защищённое соединение с {mailer.SMTP_HOST}:{self.port}: "
+                raise MailError(502, f"Не удалось проверить защищённое соединение с {smtp.SMTP_HOST}:{self.port}: "
                                      f"{exc}. Вероятно, на этом компьютере нет корневого сертификата, которому доверяет mail.ru "
                                      "(на Windows список обновляется не сразу), либо соединение подменяет антивирус. "
                                      "Запустите check_cert.py и пришлите его вывод."
                                 ) from exc
             except OSError as exc:
-                raise MailError(504, f"Не удалось соединиться с {mailer.SMTP_HOST}:{self.port} "
+                raise MailError(504, f"Не удалось соединиться с {smtp.SMTP_HOST}:{self.port} "
                                      f"({type(exc).__name__}: {exc}). {_connect_hint()}") from exc
             finally:
                 sender.close()

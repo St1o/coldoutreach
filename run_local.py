@@ -15,7 +15,7 @@ import sys
 import threading
 import webbrowser
 
-from mailer import read_env_file                            # общий разбор local.env с рассылкой
+from mailing.config import read_env_file                  # общий разбор local.env с рассылкой
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, "local.env")

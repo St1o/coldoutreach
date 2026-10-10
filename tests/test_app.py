@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-import mailer
+from mailing import config as cfg
 from app import RateLimiter, Service, make_server
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord, EgrulTimeout
 
@@ -624,7 +624,7 @@ class MailWebTest(unittest.TestCase):
             self.assertEqual((status, data["daily_limit"], data["source"]), (200, 12, "сайт"))
             self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["daily_limit"], 12)
             # то же значение видит программа отправки и оно главнее local.env
-            self.assertEqual(mailer.resolve_daily_limit(settings_path=self.settings_path), (12, "сайт"))
+            self.assertEqual(cfg.resolve_daily_limit(settings_path=self.settings_path), (12, "сайт"))
 
     def test_bad_limit_is_refused_and_nothing_is_saved(self):
         self.start()

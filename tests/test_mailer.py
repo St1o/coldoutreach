@@ -1,10 +1,19 @@
+import json
 import os
 import smtplib
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 
 import mailer
-from mailer import Letter, MailruSender, build_message, read_letters, run
+from mailer import run
+from mailing import config as cfg, journal
+from mailing import lock as sendlock
+from mailing import smtp as smtpmod
+from mailing import table as lettertable
+from mailing.smtp import MailruSender, build_message
+from mailing.table import Letter, read_letters
 
 USER = "sender@mail.ru"
 SECRET = "APP-PASSWORD-123"
@@ -77,7 +86,7 @@ class ReadLettersTest(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_missing_columns_are_named(self):
-        with self.assertRaises(mailer.LettersError) as ctx:
+        with self.assertRaises(lettertable.LettersError) as ctx:
             self.read("Почта;Тема\na@b.ru;Тема\n")
         self.assertIn("Текст", str(ctx.exception))
 
@@ -94,7 +103,7 @@ class ReadLettersTest(unittest.TestCase):
         self.assertFalse(any("@" in reason for _, reason in problems))
 
     def test_missing_file(self):
-        with self.assertRaises(mailer.LettersError):
+        with self.assertRaises(lettertable.LettersError):
             read_letters("/нет/такого/файла.csv")
 
 
@@ -131,7 +140,7 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.server.sent, [])
         self.assertEqual(self.server.logins, [])
         self.assertIn("--send", self.output())
-        self.assertFalse(os.path.exists(mailer.state_path(self.path)))
+        self.assertFalse(os.path.exists(journal.state_path(self.path)))
 
     def test_dry_run_flags_bad_rows_with_exit_code_1(self):
         self.assertEqual(self.go(table("плохо;Тема;Текст", "a@b.ru;Тема;Текст")), 1)
@@ -143,7 +152,7 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.sleeps, [7, 7])                  # между письмами, не перед первым и не после последнего
         self.assertEqual(self.server.logins, [(USER, SECRET)])
         self.assertTrue(self.server.quit_called)
-        state = mailer.load_state(mailer.state_path(self.path))
+        state = journal.load_state(journal.state_path(self.path))
         self.assertEqual({k: v["status"] for k, v in state.items()},
                          {"a@b.ru": "sent", "c@d.ru": "sent", "e@f.ru": "sent"})
 
@@ -163,7 +172,7 @@ class RunTest(unittest.TestCase):
         code = self.go(table("bad@b.ru;Т;Х", "ok@b.ru;Т;Х"), server=server, send=True, pause=0)
         self.assertEqual(code, 0)
         self.assertEqual([m["To"] for m in server.sent], ["ok@b.ru"])
-        state = mailer.load_state(mailer.state_path(self.path))
+        state = journal.load_state(journal.state_path(self.path))
         self.assertEqual(state["bad@b.ru"]["status"], "rejected")
 
     def test_temporary_recipient_refusals_are_retried_next_time_then_stop(self):
@@ -172,14 +181,14 @@ class RunTest(unittest.TestCase):
         code = self.go(table(*rows), server=server, send=True, pause=0)
         self.assertEqual(code, 5)
         self.assertEqual(server.sent, [])
-        self.assertEqual(mailer.load_state(mailer.state_path(self.path)), {})
+        self.assertEqual(journal.load_state(journal.state_path(self.path)), {})
 
     def test_rate_limit_stops_at_once_and_keeps_letter_for_next_run(self):
         server = FakeServer(fail={"c@d.ru": smtplib.SMTPDataError(451, b"Ratelimit exceeded for mailbox. Try again later.")})
         code = self.go(table("a@b.ru;Т;Х", "c@d.ru;Т;Х", "e@f.ru;Т;Х"), server=server, send=True, pause=0)
         self.assertEqual(code, 3)
         self.assertEqual([m["To"] for m in server.sent], ["a@b.ru"])
-        self.assertEqual(list(mailer.load_state(mailer.state_path(self.path))), ["a@b.ru"])
+        self.assertEqual(list(journal.load_state(journal.state_path(self.path))), ["a@b.ru"])
         self.assertIn("451", self.output())
 
     def test_auth_failure_stops_and_mentions_app_password(self):
@@ -238,29 +247,29 @@ class EnvFileTest(unittest.TestCase):
     def test_parses_values_comments_and_quotes(self):
         self.write("# комментарий\n\nMAILRU_USER = a@b.ru \nMAILRU_APP_PASSWORD=\"abc def\"\n"
                    "PORT='8001'\n  # MAIL_EXAMPLE_TO=x@y.ru\nbroken line\n")
-        self.assertEqual(mailer.read_env_file(self.env),
+        self.assertEqual(cfg.read_env_file(self.env),
                          {"MAILRU_USER": "a@b.ru", "MAILRU_APP_PASSWORD": "abc def", "PORT": "8001"})
 
     def test_file_fills_missing_variables(self):
         self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n")
-        self.assertTrue(mailer.load_env_file(self.env))
+        self.assertTrue(cfg.load_env_file(self.env))
         self.assertEqual((os.environ["MAILRU_USER"], os.environ["MAILRU_APP_PASSWORD"]), (USER, SECRET))
 
     def test_real_environment_wins_over_file_but_empty_one_does_not(self):
         self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n")
         os.environ["MAILRU_USER"] = "other@mail.ru"
         os.environ["MAILRU_APP_PASSWORD"] = ""
-        mailer.load_env_file(self.env)
+        cfg.load_env_file(self.env)
         self.assertEqual(os.environ["MAILRU_USER"], "other@mail.ru")
         self.assertEqual(os.environ["MAILRU_APP_PASSWORD"], SECRET)
 
     def test_empty_values_in_file_do_not_create_variables(self):
         self.write("MAILRU_USER=\nMAILRU_APP_PASSWORD=\n")
-        mailer.load_env_file(self.env)
+        cfg.load_env_file(self.env)
         self.assertNotIn("MAILRU_USER", os.environ)
 
     def test_missing_file_is_not_an_error(self):
-        self.assertFalse(mailer.load_env_file(self.env))
+        self.assertFalse(cfg.load_env_file(self.env))
 
     def test_main_takes_access_from_the_file(self):
         from unittest import mock
@@ -299,11 +308,11 @@ class StoplistTest(unittest.TestCase):
     def test_reads_addresses_domains_comments_and_case(self):
         with open(self.path("stoplist.txt"), "w", encoding="utf-8-sig") as fh:
             fh.write("# отписались\nBad@Mail.ru\n\n@registrar.ru  # сервис регистрации\n")
-        stop = mailer.read_stoplist(self.path("stoplist.txt"))
+        stop = cfg.read_stoplist(self.path("stoplist.txt"))
         self.assertEqual(stop, {"bad@mail.ru", "@registrar.ru"})
-        self.assertTrue(mailer.is_stopped("BAD@mail.ru", stop))
-        self.assertTrue(mailer.is_stopped("anyone@Registrar.ru", stop))
-        self.assertFalse(mailer.is_stopped("good@mail.ru", stop))
+        self.assertTrue(cfg.is_stopped("BAD@mail.ru", stop))
+        self.assertTrue(cfg.is_stopped("anyone@Registrar.ru", stop))
+        self.assertFalse(cfg.is_stopped("good@mail.ru", stop))
 
     def test_stopped_addresses_are_skipped_but_not_marked_as_handled(self):
         logs, server = [], FakeServer()
@@ -315,7 +324,7 @@ class StoplistTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([m["To"] for m in server.sent], ["ok@b.ru"])
         self.assertIn("В стоп-листе: 2", "\n".join(logs))
-        self.assertEqual(set(mailer.load_state(mailer.state_path(t.path))), {"ok@b.ru"})
+        self.assertEqual(set(journal.load_state(journal.state_path(t.path))), {"ok@b.ru"})
 
     def test_main_uses_stoplist_next_to_the_table(self):
         from unittest import mock
@@ -336,7 +345,7 @@ class StoplistTest(unittest.TestCase):
 
 
 class DailyLimitTest(unittest.TestCase):
-    NOW = mailer.datetime(2026, 10, 12, 12, 0, tzinfo=mailer.timezone.utc)
+    NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
 
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -345,7 +354,7 @@ class DailyLimitTest(unittest.TestCase):
 
     def journal(self, name, entries):
         with open(os.path.join(self.dir.name, name), "w", encoding="utf-8") as fh:
-            mailer.json.dump(entries, fh)
+            json.dump(entries, fh)
 
     def go(self, rows, **kw):
         path = os.path.join(self.dir.name, "letters_2.csv")
@@ -362,7 +371,7 @@ class DailyLimitTest(unittest.TestCase):
             "c@x.ru": {"status": "sent", "time": old},                 # больше 24 часов назад
             "d@x.ru": {"status": "rejected", "time": recent}})         # не отправлено
         self.journal("letters_test.sent.json", {"me@x.ru": {"status": "sent", "time": recent}})
-        self.assertEqual(mailer.sent_last_24h(self.dir.name, self.NOW), 3)
+        self.assertEqual(journal.sent_last_24h(self.dir.name, self.NOW), 3)
 
     def test_only_the_remaining_room_is_sent(self):
         self.journal("letters_1.sent.json", {f"s{i}@x.ru": {"status": "sent", "time": "2026-10-12T09:00:00+00:00"}
@@ -392,7 +401,7 @@ class JournalMetaAndUnsubscribeTest(unittest.TestCase):
         self.assertEqual(letters[0].meta, {"Группа": "3", "Источник адреса": "ЕГРЮЛ"})
         server = FakeServer()
         run(t.path, send=True, sender=MailruSender(USER, SECRET, connect=lambda *a: server), log=lambda m: None)
-        entry = mailer.load_state(mailer.state_path(t.path))["a@b.ru"]
+        entry = journal.load_state(journal.state_path(t.path))["a@b.ru"]
         self.assertEqual((entry["status"], entry["subject"]), ("sent", "Тема"))
         self.assertEqual(entry["meta"], {"Группа": "3", "Источник адреса": "ЕГРЮЛ"})
 
@@ -419,9 +428,9 @@ class JournalMetaAndUnsubscribeTest(unittest.TestCase):
 
 class MaskingTest(unittest.TestCase):
     def test_mask_and_redact(self):
-        self.assertEqual(mailer.mask_email("Ivan.Petrov@Mail.ru"), "I***@Mail.ru")
-        self.assertEqual(mailer.mask_email("мусор"), "***")
-        self.assertEqual(mailer.redact("550 <a.b@x.ru>: no such user, cc c@y.com"),
+        self.assertEqual(cfg.mask_email("Ivan.Petrov@Mail.ru"), "I***@Mail.ru")
+        self.assertEqual(cfg.mask_email("мусор"), "***")
+        self.assertEqual(cfg.redact("550 <a.b@x.ru>: no such user, cc c@y.com"),
                          "550 <a***@x.ru>: no such user, cc c***@y.com")
 
     def test_masked_run_prints_no_addresses(self):
@@ -448,19 +457,19 @@ class SendLockTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.path = os.path.join(self.dir.name, mailer.LOCK_NAME)
+        self.path = os.path.join(self.dir.name, sendlock.LOCK_NAME)
 
     def test_lock_is_taken_and_released(self):
-        with mailer.SendLock(self.dir.name):
+        with sendlock.SendLock(self.dir.name):
             self.assertTrue(os.path.exists(self.path))
-            self.assertEqual(mailer.lock_holder(self.dir.name), os.getpid())
+            self.assertEqual(sendlock.lock_holder(self.dir.name), os.getpid())
         self.assertFalse(os.path.exists(self.path))
 
     def test_second_sender_is_refused_while_the_first_is_alive(self):
         with open(self.path, "w") as fh:
             fh.write(str(os.getppid()))                      # родительский процесс жив
-        with self.assertRaises(mailer.Locked) as ctx:
-            mailer.SendLock(self.dir.name).__enter__()
+        with self.assertRaises(sendlock.Locked) as ctx:
+            sendlock.SendLock(self.dir.name).__enter__()
         self.assertEqual(ctx.exception.pid, os.getppid())
         self.assertTrue(os.path.exists(self.path))           # чужой замок не трогаем
 
@@ -471,22 +480,22 @@ class SendLockTest(unittest.TestCase):
         done.wait()
         with open(self.path, "w") as fh:
             fh.write(str(done.pid))
-        with mailer.SendLock(self.dir.name):
-            self.assertEqual(mailer.lock_holder(self.dir.name), os.getpid())
+        with sendlock.SendLock(self.dir.name):
+            self.assertEqual(sendlock.lock_holder(self.dir.name), os.getpid())
 
     def test_forgotten_old_lock_is_ignored(self):
         with open(self.path, "w") as fh:
             fh.write(str(os.getppid()))
-        old = mailer.time.time() - mailer.LOCK_MAX_AGE - 10
+        old = time.time() - sendlock.LOCK_MAX_AGE - 10
         os.utime(self.path, (old, old))
-        self.assertEqual(mailer.lock_holder(self.dir.name), 0)
+        self.assertEqual(sendlock.lock_holder(self.dir.name), 0)
         self.assertFalse(os.path.exists(self.path))
 
     def test_main_holds_the_lock_while_sending_and_refuses_a_second_run(self):
         from unittest import mock
         t = TempTable(table("a@b.ru;Т;Х"))
         self.addCleanup(t.close)
-        lock = os.path.join(os.path.dirname(t.path), mailer.LOCK_NAME)
+        lock = os.path.join(os.path.dirname(t.path), sendlock.LOCK_NAME)
         seen = []
 
         def fake_run(*a, **k):
@@ -501,6 +510,13 @@ class SendLockTest(unittest.TestCase):
         self.assertEqual(seen, [True])
 
 
+class ProjectFilesLocationTest(unittest.TestCase):
+    def test_local_env_and_settings_live_in_the_project_root_next_to_mailer_py(self):
+        root = os.path.dirname(os.path.abspath(mailer.__file__))
+        self.assertEqual(os.path.dirname(cfg.ENV_FILE), root)
+        self.assertEqual(os.path.dirname(cfg.SETTINGS_FILE), root)
+
+
 class DailyLimitSettingTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -508,38 +524,38 @@ class DailyLimitSettingTest(unittest.TestCase):
         self.path = os.path.join(self.dir.name, "settings.json")
 
     def test_parse_accepts_whole_numbers_in_range_only(self):
-        self.assertEqual(mailer.parse_daily_limit(" 12 "), 12)
-        self.assertEqual(mailer.parse_daily_limit(200), 200)
+        self.assertEqual(cfg.parse_daily_limit(" 12 "), 12)
+        self.assertEqual(cfg.parse_daily_limit(200), 200)
         for bad in ("0", "201", "-1", "abc", "", None, "1.5"):
             with self.assertRaises(ValueError, msg=repr(bad)):
-                mailer.parse_daily_limit(bad)
+                cfg.parse_daily_limit(bad)
 
     def test_save_and_load_round_trip_and_broken_file_is_empty(self):
-        self.assertEqual(mailer.load_settings(self.path), {})
-        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
-        self.assertEqual(mailer.load_settings(self.path), {mailer.DAILY_LIMIT_KEY: 9})
+        self.assertEqual(cfg.load_settings(self.path), {})
+        cfg.save_settings({cfg.DAILY_LIMIT_KEY: 9}, self.path)
+        self.assertEqual(cfg.load_settings(self.path), {cfg.DAILY_LIMIT_KEY: 9})
         with open(self.path, "w") as fh:
             fh.write("{не json")
-        self.assertEqual(mailer.load_settings(self.path), {})
+        self.assertEqual(cfg.load_settings(self.path), {})
 
     def test_order_of_sources(self):
         env = {"MAIL_DAILY_LIMIT": "15"}
-        self.assertEqual(mailer.resolve_daily_limit(None, self.path, {}), (40, "по умолчанию"))
-        self.assertEqual(mailer.resolve_daily_limit(None, self.path, env), (15, "local.env"))
-        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
-        self.assertEqual(mailer.resolve_daily_limit(None, self.path, env), (9, "сайт"))
-        self.assertEqual(mailer.resolve_daily_limit(3, self.path, env), (3, "ключ --daily-limit"))
-        self.assertEqual(mailer.resolve_daily_limit(0, self.path, env), (0, "ключ --daily-limit"))
+        self.assertEqual(cfg.resolve_daily_limit(None, self.path, {}), (40, "по умолчанию"))
+        self.assertEqual(cfg.resolve_daily_limit(None, self.path, env), (15, "local.env"))
+        cfg.save_settings({cfg.DAILY_LIMIT_KEY: 9}, self.path)
+        self.assertEqual(cfg.resolve_daily_limit(None, self.path, env), (9, "сайт"))
+        self.assertEqual(cfg.resolve_daily_limit(3, self.path, env), (3, "ключ --daily-limit"))
+        self.assertEqual(cfg.resolve_daily_limit(0, self.path, env), (0, "ключ --daily-limit"))
 
     def test_bad_site_value_is_skipped_but_bad_env_value_is_an_error(self):
-        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 999}, self.path)
-        self.assertEqual(mailer.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "15"}), (15, "local.env"))
+        cfg.save_settings({cfg.DAILY_LIMIT_KEY: 999}, self.path)
+        self.assertEqual(cfg.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "15"}), (15, "local.env"))
         with self.assertRaises(ValueError):
-            mailer.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "много"})
+            cfg.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "много"})
 
     def test_main_takes_the_limit_saved_on_the_site(self):
         from unittest import mock
-        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
+        cfg.save_settings({cfg.DAILY_LIMIT_KEY: 9}, self.path)
         t = TempTable(table("a@b.ru;Т;Х"))
         self.addCleanup(t.close)
         with mock.patch.dict(os.environ):
@@ -569,7 +585,7 @@ class WindowsPidTest(unittest.TestCase):
 
     def alive(self, **kw):
         fake = self.Kernel32(**kw)
-        return mailer._windows_pid_alive(123, fake), fake
+        return sendlock._windows_pid_alive(123, fake), fake
 
     def test_running_process_is_alive_and_handle_is_closed(self):
         result, fake = self.alive()
@@ -609,8 +625,8 @@ class StatusAndBackgroundTest(unittest.TestCase):
             fh.write(text)
 
     def test_status_counts_without_addresses(self):
-        now = mailer._now()
-        mailer.save_state(mailer.state_path(self.table.path), {
+        now = journal.now_iso()
+        journal.save_state(journal.state_path(self.table.path), {
             "a@b.ru": {"status": "sent", "time": now}, "c@b.ru": {"status": "rejected", "time": now}})
         with open(os.path.join(self.folder, mailer.LOG_NAME), "w", encoding="utf-8") as fh:
             fh.write("--- запуск ---\n[1/3] a***@b.ru: отправлено\n")
@@ -648,7 +664,7 @@ class StatusAndBackgroundTest(unittest.TestCase):
             self.assertEqual(mailer.main([self.table.path, "--send", "--background", "--env", self.env]), 1)
             self.write_env()
             self.assertEqual(mailer.main([self.table.path, "--background", "--env", self.env]), 1)
-            with open(os.path.join(self.folder, mailer.LOCK_NAME), "w") as fh:
+            with open(os.path.join(self.folder, sendlock.LOCK_NAME), "w") as fh:
                 fh.write(str(os.getppid()))
             self.assertEqual(mailer.main([self.table.path, "--send", "--background", "--env", self.env]), 1)
             popen.assert_not_called()
@@ -669,7 +685,7 @@ class StatusAndBackgroundTest(unittest.TestCase):
 class SslContextTest(unittest.TestCase):
     def test_verification_stays_on_and_certifi_roots_are_added(self):
         import ssl
-        context = mailer.make_ssl_context()
+        context = smtpmod.make_ssl_context()
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(context.check_hostname)
         self.assertGreater(len(context.get_ca_certs()), len(ssl.create_default_context().get_ca_certs()))
@@ -678,7 +694,7 @@ class SslContextTest(unittest.TestCase):
         from unittest import mock
         with mock.patch.dict(os.environ, {"MAILRU_CA_FILE": "/нет/такого/файла.pem"}):
             with self.assertRaises(OSError):
-                mailer.make_ssl_context()
+                smtpmod.make_ssl_context()
 
 
 if __name__ == "__main__":

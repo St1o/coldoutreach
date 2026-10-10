@@ -1,39 +1,21 @@
-"""Сборка писем рассылки: таблица с /leads + тексты агентов (.md) -> letters_<этап>.csv для mailer.py.
+"""Сборка писем рассылки: таблица /leads + тексты агентов (.md) -> letters_<этап>.csv для mailer.py.
+Порядок работы и все команды: LOCAL.md, раздел «Рассылка».
 
-Агенты рассылки пишут шаблоны с подстановками ({{группа_словами}}, {{боль_1}}, {{боль_2}}, {{ссылка_на_опрос}},
-{{подпись}}) и блоки боли по группам видов деятельности. Адресов и ФИО они не видят. Эта программа работает на
-вашем компьютере и подставляет значения:
+    python compose.py leads_<дата>.csv --limit 150 --preview        # этап 1, первое письмо
+    python compose.py leads_<дата>.csv --stage 2 --preview          # дожим (3 рабочих дня после первого письма)
+    python compose.py leads_<дата>.csv --stage 3                    # закрывающее (7 дней после первого)
+    python compose.py leads_<дата>.csv --test-to me@mail.ru         # пробные письма на свои ящики
 
-    * группа получателя - по первым двум знакам основного ОКВЭД (таблица групп в файле сегмента, раздел 4);
-      группа 12 и неизвестный ОКВЭД - запасной вариант;
-    * ФИО директора и название компании в письма не попадают: из таблицы читаются только почта, ОКВЭД и
-      источник почты;
-    * письма идут только на адреса из ЕГРЮЛ (не из контактов Checko), без повторов и без стоп-листа;
-    * этап 1 - первое письмо; этап 2 (дожим) - тем, кому первое отправлено 3 рабочих дня назад и больше;
-      этап 3 (закрывающее) - тем, кому дожим отправлен и с первого письма прошло 7 дней. Дожим и закрывающее
-      не получают те, чей адрес есть в файле ответов опроса. Не больше трёх писем на адрес;
-    * нет ссылки на форму - письма не собираются; то же с подписью, но только если в шаблонах есть {{подпись}}.
-
-Все файлы партии лежат в одной папке рядом с таблицей (она не должна быть в папке проекта агентов):
-    leads_<дата>.csv          таблица с /leads
-    stoplist.txt              адреса и @домены, которым писать нельзя
-    responses.csv             выгрузка ответов опроса (адреса ищутся по всему файлу)
-    letters_1.csv, letters_2.csv, letters_3.csv     то, что собирает эта программа
-    letters_1.sent.json, ...  журналы отправки (их ведёт mailer.py; по ним считаются этапы 2 и 3)
-
-Запуск:
-    python compose.py leads_2026-10-09.csv --letters <письма>.md --segment <сегмент>.md --preview
-    python compose.py leads_2026-10-09.csv --letters ... --segment ... --limit 150
-    python compose.py leads_2026-10-09.csv --letters ... --segment ... --stage 2
-    python compose.py leads_2026-10-09.csv --letters ... --segment ... --test-to me@mail.ru,me2@gmail.com
-Ссылку на форму, подпись (если она есть в шаблонах) и пути к файлам агентов можно один раз вписать в local.env:
-SURVEY_LINK=..., MAIL_SIGNATURE=..., OUTREACH_LETTERS=..., OUTREACH_SEGMENT=...; тогда --letters, --segment, --link
-и --signature не нужны. Параметры командной строки главнее local.env.
+Из таблицы читаются только почта, ОКВЭД и источник почты (ФИО и названия в письма не попадают). Группа - по первым
+двум знакам ОКВЭД (таблица групп в файле сегмента), запасная группа 12 - для неизвестного. Только адреса из ЕГРЮЛ,
+без повторов, стоп-листа и ответивших на опрос. Нет ссылки на форму (и подписи, если в шаблоне есть {{подпись}}),
+остались {{…}} или больше одной ссылки - письма не собираются. Этапы 2 и 3 строятся по журналам отправки.
+Ссылка, подпись и пути к файлам агентов берутся из local.env: SURVEY_LINK, MAIL_SIGNATURE, OUTREACH_LETTERS,
+OUTREACH_SEGMENT (ключи командной строки главнее).
 """
 import argparse
 import csv
 import io
-import json
 import os
 import re
 import sys
@@ -41,175 +23,19 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-import mailer
+from mailing import config, journal
+from mailing.agentmd import (
+    FALLBACK_ID, ComposeError, Texts, _key, check_texts, parse_letters, parse_segment)
 
 OUT_FIELDS = ["Почта", "Тема", "Текст", "Группа", "Источник адреса"]
 LEAD_COLUMNS = {"email": "Почта", "okved": "ОКВЭД (код)", "source": "Источник почты"}
 SOURCE_REGISTER = "ЕГРЮЛ"
-FALLBACK_ID = "12"
 FIRST_ID, MIN_BUSINESS_DAYS, MIN_DAYS_TO_LAST = 1, 3, 7       # дожим через 3 рабочих дня, закрывающее через 7 дней
 KNOWN_PLACEHOLDERS = {"группа_словами", "боль_1", "боль_2", "ссылка_на_опрос", "подпись"}
 _PLACEHOLDER = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 _EMPTY_WORDS_CLAUSE = re.compile(r",\s*вид деятельности\s*[—–-]\s*\{\{\s*группа_словами\s*\}\}")
 _LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle)/\S*")
 _EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
-
-
-class ComposeError(Exception):
-    """Письма собрать нельзя; текст понятен пользователю."""
-
-
-@dataclass
-class Group:
-    id: str
-    name: str
-    classes: frozenset          # первые два знака ОКВЭД; у запасной группы пусто
-
-    @property
-    def words(self) -> str:
-        """{{группа_словами}}: название группы маленькими буквами; у запасной группы пусто."""
-        return "" if self.id == FALLBACK_ID else self.name[:1].lower() + self.name[1:]
-
-
-@dataclass
-class Texts:
-    subjects: list                                    # [(текст, рекомендована)]
-    templates: dict                                   # этап -> текст шаблона
-    pain1: dict = field(default_factory=dict)         # ключ группы -> блок боли письма 1
-    pain2: dict = field(default_factory=dict)
-    fallback1: str = ""
-    fallback2: str = ""
-
-
-# --- разбор файлов агентов -------------------------------------------------------------------------------
-
-def _key(name: str) -> str:
-    return re.sub(r"\(.*?\)", "", name).split(":")[0].strip().casefold()
-
-
-def _sections(text: str):
-    """Файл -> [(заголовок «## …» без решёток, строки до следующего «## »)]."""
-    result, heading, lines = [], None, []
-    for line in text.splitlines():
-        if line.startswith("## "):
-            if heading is not None:
-                result.append((heading, lines))
-            heading, lines = line[3:].strip(), []
-        elif heading is not None:
-            lines.append(line)
-    if heading is not None:
-        result.append((heading, lines))
-    return result
-
-
-def _fenced(lines):
-    inside, block = False, []
-    for line in lines:
-        if line.strip().startswith("```"):
-            if inside:
-                return "\n".join(block).strip("\n")
-            inside = True
-        elif inside:
-            block.append(line)
-    return ""
-
-
-def parse_segment(text: str) -> list:
-    """Таблица групп (раздел «4. …» файла сегмента) -> [Group]. Запасная группа 12 есть всегда."""
-    groups, section = [], None
-    for heading, lines in _sections(text):
-        if re.match(r"4\.", heading):
-            section = lines
-    if section is None:
-        raise ComposeError("в файле сегмента нет раздела «4. …» с таблицей групп видов деятельности")
-    for line in section:
-        if not line.lstrip().startswith("|"):
-            continue
-        cell = line.strip().strip("|").split("|", 1)[0].strip()
-        found = re.match(r"^(\d+[а-яa-z]?)\.\s+(.+)$", cell)
-        if not found:
-            continue
-        group_id, rest = found.groups()
-        with_classes = re.match(r"^(.+?)\s*\(([\d\s,–—-]+)\)\s*$", rest)
-        if group_id == FALLBACK_ID or not with_classes:
-            if group_id == FALLBACK_ID:
-                groups.append(Group(FALLBACK_ID, rest.split(":")[0].strip(), frozenset()))
-            continue
-        classes = set()
-        for token in with_classes.group(2).split(","):
-            token = token.strip()
-            if re.match(r"^\d+\s*[–—-]\s*\d+$", token):
-                low, high = (int(part) for part in re.split(r"\s*[–—-]\s*", token))
-                classes.update(range(low, high + 1))
-            elif token.isdigit():
-                classes.add(int(token))
-        groups.append(Group(group_id, with_classes.group(1).strip(), frozenset(classes)))
-    if not any(group.id == FALLBACK_ID for group in groups):
-        groups.append(Group(FALLBACK_ID, "Запасной", frozenset()))
-    if len(groups) < 2:
-        raise ComposeError("в таблице групп файла сегмента не нашлось ни одной группы с классами ОКВЭД")
-    return groups
-
-
-def parse_letters(text: str) -> Texts:
-    """Файл писем -> Texts: темы, шаблоны трёх писем, блоки боли по группам, запасные блоки."""
-    subjects, templates, texts = [], {}, Texts([], {})
-    for heading, lines in _sections(text):
-        if heading.startswith("Темы"):
-            for line in lines:
-                found = re.match(r"^\s*\d+\.\s+(.*\S)\s*$", line)
-                if found:
-                    raw = found.group(1)
-                    subjects.append((re.sub(r"\s*\(рекомендую\)\s*", "", raw).strip(), "(рекомендую)" in raw))
-        elif re.match(r"Письмо 1\b", heading):
-            templates[1] = _fenced(lines)
-        elif heading.startswith("Дожим"):
-            templates[2] = _fenced(lines)
-            for line in lines:
-                found = re.match(r"^\*([^*\n]+?):\*\s*(.+?)\s*$", line)
-                if found:
-                    _store(texts, 2, found.group(1), found.group(2))
-        elif heading.startswith("Закрывающее"):
-            templates[3] = _fenced(lines)
-        elif heading.startswith("Блоки боли для письма 1"):
-            name, parts = None, []
-            for line in lines + ["**"]:
-                found = re.match(r"^\*\*(.+?)\*\*\s*$", line)
-                if found or line == "**":
-                    if name is not None and parts:
-                        _store(texts, 1, name, " ".join(parts))
-                    name, parts = (found.group(1) if found else None), []
-                elif name is not None and line.strip():
-                    parts.append(line.strip())
-    texts.subjects, texts.templates = subjects, templates
-    return texts
-
-
-def _store(texts: Texts, stage: int, name: str, block: str) -> None:
-    key = _key(name)
-    if key.startswith("запасной"):
-        if stage == 1:
-            texts.fallback1 = block
-        else:
-            texts.fallback2 = block
-    else:
-        (texts.pain1 if stage == 1 else texts.pain2)[key] = block
-
-
-def check_texts(texts: Texts, groups: list) -> None:
-    known = {_key(group.name) for group in groups}
-    for key in list(texts.pain1) + list(texts.pain2):
-        if key not in known:
-            raise ComposeError(f"блок боли «{key}» из файла писем не найден в таблице групп файла сегмента: "
-                               "названия должны совпадать")
-    for stage in (1, 2, 3):
-        if not texts.templates.get(stage):
-            raise ComposeError(f"в файле писем нет шаблона письма {stage} (блок ``` под заголовком "
-                               "«Письмо 1», «Дожим», «Закрывающее»)")
-    if not texts.subjects:
-        raise ComposeError("в файле писем нет тем (нумерованный список под заголовком «Темы»)")
-    if not texts.fallback1 or not texts.fallback2:
-        raise ComposeError("в файле писем нет запасных блоков боли («Запасной вариант» для письма 1 и для дожима)")
 
 
 # --- значения и подстановка ------------------------------------------------------------------------------
@@ -382,11 +208,11 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
     result = Result()
     handled = set()
     for stage in (1, 2, 3):
-        handled.update(mailer.load_state(journal_path(folder, stage)))
+        handled.update(journal.load_state(journal_path(folder, stage)))
     seen = set()
     for lead in leads:
         address = lead["email"].lower()
-        if not mailer.check_email(lead["email"]):
+        if not config.check_email(lead["email"]):
             result.skipped["некорректный адрес"] += 1
         elif lead["source"] != SOURCE_REGISTER:
             result.skipped["почта не из ЕГРЮЛ (контакты Checko или источник неизвестен)"] += 1
@@ -394,7 +220,7 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
             result.skipped["повтор адреса (одна цепочка на адрес)"] += 1
         elif address in handled:
             result.skipped["уже получал письма из этой рассылки"] += 1
-        elif mailer.is_stopped(address, stoplist):
+        elif config.is_stopped(address, stoplist):
             result.skipped["в стоп-листе"] += 1
         elif address in responded:
             result.skipped["уже заполнил опрос"] += 1
@@ -416,13 +242,13 @@ def compose_next(composer: Composer, stage: int, folder: str, stoplist, responde
                  min_days: int = 0) -> Result:
     """Этап 2 или 3 по журналам предыдущих этапов."""
     result = Result()
-    previous = mailer.load_state(journal_path(folder, stage - 1))
-    first = mailer.load_state(journal_path(folder, 1))
+    previous = journal.load_state(journal_path(folder, stage - 1))
+    first = journal.load_state(journal_path(folder, 1))
     later = set()
     for number in range(stage, 4):
-        later.update(mailer.load_state(journal_path(folder, number)))
+        later.update(journal.load_state(journal_path(folder, number)))
     for address, entry in previous.items():
-        if entry.get("status") != mailer.SENT:
+        if entry.get("status") != journal.SENT:
             continue
         if address in later:
             result.skipped[f"письмо этапа {stage} уже отправлялось"] += 1
@@ -438,7 +264,7 @@ def compose_next(composer: Composer, stage: int, folder: str, stoplist, responde
         if not due:
             result.skipped["срок ещё не подошёл"] += 1
             continue
-        if mailer.is_stopped(address, stoplist):
+        if config.is_stopped(address, stoplist):
             result.skipped["в стоп-листе"] += 1
             continue
         if address in responded:
@@ -519,11 +345,11 @@ def main(argv=None, today=None, log=print) -> int:
     parser.add_argument("--preview", action="store_true", help="показать по одному примеру письма на группу")
     parser.add_argument("--test-to", default="",
                         help="адреса через запятую: собрать letters_test.csv с пробными письмами им (таблица не читается)")
-    parser.add_argument("--env", default=mailer.ENV_FILE, help="файл local.env")
+    parser.add_argument("--env", default=config.ENV_FILE, help="файл local.env")
     args = parser.parse_args(argv)
 
     try:
-        mailer.load_env_file(args.env)
+        config.load_env_file(args.env)
         letters_path = args.letters or os.environ.get("OUTREACH_LETTERS", "")
         segment_path = args.segment or os.environ.get("OUTREACH_SEGMENT", "")
         if not letters_path or not segment_path:
@@ -545,7 +371,7 @@ def main(argv=None, today=None, log=print) -> int:
 
         stop_path = args.stoplist or os.path.join(folder, "stoplist.txt")
         resp_path = args.responded or os.path.join(folder, "responses.csv")
-        stoplist = mailer.read_stoplist(stop_path) if os.path.exists(stop_path) else frozenset()
+        stoplist = config.read_stoplist(stop_path) if os.path.exists(stop_path) else frozenset()
         if args.stoplist and not os.path.exists(stop_path):
             raise ComposeError(f"нет файла стоп-листа {stop_path}")
         responded = read_responded(resp_path) if (args.responded or os.path.exists(resp_path)) else frozenset()
@@ -553,7 +379,7 @@ def main(argv=None, today=None, log=print) -> int:
 
         if args.test_to:
             addresses = [a.strip() for a in args.test_to.split(",") if a.strip()]
-            bad = [a for a in addresses if not mailer.check_email(a)]
+            bad = [a for a in addresses if not config.check_email(a)]
             if not addresses or bad:
                 raise ComposeError("--test-to: нужны корректные адреса через запятую (свои ящики)")
             result = compose_test(composer, subject, args.stage, addresses)

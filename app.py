@@ -35,7 +35,7 @@ from egrul_inn_search import (
 from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
 from letter_template import render_letter
-import mailer
+from mailing import config as mailcfg
 from mail_service import MailError, MailService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -322,8 +322,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, service.defaults())
 
     def _limit_payload(self):
-        value, source = mailer.resolve_daily_limit(settings_path=self.server.settings_path)
-        return {"daily_limit": value, "source": source, "min": mailer.DAILY_LIMIT_MIN, "max": mailer.DAILY_LIMIT_MAX}
+        value, source = mailcfg.resolve_daily_limit(settings_path=self.server.settings_path)
+        return {"daily_limit": value, "source": source, "min": mailcfg.DAILY_LIMIT_MIN, "max": mailcfg.DAILY_LIMIT_MAX}
 
     def _mail_settings(self):
         """Лимит писем в сутки на один ящик, который действует для mailer.py (страница /mail)."""
@@ -353,14 +353,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/mail/settings":
             try:
-                limit = mailer.parse_daily_limit(body.get("daily_limit", ""))
+                limit = mailcfg.parse_daily_limit(body.get("daily_limit", ""))
             except ValueError as exc:
                 self._error(400, str(exc))
                 return
-            settings = mailer.load_settings(self.server.settings_path)
-            settings[mailer.DAILY_LIMIT_KEY] = limit
+            settings = mailcfg.load_settings(self.server.settings_path)
+            settings[mailcfg.DAILY_LIMIT_KEY] = limit
             try:
-                mailer.save_settings(settings, self.server.settings_path)
+                mailcfg.save_settings(settings, self.server.settings_path)
             except OSError as exc:
                 self._error(500, f"Не удалось сохранить настройку: {exc.strerror or exc}")
                 return
@@ -456,7 +456,7 @@ def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted
     server.trusted_proxies = trusted_proxies
     server.leads_job = leads_job
     server.mail_service = mail_service
-    server.settings_path = settings_path or mailer.SETTINGS_FILE
+    server.settings_path = settings_path or mailcfg.SETTINGS_FILE
     return server
 
 

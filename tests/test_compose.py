@@ -7,6 +7,9 @@ from datetime import date, datetime, timedelta, timezone
 
 import compose
 import mailer
+from mailing import journal
+from mailing import smtp as smtpmod
+from mailing import table as lettertable
 from compose import ComposeError
 
 LINK = "https://docs.google.com/forms/d/e/ABC123/viewform"
@@ -273,7 +276,7 @@ class FirstLetterTest(unittest.TestCase):
 
     def test_addresses_already_in_any_journal_are_not_written_to_again(self):
         for stage, address in [(1, "one@x.ru"), (2, "two@x.ru"), (3, "three@x.ru")]:
-            mailer.save_state(compose.journal_path(self.dir.name, stage), {address: {"status": "rejected"}})
+            journal.save_state(compose.journal_path(self.dir.name, stage), {address: {"status": "rejected"}})
         result = self.run_first(self.leads(lead("one@x.ru", "47.91"), lead("two@x.ru", "47.91"),
                                            lead("three@x.ru", "47.91"), lead("new@x.ru", "47.91")))
         self.assertEqual([letter[0] for letter in result.letters], ["new@x.ru"])
@@ -292,7 +295,7 @@ class FirstLetterTest(unittest.TestCase):
         result = self.run_first(self.leads(lead("a@x.ru", "47.91"), lead("b@x.ru", "96.02")))
         path = os.path.join(self.dir.name, "letters_1.csv")
         compose.write_letters(path, result.letters)
-        letters, problems = mailer.read_letters(path)
+        letters, problems = lettertable.read_letters(path)
         self.assertEqual(problems, [])
         self.assertEqual([(l.email, l.meta) for l in letters],
                          [("a@x.ru", {"Группа": "1", "Источник адреса": "ЕГРЮЛ"}),
@@ -325,7 +328,7 @@ class FollowUpTest(unittest.TestCase):
         self.composer = make_composer()
 
     def journal(self, stage, *entries):
-        mailer.save_state(compose.journal_path(self.dir.name, stage), dict(entries))
+        journal.save_state(compose.journal_path(self.dir.name, stage), dict(entries))
 
     def second(self, today, stoplist=frozenset(), responded=frozenset(), **kw):
         return compose.compose_next(self.composer, 2, self.dir.name, stoplist, responded, today, **kw)
@@ -379,7 +382,7 @@ class FollowUpTest(unittest.TestCase):
             def close(self): pass
 
         server = Server()
-        code = mailer.run(path, send=True, sender=mailer.MailruSender("me@mail.ru", "p", connect=lambda *a: server),
+        code = mailer.run(path, send=True, sender=smtpmod.MailruSender("me@mail.ru", "p", connect=lambda *a: server),
                           log=lambda m: None, unsubscribe=True)
         self.assertEqual(code, 0)
         self.assertEqual(server.sent[0]["List-Unsubscribe"], "<mailto:me@mail.ru?subject=unsubscribe>")
@@ -428,7 +431,7 @@ class MainTest(unittest.TestCase):
 
     def test_writes_letters_next_to_the_table(self):
         self.assertEqual(self.go(), 0)
-        letters, problems = mailer.read_letters(os.path.join(self.work, "letters_1.csv"))
+        letters, problems = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
         self.assertEqual((len(letters), problems), (2, []))
         self.assertIn("python mailer.py", self.output())
 
@@ -443,7 +446,7 @@ class MainTest(unittest.TestCase):
             code = compose.main([self.leads, "--letters", self.letters, "--segment", self.segment, "--env", env],
                                 log=self.logs.append)
         self.assertEqual(code, 0)
-        letters, _ = mailer.read_letters(os.path.join(self.work, "letters_1.csv"))
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
         self.assertIn("Анна\nруководитель", letters[0].body)
 
     def test_agent_file_paths_may_come_from_local_env(self):
@@ -496,7 +499,7 @@ class MainTest(unittest.TestCase):
 
     def test_subject_option_and_preview(self):
         self.assertEqual(self.go("--subject", "2", "--preview"), 0)
-        letters, _ = mailer.read_letters(os.path.join(self.work, "letters_1.csv"))
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
         self.assertEqual({l.subject for l in letters}, {"Вторая тема"})
         self.assertIn("пример, группа 1", self.output())
         self.assertNotIn("a@x.ru", self.output().split("Файл:")[0])           # адресов на экране нет
@@ -504,14 +507,14 @@ class MainTest(unittest.TestCase):
     def test_test_mode_does_not_read_the_table(self):
         code = self.go("--test-to", "me@x.ru,me2@x.ru", leads=os.path.join(self.work, "нет.csv"))
         self.assertEqual(code, 0)
-        letters, _ = mailer.read_letters(os.path.join(self.work, "letters_test.csv"))
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_test.csv"))
         self.assertEqual([l.email for l in letters], ["me@x.ru", "me2@x.ru"])
         self.assertEqual(self.go("--test-to", "не-адрес", leads=os.path.join(self.work, "нет.csv")), 1)
 
     def test_follow_up_stage_from_the_journal(self):
-        mailer.save_state(compose.journal_path(self.work, 1), dict([sent("a@x.ru", date(2026, 10, 5), "1")]))
+        journal.save_state(compose.journal_path(self.work, 1), dict([sent("a@x.ru", date(2026, 10, 5), "1")]))
         self.assertEqual(self.go("--stage", "2", today=date(2026, 10, 9)), 0)
-        letters, _ = mailer.read_letters(os.path.join(self.work, "letters_2.csv"))
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_2.csv"))
         self.assertEqual([l.email for l in letters], ["a@x.ru"])
         self.assertIn("Ещё вопрос", letters[0].body)
 

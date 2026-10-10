@@ -5,6 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # Тесты в образ не попадают (см. .dockerignore).
 COPY *.py index.html leads.html mail.html ./
+COPY mailing ./mailing
 
 # На хостинге порт приходит в переменной PORT; перед сайтом стоит один прокси хостинга.
 ENV HOST=0.0.0.0 TRUSTED_PROXIES=1 PYTHONUNBUFFERED=1

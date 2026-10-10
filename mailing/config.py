@@ -1,0 +1,116 @@
+"""Настройки рассылки: local.env, settings.json (лимит с сайта), стоп-лист, проверка и скрытие адресов."""
+import json
+import os
+import re
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # корень проекта, рядом с mailer.py
+ENV_FILE = os.path.join(ROOT, "local.env")
+SETTINGS_FILE = os.path.join(ROOT, "settings.json")                       # пишет страница /mail
+DEFAULT_DAILY_LIMIT = 40
+DAILY_LIMIT_KEY = "daily_limit_per_mailbox"
+DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 200
+_EMAIL_RE = re.compile(r"^[^@\s<>,;\"'()\[\]]+@[^@\s<>,;\"'()\[\]]+\.[^@\s<>,;\"'()\[\]]+$")
+
+
+def check_email(address: str) -> bool:
+    return bool(_EMAIL_RE.match(address))
+
+
+def read_stoplist(path: str) -> frozenset:
+    """Стоп-лист: по строке на адрес или на домен целиком (@example.ru); пустые строки и строки с # пропускаются."""
+    entries = set()
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip().lower()
+            if line:
+                entries.add(line)
+    return frozenset(entries)
+
+
+def is_stopped(address: str, stoplist) -> bool:
+    address = address.lower()
+    return address in stoplist or "@" + address.rpartition("@")[2] in stoplist
+
+
+def read_env_file(path: str) -> dict:
+    """Строки КЛЮЧ=значение; пустые строки и строки с # игнорируются; кавычки вокруг значения снимаются."""
+    values = {}
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            values[key.strip()] = value
+    return values
+
+
+def load_env_file(path: str) -> bool:
+    """Подставляет значения из файла в os.environ, не трогая уже заданные непустые переменные.
+    Возвращает True, если файл найден. Нет файла - не ошибка: можно обойтись переменными окружения."""
+    try:
+        values = read_env_file(path)
+    except FileNotFoundError:
+        return False
+    for key, value in values.items():
+        if value and not os.environ.get(key):
+            os.environ[key] = value
+    return True
+
+
+def load_settings(path: str = "") -> dict:
+    """Настройки, сохранённые на сайте (страница /mail). Нет файла или он испорчен - пустые настройки."""
+    try:
+        with open(path or SETTINGS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(values: dict, path: str = "") -> None:
+    path = path or SETTINGS_FILE
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(values, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def parse_daily_limit(raw) -> int:
+    """Лимит писем в сутки на один ящик: целое число от 1 до 200, иначе ValueError."""
+    try:
+        number = int(str(raw).strip())
+    except ValueError:
+        number = 0
+    if not DAILY_LIMIT_MIN <= number <= DAILY_LIMIT_MAX:
+        raise ValueError(f"Лимит должен быть целым числом от {DAILY_LIMIT_MIN} до {DAILY_LIMIT_MAX}.")
+    return number
+
+
+def resolve_daily_limit(cli_value=None, settings_path: str = "", environ=None):
+    """(лимит, откуда): ключ --daily-limit, затем настройка с сайта, затем MAIL_DAILY_LIMIT из local.env, затем 40.
+    Испорченное значение с сайта пропускается; испорченное в local.env - ValueError."""
+    if cli_value is not None:
+        return cli_value, "ключ --daily-limit"
+    try:
+        return parse_daily_limit(load_settings(settings_path).get(DAILY_LIMIT_KEY)), "сайт"
+    except ValueError:
+        pass
+    raw = (environ if environ is not None else os.environ).get("MAIL_DAILY_LIMIT", "")
+    if str(raw).strip():
+        return int(raw), "local.env"
+    return DEFAULT_DAILY_LIMIT, "по умолчанию"
+
+
+def mask_email(address: str) -> str:
+    """name@mail.ru -> n***@mail.ru: для журналов и отчётов, которые читают не только вы."""
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}***@{domain}" if domain else "***"
+
+
+def redact(text: str) -> str:
+    return re.sub(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", lambda m: mask_email(m.group(0)), text)
