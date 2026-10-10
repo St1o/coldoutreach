@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 выписки/
+# таблицы с адресами и журналы рассылки - персональные данные, в репозиторий не попадают
+leads_*.csv
+leads_*.state.json
+letters*.csv
+letters*.sent.json
