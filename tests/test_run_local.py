@@ -83,6 +83,23 @@ class MainTest(unittest.TestCase):
         self.assertIn("короче 12", out)
         self.assertEqual(run_local.read_env_file(self.env)["LEADS_TOKEN"], "short")     # чужую строку не трогаем
 
+    def test_a_token_with_russian_letters_or_spaces_is_not_used(self):
+        for bad in ("придумайте_пароль_16_знаков_латиница_и_цифры", "has a space in the middle ok", "x" * 5 + "ё" * 10):
+            self.write(f"MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\nLEADS_TOKEN={bad}\n")
+            self.calls.clear()
+            code, out = self.go()
+            self.assertEqual(code, 0, bad)
+            token = self.calls[0][1]
+            self.assertNotEqual(token, bad)
+            self.assertTrue(token.isascii() and token.isprintable() and " " not in token, bad)
+            self.assertIn("LEADS_TOKEN в local.env", out)
+            self.assertNotIn(bad, out)
+
+    def test_token_problem_names_the_reason(self):
+        self.assertEqual(run_local.token_problem("abcdefghijkl"), "")
+        self.assertIn("короче", run_local.token_problem("short"))
+        self.assertIn("русскими", run_local.token_problem("пароль-пароль-пароль"))
+
     def test_data_folder_defaults_next_to_the_project_and_can_be_set(self):
         self.write("MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\n")
         self.go()
@@ -101,6 +118,14 @@ class MainTest(unittest.TestCase):
             with unittest.mock.patch.object(app, "main"):
                 run_local.serve(8123, "token-for-the-link", values, True)
         self.assertEqual(opened, ["http://127.0.0.1:8123/leads#token-for-the-link"])
+
+    def test_the_site_is_told_to_hand_the_password_to_its_own_pages(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            import app
+            with unittest.mock.patch.object(app, "main"):
+                run_local.serve(8123, "token-for-the-link", {}, False)
+            self.assertEqual(os.environ["LEADS_AUTO_LOGIN"], "1")
+            self.assertEqual(os.environ["LEADS_TOKEN"], "token-for-the-link")
 
     def test_options_and_own_token(self):
         self.write("MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\nPORT=8123\nLEADS_TOKEN=my-own-long-password\n")

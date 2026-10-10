@@ -199,7 +199,16 @@ function headers(extra) {
 const jsonHeaders = () => headers({ 'Content-Type': 'application/json' });
 
 async function api(path, options) {
-  const response = await fetch(path, Object.assign({ headers: headers() }, options || {}));
+  let response;
+  try {
+    response = await fetch(path, Object.assign({ headers: headers() }, options || {}));
+  } catch (e) {
+    const letters = /ISO-8859-1/.test(String(e && e.message));       // русские буквы в пароле: браузер не отправит заголовок
+    const error = new Error(letters ? 'В пароле русские буквы: нужен пароль из латинских букв и цифр.'
+                                    : 'Нет связи с сайтом: он запущен?');
+    error.status = letters ? 401 : 0;
+    throw error;
+  }
   if (!response.ok) {
     let message = 'Ошибка ' + response.status;
     try { message = (await response.json()).error || message; } catch (e) { /* не JSON */ }
@@ -208,6 +217,15 @@ async function api(path, options) {
     throw error;
   }
   return response;
+}
+
+// На своём компьютере (run_local.py) сайт сам отдаёт странице пароль из local.env: вводить его не нужно.
+let triedSession = false;
+async function fetchSession() {
+  try {
+    const response = await fetch('/api/leads/session');
+    return response.ok ? ((await response.json()).token || '') : '';
+  } catch (e) { return ''; }
 }
 
 // ---- таблица ----
@@ -303,11 +321,18 @@ async function poll() {
   try {
     data = await (await api('/api/leads/status')).json();
   } catch (error) {
+    if (error.status === 401 && !triedSession) {         // пароль устарел или не тот: берём актуальный у сайта
+      triedSession = true;
+      const fresh = await fetchSession();
+      if (fresh) { password = fresh; poll(); return; }
+    }
     if (error.status === 401 || error.status === 429) { showLogin(error.message); return; }
+    if (error.status === 0) { showLogin(error.message); return; }
     $('start').disabled = false;
     setStatus(error.message, 'error');
     return;
   }
+  triedSession = false;
   $('login').hidden = true;
   $('app').hidden = false;
   storePassword(password);
@@ -345,12 +370,18 @@ async function poll() {
   else if (Date.now() < watchUntil) timer = setTimeout(poll, 2000);
 }
 
+const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
 function showLogin(message) {
   storePassword('');
   password = '';
   $('app').hidden = true;
   $('login').hidden = false;
-  setText('login-status', message || '', message ? 'error' : '');
+  let text = message || '';
+  if (LOCAL_HOSTS.includes(location.hostname) && !/латинских/.test(message || '')) {
+    text += (text ? '\n' : '') + 'Если сайт запускали из PyCharm до обновления проекта, остановите его (красный квадрат) '
+          + 'и запустите run_local заново: после этого пароль подставляется сам.';
+  }
+  setText('login-status', text, message ? 'error' : '');
   $('token').focus();
 }
 
@@ -528,9 +559,16 @@ $('download').addEventListener('click', async () => {
 let fromLink = '';
 try { fromLink = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* испорченная ссылка */ }
 if (fromLink) history.replaceState(null, '', location.pathname);        // пароль не остаётся в адресной строке
-password = fromLink || savedPassword();
-if (password) poll();
-else showLogin('');
+(async () => {
+  password = fromLink;
+  if (!password) {
+    password = await fetchSession();                    // свой компьютер: пароль отдаёт сайт
+    if (password) triedSession = true;
+  }
+  if (!password) password = savedPassword();            // хостинг: пароль, который вводили раньше
+  if (password) poll();
+  else showLogin('');
+})();
 </script>
 </body>
 </html>

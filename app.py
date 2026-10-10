@@ -46,6 +46,7 @@ MAIL_MAX_BODY = 100_000       # запрос страницы /mail: тема и
 MAIL_FIELDS = ("company", "director", "okved", "signature", "offer")
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SEND_MAX_BODY = 2_000       # запрос кнопки «Отправить»: число писем и две отметки
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")      # имена, под которыми страницу открывают на этом же компьютере
 MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
@@ -245,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
             self._mail_defaults()
         elif url.path == "/api/mail/settings":
             self._mail_settings()
+        elif url.path == "/api/leads/session":
+            self._leads_session()
         elif url.path in ("/api/leads/status", "/api/leads/download", "/api/send/status"):
             self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
@@ -280,6 +283,27 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._error(401, "Неверный пароль.")
         return False
+
+    def _local_request(self):
+        """Запрос идёт с этого же компьютера, со страницы этого сайта, а не с чужого сайта в браузере:
+        адрес собеседника - сам компьютер (заголовок прокси не в счёт), Host - 127.0.0.1 или localhost
+        (при подмене DNS в нём будет чужое имя), Sec-Fetch-Site - свой сайт."""
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host.split("]")[0] + "]" if host.startswith("[") else host.partition(":")[0]
+        if name not in LOCAL_HOSTS:
+            return False
+        return self.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
+
+    def _leads_session(self):
+        """Пароль страницы для самой страницы, только когда сайт запущен у вас на компьютере (run_local.py):
+        вводить его не нужно. На хостинге и для чужих запросов страницы нет."""
+        job = self.server.leads_job
+        if not self.server.auto_login or job is None or not job.enabled or not self._local_request():
+            self._error(404, "Страница не найдена.")
+            return
+        self._json(200, {"token": job.token})
 
     def _leads_page(self):
         if self._leads_enabled() is None:
@@ -493,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0,
-                leads_job=None, mail_service=None, settings_path=None, send_service=None):
+                leads_job=None, mail_service=None, settings_path=None, send_service=None, auto_login=False):
     server = ThreadingHTTPServer((host, port), Handler)
     server.service = service or Service()
     server.limiter = limiter or RateLimiter()
@@ -502,6 +526,7 @@ def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted
     server.leads_job = leads_job
     server.mail_service = mail_service
     server.send_service = send_service
+    server.auto_login = auto_login
     server.settings_path = settings_path or mailcfg.SETTINGS_FILE
     return server
 
@@ -530,7 +555,7 @@ def main(argv=None):
     send_service = SendService(data_dir) if data_dir else None
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
                          RateLimiter(args.rate_limit), args.trusted_proxies, leads_job, mail_service,
-                         send_service=send_service)
+                         send_service=send_service, auto_login=env("LEADS_AUTO_LOGIN") == "1")
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
     if leads_job.enabled:
         print("Страница /leads включена (пароль из LEADS_TOKEN)."

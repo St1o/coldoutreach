@@ -29,16 +29,26 @@ REQUIRED = ("MAILRU_USER", "MAILRU_APP_PASSWORD")
 DEFAULT_PORT = 8000
 
 
+def token_problem(token: str) -> str:
+    """Чем пароль не подходит (пусто - подходит): не короче 12 знаков, только латинские буквы, цифры и знаки без пробелов
+    (пароль идёт в заголовке запроса, а в нём русским буквам не место)."""
+    if len(token) < MIN_TOKEN_LENGTH:
+        return "короче 12 знаков"
+    if not (token.isascii() and token.isprintable()) or any(ch.isspace() for ch in token):
+        return "с русскими буквами или пробелами (нужны латинские буквы и цифры)"
+    return ""
+
+
 def stored_token(env_path: str, values: dict) -> str:
-    """Пароль страницы из local.env. Нет (или короче 12 знаков) - создаёт новый и дописывает в файл, чтобы он
-    не менялся от запуска к запуску и его не нужно было вводить. Не удалось записать - пароль на этот запуск."""
+    """Пароль страницы из local.env. Нет - создаёт новый и дописывает в файл, чтобы он не менялся от запуска к запуску.
+    Есть, но не подходит - на этот запуск создаёт другой, файл не трогает. Не удалось записать - пароль на этот запуск."""
     token = values.get("LEADS_TOKEN", "")
-    if len(token) >= MIN_TOKEN_LENGTH:
+    if token and not token_problem(token):
         return token
     token = secrets.token_urlsafe(16)
     if values.get("LEADS_TOKEN"):
-        print("LEADS_TOKEN в local.env короче 12 знаков: на этот запуск создан другой пароль. "
-              "Замените строку в файле или удалите её, и пароль сохранится сам.")
+        print(f"LEADS_TOKEN в local.env {token_problem(values['LEADS_TOKEN'])}: на этот запуск создан другой пароль, "
+              "вводить его не нужно. Замените строку в файле на пароль из латинских букв и цифр или удалите её.")
         return token
     try:
         with open(env_path, "a", encoding="utf-8") as fh:
@@ -54,6 +64,7 @@ def serve(port: int, token: str, values: dict, open_browser: bool = True) -> Non
     for key, value in values.items():
         os.environ.setdefault(key, value)                   # настоящие переменные окружения главнее файла
     os.environ["LEADS_TOKEN"] = token
+    os.environ["LEADS_AUTO_LOGIN"] = "1"                    # страницы /leads и /mail получают пароль сами, вводить не нужно
     os.environ["HOST"] = "127.0.0.1"                        # только этот компьютер
     os.environ["TRUSTED_PROXIES"] = "0"
     if open_browser:
@@ -86,8 +97,7 @@ def main(argv=None, env_path: str = ENV_PATH, example_path: str = EXAMPLE_PATH, 
     if not values.get("OUTREACH_DATA"):
         values["OUTREACH_DATA"] = DEFAULT_DATA_DIR
     print(f"Папка данных рассылки: {values['OUTREACH_DATA']}")
-    print(f"Если браузер не открылся сам, откройте http://127.0.0.1:{port}/leads#<пароль из строки LEADS_TOKEN "
-          "в файле local.env>")
+    print(f"Если браузер не открылся сам, откройте http://127.0.0.1:{port}/leads (пароль подставится сам).")
     try:
         run(port, token, values, not args.no_browser)
     except OSError as exc:

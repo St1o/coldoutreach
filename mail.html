@@ -291,19 +291,28 @@ $('forget').addEventListener('click', () => {
   $('login-status').textContent = 'Пароль удалён из этого браузера.';
 });
 
-// Запуск через run_local.py открывает страницу со свежим паролем в ссылке (после # он на сервер не уходит)
+// На своём компьютере (run_local.py) сайт сам отдаёт странице пароль из local.env: вводить его не нужно
+async function fetchSession() {
+  try {
+    const response = await fetch('/api/leads/session');
+    return response.ok ? ((await response.json()).token || '') : '';
+  } catch (e) { return ''; }
+}
+
 let fromLink = '';
 try { fromLink = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* испорченная ссылка */ }
-const saved = savedPassword();
-if (fromLink) {
-  history.replaceState(null, '', location.pathname);
-  $('token').value = fromLink;
-  $('remember').checked = false;                  // пароль на один запуск запоминать незачем
-  enter(false);
-} else if (saved) {
-  $('token').value = saved;
-  enter(true);
-}
+if (fromLink) history.replaceState(null, '', location.pathname);
+(async () => {
+  const token = fromLink || await fetchSession();
+  if (token) {
+    $('token').value = token;
+    $('remember').checked = false;                // пароль на один запуск запоминать незачем
+    enter(false);
+  } else if (savedPassword()) {                   // хостинг: пароль, который вводили раньше
+    $('token').value = savedPassword();
+    enter(true);
+  }
+})();
 </script>
 </body>
 </html>

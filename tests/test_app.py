@@ -317,17 +317,18 @@ class LeadsCase(unittest.TestCase):
         log("[1/1] 7707083004: ok")
         return self.code
 
-    def start(self, token=TOKEN, api_key="KEY", send_service=None):
+    def start(self, token=TOKEN, api_key="KEY", send_service=None, auto_login=False):
         job = LeadsJob(token, run=self.fake_run, out_dir=self.tmp.name, api_key=api_key)
         server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
-                             leads_job=job, send_service=send_service)
+                             leads_job=job, send_service=send_service, auto_login=auto_login)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(AppTest.stop, server)
         self.job, self.base = job, f"http://127.0.0.1:{server.server_port}"
         return job
 
-    def request(self, path, method="GET", body=None, token=TOKEN):
+    def request(self, path, method="GET", body=None, token=TOKEN, extra=None):
         headers = {"X-Leads-Token": token} if token is not None else {}
+        headers.update(extra or {})
         data = None
         if body is not None:
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -568,6 +569,49 @@ class FakeSendService:
 
     def status(self):
         return {"running": False, "lines": ["Сейчас отправка не идёт."], "ready": True}
+
+
+class SessionTest(LeadsCase):
+    """Пароль страницы для самой страницы: только на своём компьютере и только для своих запросов."""
+
+    def test_off_unless_the_site_runs_on_the_owners_computer(self):
+        self.start()
+        self.assertEqual(self.request("/api/leads/session", token=None)[0], 404)
+
+    def test_the_page_gets_the_password_from_the_site(self):
+        self.start(auto_login=True)
+        status, headers, body = self.request("/api/leads/session", token=None)
+        self.assertEqual((status, json.loads(body)), (200, {"token": TOKEN}))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Sec-Fetch-Site": "same-origin"})[0], 200)
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Host": "localhost:8000"})[0], 200)
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Host": "[::1]:8000"})[0], 200)
+
+    def test_foreign_sites_and_rebinding_names_get_nothing(self):
+        self.start(auto_login=True)
+        for extra in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
+                      {"Host": "evil.example:8000"}, {"Host": "127.0.0.1.evil.example"}, {"Host": ""}):
+            self.assertEqual(self.request("/api/leads/session", token=None, extra=extra)[0], 404, extra)
+
+    def test_only_the_computer_itself_counts_as_local(self):
+        import types
+        from app import Handler
+
+        def local(peer, **headers):
+            fake = types.SimpleNamespace(client_address=(peer, 5000), headers=headers)
+            fake.headers = types.SimpleNamespace(get=lambda name, default=None: headers.get(name, default))
+            return Handler._local_request(fake)
+
+        self.assertTrue(local("127.0.0.1", Host="127.0.0.1:8000"))
+        self.assertTrue(local("::1", Host="[::1]:8000"))
+        self.assertFalse(local("203.0.113.5", Host="127.0.0.1:8000"))                    # чужой компьютер в сети
+        self.assertFalse(local("127.0.0.1", Host="127.0.0.1:8000", **{"Sec-Fetch-Site": "cross-site"}))
+        self.assertFalse(local("127.0.0.1", Host="my-computer.local:8000"))
+        self.assertFalse(local("127.0.0.1"))                                                # нет Host
+
+    def test_disabled_page_has_no_session_either(self):
+        self.start(token="short", auto_login=True)
+        self.assertEqual(self.request("/api/leads/session", token=None)[0], 404)
 
 
 class SendWebTest(LeadsCase):
