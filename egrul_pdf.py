@@ -14,6 +14,10 @@
 
 ФИО берётся из раздела руководителя (для ИП - из «Сведений об индивидуальном
 предпринимателе»), почта - из строки «E-mail».
+
+Основной ОКВЭД - из раздела «Сведения об основном виде деятельности»: код вида «62.01» и
+название после него. Раскладку этого раздела на настоящих выписках ещё не проверяли, поэтому
+код ищется терпимо (любой код с точкой после заголовка раздела), а если не нашёлся - поле пустое.
 """
 import io
 import re
@@ -35,6 +39,10 @@ FIO_COLUMNS_RE = re.compile(
 FIO_ROWS_RE = re.compile(
     rf"Фамилия\s+({_WORD})\s+(?:\d+\s+)?Имя\s+({_WORD})"
     rf"(?:\s+(?:\d+\s+)?Отчество\s+({_WORD}))?")
+MAIN_OKVED_RE = re.compile(r"Сведения\s+об\s+основном\s+виде\s+деятельности", re.IGNORECASE)
+# код с точкой («62.01», «47.19.1»), затем название до номера следующей строки таблицы
+OKVED_CODE_RE = re.compile(
+    r"(?<![\d.])(\d{2}\.\d{1,2}(?:\.\d{1,2})?)(?![\d.])\s+(.+?)(?=\s+\d{1,3}\s+[А-ЯЁA-Z]|$)")
 EMAIL_ROW_RE = re.compile(r"(?<!\w)E-?mail\s+(.+?)(?=\s+\d+\s+\D|$)", re.IGNORECASE)
 EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 # адреса налоговых органов в выписке - не почта компании
@@ -51,6 +59,8 @@ class ExtractError(Exception):
 class ExtractData:
     director: str = ""      # ФИО (Фамилия Имя Отчество)
     email: str = ""
+    okved: str = ""         # код основного вида деятельности, например «62.01»
+    okved_name: str = ""
 
 
 def pdf_to_text(pdf: bytes) -> str:
@@ -106,6 +116,21 @@ def find_email(flat: str) -> str:
     return ""
 
 
+def find_main_okved(flat: str):
+    """(код, название) основного вида деятельности; ("", "") если раздел не найден."""
+    for section in MAIN_OKVED_RE.finditer(flat):
+        window = flat[section.end(): section.end() + SECTION_WINDOW]
+        following = NEXT_SECTION_RE.search(window)
+        if following:
+            window = window[:following.start()]
+        match = OKVED_CODE_RE.search(window)
+        if match:
+            return match.group(1), match.group(2).strip()[:200]
+    return "", ""
+
+
 def parse_extract(text: str) -> ExtractData:
     flat = _flatten(text)
-    return ExtractData(director=find_director(flat), email=find_email(flat))
+    okved, okved_name = find_main_okved(flat)
+    return ExtractData(director=find_director(flat), email=find_email(flat),
+                       okved=okved, okved_name=okved_name)

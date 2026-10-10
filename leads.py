@@ -1,4 +1,4 @@
-"""Новые организации за день -> таблица: название, ФИО директора, почта.
+"""Новые организации за день -> таблица: название, ФИО директора, почта, основной ОКВЭД.
 
 Алгоритм:
     1. Со страницы https://checko.ru/company/updates собрать ИНН организаций,
@@ -31,7 +31,10 @@ from checko_updates import CheckoBlocked, CheckoClient, CheckoError
 from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
 
-FIELDS = ["Название", "ФИО директора", "Почта"]
+FIELDS = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
+
+SOURCE_REGISTER = "ЕГРЮЛ"             # почта из выписки ЕГРЮЛ: на такие адреса рассылка разрешена
+SOURCE_CHECKO = "контакты Checko"      # почта из контактов Checko («открытые источники»): для рассылки не годится
 
 OK = "ok"                # есть почта - идёт в таблицу
 NO_EMAIL = "no_email"    # выписка получена, почты нет - в таблицу не идёт и повторно не проверяется
@@ -49,7 +52,8 @@ def director_from_search(raw: str) -> str:
 
 def process_company(client: EgrulClient, company) -> dict:
     """Одна организация -> запись состояния. Капча пробрасывается наверх."""
-    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "okved": "",
+             "okved_name": "", "note": ""}
     try:
         records = client.search_by_inn(company.inn)
         if not records:
@@ -71,6 +75,8 @@ def process_company(client: EgrulClient, company) -> dict:
         return entry
 
     entry["email"] = data.email
+    entry["email_source"] = SOURCE_REGISTER
+    entry["okved"], entry["okved_name"] = data.okved, data.okved_name
     entry["director"] = data.director or director_from_search(record.director)
     entry["status"] = OK if data.email else NO_EMAIL
     return entry
@@ -78,7 +84,8 @@ def process_company(client: EgrulClient, company) -> dict:
 
 def process_company_api(api, company) -> dict:
     """Одна организация через API Checko -> запись состояния. Исчерпанный лимит пробрасывается."""
-    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "okved": "",
+             "okved_name": "", "note": ""}
     try:
         info = parse_company(api.company(company.inn))
     except CheckoApiQuotaExceeded:
@@ -93,6 +100,8 @@ def process_company_api(api, company) -> dict:
     entry["name"] = info.name or company.name
     entry["director"] = info.director
     entry["email"] = info.email
+    entry["email_source"] = SOURCE_REGISTER if info.email_from_register else SOURCE_CHECKO
+    entry["okved"], entry["okved_name"] = info.okved, info.okved_name
     entry["status"] = OK if info.email else NO_EMAIL
     if info.email and not info.email_from_register:
         entry["note"] = "почта из контактов Checko, не из ЕГРЮЛ"
@@ -130,10 +139,20 @@ def save_results(out: str, state: dict) -> None:
             writer.writerow(FIELDS)
             for entry in state.values():
                 if entry["status"] == OK:
-                    writer.writerow([entry["name"], entry["director"], entry["email"]])
+                    writer.writerow([entry["name"], entry["director"], entry["email"],
+                                     entry.get("okved", ""), entry.get("okved_name", ""),
+                                     entry.get("email_source", "")])
 
     _write_atomic(state_path(out), write_state)
     _write_atomic(out, write_csv)
+
+
+def needs_check(entry) -> bool:
+    """Проверять ли организацию (снова): ошибка или нет в ЕГРЮЛ; а также запись из старого запуска,
+    сделанного до появления ОКВЭД и источника почты (ключа «okved» в ней нет) - её дозаполняем один раз."""
+    if entry is None:
+        return True
+    return entry["status"] == RETRY or (entry["status"] == OK and "okved" not in entry)
 
 
 def count(state: dict, status: str) -> int:
@@ -180,7 +199,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
     log(f"Найдено организаций: {len(companies)}")
 
     state = load_state(state_path(out))
-    todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]
+    todo = [c for c in companies if needs_check(state.get(c.inn))]
     if state:
         log(f"Уже проверено раньше: {len(companies) - len(todo)}; осталось: {len(todo)}")
     if limit:
@@ -235,7 +254,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Новые организации за день: название, ФИО директора, почта")
+    parser = argparse.ArgumentParser(description="Новые организации за день: название, ФИО директора, почта, основной ОКВЭД")
     parser.add_argument("--date", type=date.fromisoformat, default=None,
                         help="дата регистрации ГГГГ-ММ-ДД (по умолчанию сегодня по Москве)")
     parser.add_argument("--out", help="CSV-файл (по умолчанию leads_<дата>.csv)")

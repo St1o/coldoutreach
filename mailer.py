@@ -7,8 +7,15 @@
     * без ключа --send ничего не отправляется: только проверка таблицы и список «что уйдёт»;
     * за один запуск уходит не больше --limit писем (по умолчанию 20), между письмами пауза --pause;
     * рядом с таблицей ведётся журнал <таблица>.sent.json: кому уже отправлено, повторно не шлём;
+    * не больше --daily-limit писем за последние 24 часа (по журналам всех таблиц letters*.sent.json в той же
+      папке; по умолчанию 40: в правилах рассылки для нового ящика 30-50 писем в день);
+    * адреса из стоп-листа (stoplist.txt рядом с таблицей: строка = адрес или @домен) пропускаются при каждом
+      запуске, так что отписка действует сразу, даже если письмо уже лежит в таблице;
+    * в каждое письмо добавляется заголовок List-Unsubscribe (mailto на адрес отправителя);
     * при ошибке входа, отказе или лимите сервера mail.ru программа сразу останавливается
       (дальше стучаться бессмысленно и вредно для репутации ящика); готовое сохранено.
+
+Лишние колонки таблицы (например, «Группа», «Источник адреса») записываются в журнал рядом с письмом.
 
 Доступ к ящику (в аргументы командной строки пароль не попадает):
     MAILRU_USER           полный адрес ящика, например name@mail.ru
@@ -30,8 +37,8 @@ import smtplib
 import ssl
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 
@@ -60,10 +67,27 @@ class Letter:
     email: str
     subject: str
     body: str
+    meta: dict = field(default_factory=dict)      # прочие колонки таблицы: «Группа», «Источник адреса» и т. д.
 
 
 def check_email(address: str) -> bool:
     return bool(_EMAIL_RE.match(address))
+
+
+def read_stoplist(path: str) -> frozenset:
+    """Стоп-лист: по строке на адрес или на домен целиком (@example.ru); пустые строки и строки с # пропускаются."""
+    entries = set()
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip().lower()
+            if line:
+                entries.add(line)
+    return frozenset(entries)
+
+
+def is_stopped(address: str, stoplist) -> bool:
+    address = address.lower()
+    return address in stoplist or "@" + address.rpartition("@")[2] in stoplist
 
 
 def read_env_file(path: str) -> dict:
@@ -118,6 +142,8 @@ def read_letters(path: str):
         raise LettersError("в таблице нет колонок: " + ", ".join(missing)
                            + ". Нужны: " + ", ".join(FIELDS))
 
+    extra = {index: name.strip() for index, name in enumerate(rows[0])
+             if name.strip() and index not in columns.values()}
     letters, problems, seen = [], [], set()
     for number, row in enumerate(rows[1:], 2):
         if not any(cell.strip() for cell in row):
@@ -136,17 +162,21 @@ def read_letters(path: str):
             problems.append((number, "повтор адреса (второе письмо туда же не отправляем)"))
         else:
             seen.add(address.lower())
-            letters.append(Letter(address, subject, body))
+            meta = {name: row[index].strip() for index, name in extra.items()
+                    if index < len(row) and row[index].strip()}
+            letters.append(Letter(address, subject, body, meta))
     return letters, problems
 
 
-def build_message(letter: Letter, sender: str, from_name: str = "") -> EmailMessage:
+def build_message(letter: Letter, sender: str, from_name: str = "", unsubscribe: bool = False) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = formataddr((from_name, sender)) if from_name else sender
     msg["To"] = letter.email
     msg["Subject"] = letter.subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1])
+    if unsubscribe:             # почтовые программы показывают кнопку «отписаться»; письмо придёт в наш ящик
+        msg["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
     msg.set_content(letter.body.replace("\r\n", "\n"), charset="utf-8", cte="base64")
     return msg
 
@@ -247,9 +277,36 @@ def reply_text(exc) -> str:
     return (f"{code} " if code else "") + (text or str(exc))[:200]
 
 
+def sent_last_24h(directory: str, now: datetime) -> int:
+    """Сколько писем ушло за последние 24 часа по журналам всех таблиц letters*.sent.json в папке."""
+    total = 0
+    for name in os.listdir(directory):
+        if not (name.startswith("letters") and name.endswith(".sent.json")):
+            continue
+        for entry in load_state(os.path.join(directory, name)).values():
+            if entry.get("status") != SENT:
+                continue
+            try:
+                when = datetime.fromisoformat(entry["time"])
+            except (KeyError, ValueError):
+                continue
+            if timedelta(0) <= now - when < timedelta(hours=24):
+                total += 1
+    return total
+
+
+def _entry(status: str, letter: Letter, note: str = "") -> dict:
+    """Запись журнала. Тема и лишние колонки таблицы (группа, источник адреса) нужны для следующих писем цепочки."""
+    entry = {"status": status, "time": _now(), "note": note, "subject": letter.subject}
+    if letter.meta:
+        entry["meta"] = letter.meta
+    return entry
+
+
 def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, user: str = "",
         password: str = "", from_name: str = "", port: int = SMTP_PORT, sender=None, log=print,
-        sleep=time.sleep, max_temp_errors: int = 3) -> int:
+        sleep=time.sleep, max_temp_errors: int = 3, stoplist=frozenset(), daily_limit: int = 0,
+        unsubscribe: bool = False, now=None) -> int:
     """Возвращает код выхода: 0 - готово, 1 - ошибка в таблице или настройках,
     2 - mail.ru не принял вход (логин/пароль), 3 - mail.ru отказал или ограничил отправку,
     5 - несколько временных отказов по получателям подряд."""
@@ -265,8 +322,17 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
     state = load_state(state_file)
     todo = [letter for letter in letters if letter.email.lower() not in state]
     skipped_done = len(letters) - len(todo)
+    stopped = [letter for letter in todo if is_stopped(letter.email, stoplist)]
+    if stopped:
+        todo = [letter for letter in todo if not is_stopped(letter.email, stoplist)]
+        log(f"В стоп-листе: {len(stopped)} адресов, им письма не уйдут.")
     if limit:
         todo = todo[:limit]
+    if daily_limit:
+        used = sent_last_24h(os.path.dirname(os.path.abspath(path)), now or datetime.now(timezone.utc))
+        room = max(0, daily_limit - used)
+        log(f"Дневной лимит {daily_limit}: за последние 24 часа уже отправлено {used}, можно ещё {room}.")
+        todo = todo[:room]
     log(f"Писем в таблице: {len(letters)}; уже обработано раньше: {skipped_done}; "
         f"в этом запуске: {len(todo)}; строк с ошибками: {len(problems)}.")
 
@@ -295,7 +361,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             if number > 1:
                 sleep(pause)                    # пауза между письмами: репутация ящика важнее скорости
             try:
-                sender.send(build_message(letter, sender.user, from_name))
+                sender.send(build_message(letter, sender.user, from_name, unsubscribe))
             except smtplib.SMTPAuthenticationError as exc:
                 log(f"mail.ru не принял логин/пароль ({reply_text(exc)}). Нужен «пароль для внешних приложений», "
                     "а не обычный пароль от ящика. Остановлено.")
@@ -306,7 +372,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                 permanent = all(str(reply[0]).startswith("5") for reply in replies)
                 note = reply_text(exc) if not replies else f"{replies[0][0]} " + replies[0][1].decode("utf-8", "replace")[:150]
                 if permanent:
-                    state[letter.email.lower()] = {"status": REJECTED, "time": _now(), "note": note}
+                    state[letter.email.lower()] = _entry(REJECTED, letter, note)
                     save_state(state_file, state)
                     log(f"[{number}/{len(todo)}] {letter.email}: адрес не принят ({note}) - пропускаем")
                     temp_in_a_row = 0
@@ -324,7 +390,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                     "а следующий запуск начнёт с этого письма.")
                 code = 3
                 break
-            state[letter.email.lower()] = {"status": SENT, "time": _now(), "note": ""}
+            state[letter.email.lower()] = _entry(SENT, letter)
             save_state(state_file, state)
             done += 1
             temp_in_a_row = 0
@@ -353,6 +419,12 @@ def main(argv=None) -> int:
                         help="имя отправителя в поле «От» (по умолчанию MAIL_FROM_NAME из local.env)")
     parser.add_argument("--port", type=int, default=SMTP_PORT, choices=(465, 587),
                         help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS)")
+    parser.add_argument("--daily-limit", type=int, default=40,
+                        help="не больше писем за последние 24 часа по всем таблицам letters*.sent.json в папке "
+                             "(по умолчанию 40; для нового ящика правила рассылки советуют 30-50; 0 - без лимита)")
+    parser.add_argument("--stoplist", default=None,
+                        help="файл стоп-листа: адрес или @домен в строке (по умолчанию stoplist.txt рядом с таблицей, "
+                             "если он есть)")
     parser.add_argument("--env", default=ENV_FILE,
                         help="файл с MAILRU_USER и MAILRU_APP_PASSWORD (по умолчанию local.env рядом с mailer.py)")
     args = parser.parse_args(argv)
@@ -361,10 +433,22 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"Ошибка: не удалось прочитать {args.env}: {getattr(exc, 'strerror', None) or exc}")
         return 1
+    stop_path = args.stoplist or os.path.join(os.path.dirname(os.path.abspath(args.letters)), "stoplist.txt")
+    try:
+        stoplist = read_stoplist(stop_path)
+    except FileNotFoundError:
+        if args.stoplist:
+            print(f"Ошибка: нет файла стоп-листа {args.stoplist}")
+            return 1
+        stoplist = frozenset()                  # файла нет - стоп-лист пока пуст
+    except (OSError, ValueError) as exc:
+        print(f"Ошибка: не удалось прочитать стоп-лист {stop_path}: {getattr(exc, 'strerror', None) or exc}")
+        return 1
     try:
         return run(args.letters, args.send, args.limit, args.pause,
                    os.environ.get("MAILRU_USER", ""), os.environ.get("MAILRU_APP_PASSWORD", ""),
-                   args.from_name or os.environ.get("MAIL_FROM_NAME", ""), args.port)
+                   args.from_name or os.environ.get("MAIL_FROM_NAME", ""), args.port,
+                   stoplist=stoplist, daily_limit=args.daily_limit, unsubscribe=True)
     except KeyboardInterrupt:
         print("Остановлено вами. Отправленное записано в журнал.")
         return 4

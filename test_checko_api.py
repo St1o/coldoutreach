@@ -73,6 +73,25 @@ class ParseCompanyTest(unittest.TestCase):
         info = parse_company(payload(Руковод=[], УпрОрг={"НаимПолн": "УК ООО"}))
         self.assertEqual(info.director, "")
 
+    def test_main_okved_from_checko_field(self):
+        info = parse_company(payload(ОКВЭД={"Код": "62.01", "Наим": "Разработка ПО", "Версия": "2014"}))
+        self.assertEqual((info.okved, info.okved_name), ("62.01", "Разработка ПО"))
+
+    def test_main_okved_from_register_data_when_checko_field_is_empty(self):
+        body = payload(ОКВЭД={})
+        body["source_data"] = {"СвЮЛ": {"СвОКВЭД": {"СвОКВЭДОсн": {"@attributes": {
+            "КодОКВЭД": "47.19", "НаимОКВЭД": "Торговля розничная"}}}}}
+        info = parse_company(body)
+        self.assertEqual((info.okved, info.okved_name), ("47.19", "Торговля розничная"))
+
+    def test_main_okved_as_one_string(self):
+        info = parse_company(payload(ОКВЭД="62.01 Разработка ПО"))
+        self.assertEqual((info.okved, info.okved_name), ("62.01", "Разработка ПО"))
+
+    def test_no_okved_is_empty_not_an_error(self):
+        info = parse_company(payload())
+        self.assertEqual((info.okved, info.okved_name), ("", ""))
+
     def test_falls_back_to_full_name(self):
         self.assertTrue(parse_company(payload(НаимСокр="")).name.startswith("ОБЩЕСТВО"))
 

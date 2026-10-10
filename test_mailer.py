@@ -288,6 +288,135 @@ class EnvFileTest(unittest.TestCase):
         self.assertEqual(mailer.main(["letters.csv", "--env", self.env]), 1)
 
 
+class StoplistTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def path(self, name):
+        return os.path.join(self.dir.name, name)
+
+    def test_reads_addresses_domains_comments_and_case(self):
+        with open(self.path("stoplist.txt"), "w", encoding="utf-8-sig") as fh:
+            fh.write("# отписались\nBad@Mail.ru\n\n@registrar.ru  # сервис регистрации\n")
+        stop = mailer.read_stoplist(self.path("stoplist.txt"))
+        self.assertEqual(stop, {"bad@mail.ru", "@registrar.ru"})
+        self.assertTrue(mailer.is_stopped("BAD@mail.ru", stop))
+        self.assertTrue(mailer.is_stopped("anyone@Registrar.ru", stop))
+        self.assertFalse(mailer.is_stopped("good@mail.ru", stop))
+
+    def test_stopped_addresses_are_skipped_but_not_marked_as_handled(self):
+        logs, server = [], FakeServer()
+        t = TempTable(table("bad@b.ru;Т;Х", "ok@b.ru;Т;Х", "x@reg.ru;Т;Х"))
+        self.addCleanup(t.close)
+        sender = MailruSender(USER, SECRET, connect=lambda *a: server)
+        code = run(t.path, sender=sender, log=logs.append, sleep=lambda s: None, send=True,
+                   stoplist=frozenset({"bad@b.ru", "@reg.ru"}))
+        self.assertEqual(code, 0)
+        self.assertEqual([m["To"] for m in server.sent], ["ok@b.ru"])
+        self.assertIn("В стоп-листе: 2", "\n".join(logs))
+        self.assertEqual(set(mailer.load_state(mailer.state_path(t.path))), {"ok@b.ru"})
+
+    def test_main_uses_stoplist_next_to_the_table(self):
+        from unittest import mock
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        with open(os.path.join(os.path.dirname(t.path), "stoplist.txt"), "w", encoding="utf-8") as fh:
+            fh.write("a@b.ru\n")
+        with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+            mailer.main([t.path, "--env", os.path.join(self.dir.name, "нет.env")])
+        self.assertEqual(fake_run.call_args.kwargs["stoplist"], {"a@b.ru"})
+        self.assertTrue(fake_run.call_args.kwargs["unsubscribe"])
+
+    def test_main_explicit_missing_stoplist_is_an_error(self):
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        self.assertEqual(mailer.main([t.path, "--stoplist", os.path.join(self.dir.name, "нет.txt"),
+                                      "--env", os.path.join(self.dir.name, "нет.env")]), 1)
+
+
+class DailyLimitTest(unittest.TestCase):
+    NOW = mailer.datetime(2026, 10, 12, 12, 0, tzinfo=mailer.timezone.utc)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.logs, self.server = [], FakeServer()
+
+    def journal(self, name, entries):
+        with open(os.path.join(self.dir.name, name), "w", encoding="utf-8") as fh:
+            mailer.json.dump(entries, fh)
+
+    def go(self, rows, **kw):
+        path = os.path.join(self.dir.name, "letters_2.csv")
+        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            fh.write(table(*rows))
+        sender = MailruSender(USER, SECRET, connect=lambda *a: self.server)
+        return run(path, sender=sender, log=self.logs.append, sleep=lambda s: None, send=True,
+                   now=self.NOW, **kw)
+
+    def test_counts_last_24_hours_across_all_journals_of_the_folder(self):
+        recent, old = "2026-10-12T03:00:00+00:00", "2026-10-11T11:59:00+00:00"
+        self.journal("letters_1.sent.json", {
+            "a@x.ru": {"status": "sent", "time": recent}, "b@x.ru": {"status": "sent", "time": recent},
+            "c@x.ru": {"status": "sent", "time": old},                 # больше 24 часов назад
+            "d@x.ru": {"status": "rejected", "time": recent}})         # не отправлено
+        self.journal("letters_test.sent.json", {"me@x.ru": {"status": "sent", "time": recent}})
+        self.assertEqual(mailer.sent_last_24h(self.dir.name, self.NOW), 3)
+
+    def test_only_the_remaining_room_is_sent(self):
+        self.journal("letters_1.sent.json", {f"s{i}@x.ru": {"status": "sent", "time": "2026-10-12T09:00:00+00:00"}
+                                             for i in range(3)})
+        code = self.go(["a@b.ru;Т;Х", "c@b.ru;Т;Х", "d@b.ru;Т;Х"], daily_limit=4, pause=0)
+        self.assertEqual(code, 0)
+        self.assertEqual([m["To"] for m in self.server.sent], ["a@b.ru"])
+        self.assertIn("уже отправлено 3, можно ещё 1", "\n".join(self.logs))
+
+    def test_exhausted_limit_sends_nothing(self):
+        self.journal("letters_1.sent.json", {f"s{i}@x.ru": {"status": "sent", "time": "2026-10-12T09:00:00+00:00"}
+                                             for i in range(2)})
+        self.assertEqual(self.go(["a@b.ru;Т;Х"], daily_limit=2, pause=0), 0)
+        self.assertEqual(self.server.sent, [])
+        self.assertIn("Отправлять нечего", "\n".join(self.logs))
+
+    def test_zero_means_no_daily_limit(self):
+        self.go(["a@b.ru;Т;Х", "c@b.ru;Т;Х"], daily_limit=0, pause=0)
+        self.assertEqual(len(self.server.sent), 2)
+
+
+class JournalMetaAndUnsubscribeTest(unittest.TestCase):
+    def test_extra_columns_and_subject_go_to_the_journal(self):
+        t = TempTable(table("a@b.ru;Тема;Текст;3;ЕГРЮЛ", header="Почта;Тема;Текст;Группа;Источник адреса"))
+        self.addCleanup(t.close)
+        letters, _ = read_letters(t.path)
+        self.assertEqual(letters[0].meta, {"Группа": "3", "Источник адреса": "ЕГРЮЛ"})
+        server = FakeServer()
+        run(t.path, send=True, sender=MailruSender(USER, SECRET, connect=lambda *a: server), log=lambda m: None)
+        entry = mailer.load_state(mailer.state_path(t.path))["a@b.ru"]
+        self.assertEqual((entry["status"], entry["subject"]), ("sent", "Тема"))
+        self.assertEqual(entry["meta"], {"Группа": "3", "Источник адреса": "ЕГРЮЛ"})
+
+    def test_plain_table_has_no_meta(self):
+        t = TempTable(table("a@b.ru;Тема;Текст"))
+        self.addCleanup(t.close)
+        self.assertEqual(read_letters(t.path)[0][0].meta, {})
+
+    def test_list_unsubscribe_header_is_optional_and_points_to_the_sender(self):
+        letter = Letter("a@b.ru", "Т", "Х")
+        self.assertIsNone(build_message(letter, USER)["List-Unsubscribe"])
+        msg = build_message(letter, USER, unsubscribe=True)
+        self.assertEqual(msg["List-Unsubscribe"], f"<mailto:{USER}?subject=unsubscribe>")
+        msg.as_bytes().decode("ascii")
+
+    def test_run_adds_the_header_when_asked(self):
+        server = FakeServer()
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        run(t.path, send=True, unsubscribe=True, log=lambda m: None,
+            sender=MailruSender(USER, SECRET, connect=lambda *a: server))
+        self.assertIn("List-Unsubscribe", server.sent[0])
+
+
 class SslContextTest(unittest.TestCase):
     def test_verification_stays_on_and_certifi_roots_are_added(self):
         import ssl
