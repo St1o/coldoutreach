@@ -15,27 +15,13 @@ import sys
 import threading
 import webbrowser
 
+from mailer import read_env_file                            # общий разбор local.env с рассылкой
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, "local.env")
 EXAMPLE_PATH = os.path.join(HERE, "local.env.example")
 REQUIRED = ("MAILRU_USER", "MAILRU_APP_PASSWORD")
 DEFAULT_PORT = 8000
-
-
-def read_env_file(path: str) -> dict:
-    """Строки КЛЮЧ=значение; пустые строки и строки с # игнорируются; кавычки вокруг значения снимаются."""
-    values = {}
-    with open(path, encoding="utf-8-sig") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            values[key.strip()] = value
-    return values
 
 
 def serve(port: int, token: str, values: dict, open_browser: bool = True) -> None:

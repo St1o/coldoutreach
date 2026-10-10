@@ -10,9 +10,11 @@
     * при ошибке входа, отказе или лимите сервера mail.ru программа сразу останавливается
       (дальше стучаться бессмысленно и вредно для репутации ящика); готовое сохранено.
 
-Доступ к ящику - только через переменные окружения (в аргументы и файлы пароль не попадает):
+Доступ к ящику (в аргументы командной строки пароль не попадает):
     MAILRU_USER           полный адрес ящика, например name@mail.ru
     MAILRU_APP_PASSWORD   «пароль для внешних приложений» (обычный пароль от ящика не подойдёт)
+Берутся из переменных окружения, а если их нет - из файла local.env рядом с mailer.py (тот же файл,
+что использует run_local.py; в git он не попадает). Настоящие переменные окружения главнее файла.
 
 Запуск:
     python mailer.py letters.csv                          # проверка, ничего не уходит
@@ -41,6 +43,7 @@ _ALIASES = {"почта": 0, "email": 0, "e-mail": 0, "to": 0,
             "текст": 2, "body": 2}
 MAX_SUBJECT = 200
 MAX_BODY = 20_000
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.env")
 
 SENT = "sent"             # письмо принято сервером
 REJECTED = "rejected"     # сервер отказал по адресу получателя (5xx): повторно не шлём
@@ -61,6 +64,35 @@ class Letter:
 
 def check_email(address: str) -> bool:
     return bool(_EMAIL_RE.match(address))
+
+
+def read_env_file(path: str) -> dict:
+    """Строки КЛЮЧ=значение; пустые строки и строки с # игнорируются; кавычки вокруг значения снимаются."""
+    values = {}
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            values[key.strip()] = value
+    return values
+
+
+def load_env_file(path: str) -> bool:
+    """Подставляет значения из файла в os.environ, не трогая уже заданные непустые переменные.
+    Возвращает True, если файл найден. Нет файла - не ошибка: можно обойтись переменными окружения."""
+    try:
+        values = read_env_file(path)
+    except FileNotFoundError:
+        return False
+    for key, value in values.items():
+        if value and not os.environ.get(key):
+            os.environ[key] = value
+    return True
 
 
 def read_letters(path: str):
@@ -249,7 +281,8 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
         return 0
     if sender is None:
         if not user or not password:
-            log("Не заданы MAILRU_USER и MAILRU_APP_PASSWORD (адрес ящика и «пароль для внешних приложений»).")
+            log("Не заданы MAILRU_USER и MAILRU_APP_PASSWORD (адрес ящика и «пароль для внешних приложений»). "
+                "Впишите их в файл local.env рядом с mailer.py (см. LOCAL.md) или задайте переменными окружения.")
             return 1
         if not check_email(user):
             log("MAILRU_USER должен быть полным адресом ящика, например name@mail.ru.")
@@ -316,14 +349,22 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=20,
                         help="сколько писем отправить за запуск (по умолчанию 20; 0 - все)")
     parser.add_argument("--pause", type=float, default=30.0, help="пауза между письмами, с (по умолчанию 30)")
-    parser.add_argument("--from-name", default="", help="имя отправителя в поле «От»")
+    parser.add_argument("--from-name", default="",
+                        help="имя отправителя в поле «От» (по умолчанию MAIL_FROM_NAME из local.env)")
     parser.add_argument("--port", type=int, default=SMTP_PORT, choices=(465, 587),
                         help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS)")
+    parser.add_argument("--env", default=ENV_FILE,
+                        help="файл с MAILRU_USER и MAILRU_APP_PASSWORD (по умолчанию local.env рядом с mailer.py)")
     args = parser.parse_args(argv)
+    try:
+        load_env_file(args.env)
+    except (OSError, ValueError) as exc:
+        print(f"Ошибка: не удалось прочитать {args.env}: {getattr(exc, 'strerror', None) or exc}")
+        return 1
     try:
         return run(args.letters, args.send, args.limit, args.pause,
                    os.environ.get("MAILRU_USER", ""), os.environ.get("MAILRU_APP_PASSWORD", ""),
-                   args.from_name, args.port)
+                   args.from_name or os.environ.get("MAIL_FROM_NAME", ""), args.port)
     except KeyboardInterrupt:
         print("Остановлено вами. Отправленное записано в журнал.")
         return 4

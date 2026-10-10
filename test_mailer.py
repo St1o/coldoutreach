@@ -217,6 +217,77 @@ class RunTest(unittest.TestCase):
         self.assertEqual([m["To"] for m in servers[1].sent], ["c@d.ru"])
 
 
+class EnvFileTest(unittest.TestCase):
+    KEYS = ("MAILRU_USER", "MAILRU_APP_PASSWORD", "MAIL_FROM_NAME")
+
+    def setUp(self):
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ)             # всё, что программа впишет в окружение, откатится
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in self.KEYS:
+            os.environ.pop(key, None)
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.env = os.path.join(self.dir.name, "local.env")
+
+    def write(self, text):
+        with open(self.env, "w", encoding="utf-8-sig") as fh:
+            fh.write(text)
+
+    def test_parses_values_comments_and_quotes(self):
+        self.write("# комментарий\n\nMAILRU_USER = a@b.ru \nMAILRU_APP_PASSWORD=\"abc def\"\n"
+                   "PORT='8001'\n  # MAIL_EXAMPLE_TO=x@y.ru\nbroken line\n")
+        self.assertEqual(mailer.read_env_file(self.env),
+                         {"MAILRU_USER": "a@b.ru", "MAILRU_APP_PASSWORD": "abc def", "PORT": "8001"})
+
+    def test_file_fills_missing_variables(self):
+        self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n")
+        self.assertTrue(mailer.load_env_file(self.env))
+        self.assertEqual((os.environ["MAILRU_USER"], os.environ["MAILRU_APP_PASSWORD"]), (USER, SECRET))
+
+    def test_real_environment_wins_over_file_but_empty_one_does_not(self):
+        self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n")
+        os.environ["MAILRU_USER"] = "other@mail.ru"
+        os.environ["MAILRU_APP_PASSWORD"] = ""
+        mailer.load_env_file(self.env)
+        self.assertEqual(os.environ["MAILRU_USER"], "other@mail.ru")
+        self.assertEqual(os.environ["MAILRU_APP_PASSWORD"], SECRET)
+
+    def test_empty_values_in_file_do_not_create_variables(self):
+        self.write("MAILRU_USER=\nMAILRU_APP_PASSWORD=\n")
+        mailer.load_env_file(self.env)
+        self.assertNotIn("MAILRU_USER", os.environ)
+
+    def test_missing_file_is_not_an_error(self):
+        self.assertFalse(mailer.load_env_file(self.env))
+
+    def test_main_takes_access_from_the_file(self):
+        from unittest import mock
+        self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\nMAIL_FROM_NAME=Пётр\n")
+        with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+            self.assertEqual(mailer.main(["letters.csv", "--send", "--env", self.env]), 0)
+        args = fake_run.call_args.args
+        self.assertEqual((args[4], args[5], args[6]), (USER, SECRET, "Пётр"))
+
+    def test_from_name_option_beats_the_file(self):
+        from unittest import mock
+        self.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\nMAIL_FROM_NAME=Пётр\n")
+        with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+            mailer.main(["letters.csv", "--from-name", "Анна", "--env", self.env])
+        self.assertEqual(fake_run.call_args.args[6], "Анна")
+
+    def test_check_run_works_without_any_access(self):
+        table_file = TempTable(table("a@b.ru;Тема;Текст"))
+        self.addCleanup(table_file.close)
+        self.assertEqual(mailer.main([table_file.path, "--env", self.env]), 0)   # файла local.env нет
+
+    def test_unreadable_file_is_reported(self):
+        with open(self.env, "wb") as fh:
+            fh.write("MAILRU_USER=ящик".encode("cp1251"))                         # не UTF-8
+        self.assertEqual(mailer.main(["letters.csv", "--env", self.env]), 1)
+
+
 class SslContextTest(unittest.TestCase):
     def test_verification_stays_on_and_certifi_roots_are_added(self):
         import ssl
