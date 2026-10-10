@@ -501,6 +501,45 @@ class SendLockTest(unittest.TestCase):
         self.assertEqual(seen, [True])
 
 
+class WindowsPidTest(unittest.TestCase):
+    """Логика проверки процесса на Windows на подставном kernel32 (на других системах настоящий недоступен)."""
+
+    class Kernel32:
+        def __init__(self, opens=True, exit_code=259, query_ok=True):
+            self.opens, self.exit_code, self.query_ok, self.closed = opens, exit_code, query_ok, []
+
+        def OpenProcess(self, access, inherit, pid):
+            return 77 if self.opens else 0
+
+        def GetExitCodeProcess(self, handle, ref):
+            if self.query_ok:
+                ref._obj.value = self.exit_code
+            return 1 if self.query_ok else 0
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle)
+
+    def alive(self, **kw):
+        fake = self.Kernel32(**kw)
+        return mailer._windows_pid_alive(123, fake), fake
+
+    def test_running_process_is_alive_and_handle_is_closed(self):
+        result, fake = self.alive()
+        self.assertTrue(result)
+        self.assertEqual(fake.closed, [77])
+
+    def test_finished_process_whose_handle_is_still_open_is_not_alive(self):
+        result, fake = self.alive(exit_code=0)             # так было у тестов: Popen держит дескриптор
+        self.assertFalse(result)
+        self.assertEqual(fake.closed, [77])
+
+    def test_missing_process_is_not_alive(self):
+        self.assertFalse(self.alive(opens=False)[0])
+
+    def test_unknown_state_counts_as_alive(self):
+        self.assertTrue(self.alive(query_ok=False)[0])
+
+
 class StatusAndBackgroundTest(unittest.TestCase):
     def setUp(self):
         from unittest import mock
