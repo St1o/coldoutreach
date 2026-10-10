@@ -282,11 +282,15 @@ import openpyxl
 
 import leads
 from leads_job import LeadsJob
+from mailing import journal
+from send_service import SendError
 
 TOKEN = "correct-horse-battery"
 
 
-class LeadsWebTest(unittest.TestCase):
+class LeadsCase(unittest.TestCase):
+    """Общая оснастка: сайт с подставной выгрузкой."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -313,10 +317,10 @@ class LeadsWebTest(unittest.TestCase):
         log("[1/1] 7707083004: ok")
         return self.code
 
-    def start(self, token=TOKEN, api_key="KEY"):
+    def start(self, token=TOKEN, api_key="KEY", send_service=None):
         job = LeadsJob(token, run=self.fake_run, out_dir=self.tmp.name, api_key=api_key)
         server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
-                             leads_job=job)
+                             leads_job=job, send_service=send_service)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(AppTest.stop, server)
         self.job, self.base = job, f"http://127.0.0.1:{server.server_port}"
@@ -335,6 +339,9 @@ class LeadsWebTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.headers, exc.read()
 
+
+
+class LeadsWebTest(LeadsCase):
     # ---- доступ ----
 
     def test_disabled_without_a_sufficient_token(self):
@@ -389,6 +396,28 @@ class LeadsWebTest(unittest.TestCase):
         sheet = openpyxl.load_workbook(io.BytesIO(body)).active
         self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
                          [["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"], ["ФИРМА", "Иванов Иван", "a@b.ru", None, None, None]])
+
+    def test_status_marks_who_already_got_a_letter(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual((data["sent"], data["send_enabled"]), ({}, False))
+        journal.save_state(os.path.join(self.tmp.name, "letters_1.sent.json"),
+                           {"a@b.ru": journal.make_entry(journal.SENT, "Тема", {})})
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["sent"]["a@b.ru"]["stage"], 1)
+        self.assertEqual(data["sent"]["a@b.ru"]["status"], journal.SENT)
+
+    def test_the_last_table_is_still_shown_after_the_site_restarts(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        data = LeadsJob(TOKEN, run=self.fake_run, out_dir=self.tmp.name, api_key="KEY").status()
+        self.assertEqual((data["state"], data["date"]), ("idle", "2026-10-09"))
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", ""]])
+        self.assertTrue(data["has_table"])
+        self.assertEqual(LeadsJob(TOKEN, run=self.fake_run, out_dir=tempfile.mkdtemp()).status()["rows"], [])
 
     def test_the_date_must_be_chosen_by_the_user(self):
         self.start()
@@ -517,6 +546,85 @@ class LeadsWebTest(unittest.TestCase):
 
 
 # ---- пробное письмо через mail.ru (/mail) ----
+
+class FakeSendService:
+    """Вместо SendService: запоминает вызовы и отвечает по сценарию."""
+
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def prepare(self, leads_path, count, include_unwritten=False):
+        self.calls.append(("prepare", os.path.basename(leads_path), count, include_unwritten))
+        if self.error:
+            raise self.error
+        return {"letters": 3, "summary": ["Собрано писем: 3."], "examples": [], "daily_limit": 40,
+                "sent_24h": 0, "room": 40}
+
+    def start(self, leads_path, count, include_unwritten=False, expected=None):
+        self.calls.append(("start", os.path.basename(leads_path), count, include_unwritten, expected))
+        if self.error:
+            raise self.error
+        return {"started": True, "letters": 3, "daily_limit": 40, "message": "Отправка запущена."}
+
+    def status(self):
+        return {"running": False, "lines": ["Сейчас отправка не идёт."], "ready": True}
+
+
+class SendWebTest(LeadsCase):
+    def table(self, job):
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+
+    def test_without_a_service_the_buttons_do_not_exist(self):
+        self.start()
+        for path, method in (("/api/send/status", "GET"), ("/api/send/prepare", "POST"), ("/api/send/start", "POST")):
+            self.assertEqual(self.request(path, method, {"count": 1} if method == "POST" else None)[0], 404, path)
+
+    def test_the_password_is_required(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        self.assertEqual(self.request("/api/send/status", token="wrong")[0], 401)
+        self.assertEqual(self.request("/api/send/prepare", "POST", {"count": 1}, token=None)[0], 401)
+        self.assertEqual(self.request("/api/send/start", "POST", {"count": 1}, token="wrong")[0], 401)
+        self.assertEqual(service.calls, [])
+
+    def test_prepare_and_start_use_the_current_table(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        status, _, body = self.request("/api/send/prepare", "POST", {"count": 7, "include_unwritten": True})
+        self.assertEqual((status, json.loads(body)["letters"]), (200, 3))
+        status, _, body = self.request("/api/send/start", "POST", {"count": 7, "expected": 3})
+        self.assertEqual((status, json.loads(body)["started"]), (202, True))
+        self.assertEqual(service.calls, [("prepare", "leads_2026-10-09.csv", 7, True),
+                                         ("start", "leads_2026-10-09.csv", 7, False, 3)])
+        self.assertTrue(json.loads(self.request("/api/leads/status")[2])["send_enabled"])
+        self.assertEqual(json.loads(self.request("/api/send/status")[2])["lines"], ["Сейчас отправка не идёт."])
+
+    def test_no_table_means_no_send(self):
+        service = FakeSendService()
+        self.start(send_service=service)
+        status, _, body = self.request("/api/send/start", "POST", {"count": 3})
+        self.assertEqual(status, 400)
+        self.assertIn("Таблицы пока нет", json.loads(body)["error"])
+        self.assertEqual(service.calls, [])
+
+    def test_errors_of_the_service_are_shown_with_their_code(self):
+        service = FakeSendService(SendError(409, "Отправка уже идёт."))
+        job = self.start(send_service=service)
+        self.table(job)
+        status, _, body = self.request("/api/send/start", "POST", {"count": 3})
+        self.assertEqual((status, json.loads(body)["error"]), (409, "Отправка уже идёт."))
+
+    def test_bad_requests_are_rejected(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        for body in (b"", b"not json", [1], {"count": 3, "expected": "три"}, b"x" * 5000):
+            self.assertEqual(self.request("/api/send/start", "POST", body)[0], 400, body)
+        self.assertEqual(service.calls, [])
+
 
 import smtplib
 

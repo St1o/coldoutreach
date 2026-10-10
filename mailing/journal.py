@@ -47,6 +47,22 @@ def sent_last_24h(directory: str, now=None) -> int:
     return total
 
 
+def sent_overview(directory: str) -> dict:
+    """Адрес (маленькими буквами) -> {"stage", "status", "time"} по журналам первого, второго и третьего письма
+    в папке данных: самое позднее принятое письмо; если принятых нет, отказ по адресу. Для таблицы на сайте."""
+    overview = {}
+    for stage in (1, 2, 3):
+        entries = load_state(os.path.join(directory, f"letters_{stage}.sent.json"))
+        for address, entry in entries.items():
+            status = entry.get("status")
+            if status not in (SENT, REJECTED):
+                continue
+            current = overview.get(address)
+            if status == SENT or current is None:
+                overview[address] = {"stage": stage, "status": status, "time": entry.get("time", "")}
+    return overview
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
