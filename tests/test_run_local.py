@@ -95,6 +95,28 @@ class MainTest(unittest.TestCase):
             self.assertIn("LEADS_TOKEN в local.env", out)
             self.assertNotIn(bad, out)
 
+    def test_leads_password_is_the_page_password_and_wins_over_leads_token(self):
+        self.write("MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\nLEADS_TOKEN=aAnInDLx1x_0jkc1P8veJw\n"
+                   "LEADS_PASSWORD=123456789123456\nCHECKO_API_KEY=DruuXMbu3ViT3kwM\n")
+        code, out = self.go()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls[0][1], "123456789123456")
+        self.assertNotIn("123456789123456", out)
+        with open(self.env, encoding="utf-8") as fh:
+            self.assertEqual(fh.read().count("LEADS_TOKEN="), 1)          # ничего не дописано: подходящий пароль уже есть
+        self.assertEqual(self.calls[0][2]["CHECKO_API_KEY"], "DruuXMbu3ViT3kwM")   # ключ Checko - отдельная переменная
+
+    def test_a_bad_leads_password_falls_back_to_a_good_token_or_a_fresh_one(self):
+        self.write("MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\nLEADS_PASSWORD=short\nLEADS_TOKEN=aAnInDLx1x_0jkc1P8veJw\n")
+        self.go()
+        self.assertEqual(self.calls[0][1], "aAnInDLx1x_0jkc1P8veJw")
+        self.write("MAILRU_USER=a@b.ru\nMAILRU_APP_PASSWORD=x\nLEADS_PASSWORD=short\n")
+        code, out = self.go()
+        self.assertGreaterEqual(len(self.calls[1][1]), 12)
+        self.assertIn("LEADS_PASSWORD в local.env короче", out)
+        self.assertEqual(run_local.read_env_file(self.env)["LEADS_PASSWORD"], "short")      # чужую строку не трогаем
+        self.assertNotIn("LEADS_TOKEN", run_local.read_env_file(self.env))
+
     def test_token_problem_names_the_reason(self):
         self.assertEqual(run_local.token_problem("abcdefghijkl"), "")
         self.assertIn("короче", run_local.token_problem("short"))

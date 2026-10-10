@@ -20,10 +20,11 @@
 | Журнал отправки, дневной подсчёт | `mailing/journal.py` (700) |
 | Замок «одна отправка на папку» | `mailing/lock.py` (1100) |
 | local.env, settings.json, лимит в сутки, стоп-лист, скрытие адресов | `mailing/config.py` (1500) |
-| Таблица `/leads`: сбор, колонки, состояние | `leads.py` (4200), `leads_job.py` (1900), `checko_api.py`, `checko_updates.py`, `egrul_pdf.py` (по 2000-2500) |
+| Таблица `/leads`: сбор, колонки, состояние | `leads.py` (4300), `leads_job.py` (2200), `checko_api.py` (запасные пути при обрыве SSL, понятные ошибки), `checko_updates.py`, `egrul_pdf.py` (по 2000-2500) |
+| Диагностика связи с Checko (запуск у владельца: Run 'check_checko') | `check_checko.py` (1800) |
 | Сайт: страницы, API, пароль, лимит на `/mail` | `app.py` (7500), `leads.html` (таблица, серые отправленные строки, кнопка «Отправить», окно проверки), `mail.html`, `mail_service.py` (пробное письмо) |
 | Кнопка «Отправить» на `/leads`: проверка и фоновый запуск | `send_service.py` (1500): зовёт `compose.main` и `mailer.main`, сама ничего не отправляет |
-| Запуск у владельца на компьютере (PyCharm): пароль `LEADS_TOKEN` (создаётся и хранится в `local.env`), папка данных `OUTREACH_DATA`, браузер на `/leads` | `run_local.py` (1700), `LOCAL.md` |
+| Запуск у владельца на компьютере (PyCharm): пароль страниц `LEADS_PASSWORD` или `LEADS_TOKEN` (в `local.env`; ключ Checko - отдельно, `CHECKO_API_KEY`), папка данных `OUTREACH_DATA`, браузер на `/leads` | `run_local.py` (1700), `LOCAL.md` |
 
 ## Тесты
 Папка `tests/`, по файлу на модуль (`tests/test_mailer.py`, `tests/test_compose.py`, ...). Читайте только тест того модуля, который меняете. Запуск всего: `python -m unittest discover -q` (около 300 тестов, 35 секунд). Тесты не должны трогать настоящие `local.env` и `settings.json` (передавайте временные пути).

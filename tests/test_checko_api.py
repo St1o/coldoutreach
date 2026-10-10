@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import requests
 
@@ -146,6 +147,88 @@ class CheckoApiTest(unittest.TestCase):
         with self.assertRaises(CheckoApiError) as ctx:
             api.company("1")
         self.assertNotIn(KEY, str(ctx.exception))
+
+
+class ConnectionProblemsTest(unittest.TestCase):
+    def explain(self, error):
+        api = CheckoApi(KEY, FakeSession(error=error))
+        with self.assertRaises(CheckoApiError) as ctx:
+            api.company("1")
+        return str(ctx.exception)
+
+    def test_each_kind_of_failure_is_named_in_plain_words(self):
+        ssl_error = requests.exceptions.SSLError(
+            "HTTPSConnectionPool(host='api.checko.ru', port=443): Max retries exceeded with url: /v2/company?key="
+            + KEY + " (Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol')))")
+        text = self.explain(ssl_error)
+        self.assertIn("защищённое соединение", text)
+        self.assertIn("SSLEOFError", text)                      # технический хвост остаётся
+        self.assertNotIn(KEY, text)
+        self.assertIn("прокси", self.explain(requests.exceptions.ProxyError("Tunnel connection failed: 403")))
+        self.assertIn("не ответил", self.explain(requests.exceptions.ConnectTimeout("timed out")))
+        self.assertIn("нет соединения", self.explain(requests.exceptions.ConnectionError("getaddrinfo failed")))
+        self.assertIn("сбой запроса", self.explain(requests.exceptions.RequestException("что-то")))
+
+    def test_messages_stay_short_enough_for_the_log(self):
+        self.assertLessEqual(len(self.explain(requests.exceptions.SSLError("x" * 1000))), 200)
+
+
+class TransportFallbackTest(unittest.TestCase):
+    """Обрыв защищённого соединения: пробуем без прокси и с TLS 1.2, найденный путь запоминаем."""
+
+    SSL = requests.exceptions.SSLError("Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol'))")
+
+    def sessions(self, **by_mode):
+        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "tls12")}
+        patcher = mock.patch("checko_api.new_session", side_effect=lambda mode="default": made.get(mode) or FakeSession(error=self.SSL))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return made
+
+    def test_a_working_fallback_is_used_and_remembered(self):
+        made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
+        api = CheckoApi(KEY)                                    # свой сеанс: запасные пути разрешены
+        self.assertEqual(api.company("1")["data"]["НаимСокр"], "ООО ФИРМА")
+        self.assertEqual(api.mode, "tls12")
+        self.assertEqual(len(made["no-proxy"].calls), 1)        # без прокси пробовали первым и не вышло
+        api.company("2")
+        self.assertEqual(len(made["tls12"].calls), 2)           # дальше идём найденным путём
+        self.assertEqual(len(made["no-proxy"].calls), 1)
+
+    def test_no_proxy_path_comes_first(self):
+        made = self.sessions(**{"no-proxy": FakeSession(FakeResponse(payload()))})
+        api = CheckoApi(KEY)
+        api.company("1")
+        self.assertEqual(api.mode, "no-proxy")
+        self.assertEqual(made["tls12"].calls, [])
+
+    def test_when_nothing_helps_the_first_error_is_reported(self):
+        self.sessions()
+        api = CheckoApi(KEY)
+        api.session = FakeSession(error=self.SSL)
+        with self.assertRaises(CheckoApiError) as ctx:
+            api.company("1")
+        self.assertIn("защищённое соединение", str(ctx.exception))
+        self.assertEqual(api.mode, "default")
+
+    def test_no_fallback_for_a_given_session_or_for_other_errors(self):
+        made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
+        given = FakeSession(error=self.SSL)
+        with self.assertRaises(CheckoApiError):
+            CheckoApi(KEY, given).company("1")                  # сеанс передан снаружи (тесты, свои настройки): не трогаем
+        self.assertEqual(made["tls12"].calls, [])
+        api = CheckoApi(KEY)
+        api.session = FakeSession(error=requests.exceptions.ConnectTimeout("timed out"))
+        with self.assertRaises(CheckoApiError):
+            api.company("1")                                    # таймаут - не повод менять способ соединения
+        self.assertEqual((made["no-proxy"].calls, made["tls12"].calls), ([], []))
+
+    def test_real_sessions_are_built_for_each_mode(self):
+        import checko_api
+        self.assertFalse(checko_api.new_session("no-proxy").trust_env)
+        adapter = checko_api.new_session("tls12").get_adapter("https://api.checko.ru/")
+        self.assertIsInstance(adapter, checko_api._Tls12Adapter)
+        self.assertTrue(checko_api.new_session().trust_env)
 
 
 if __name__ == "__main__":

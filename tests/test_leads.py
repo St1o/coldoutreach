@@ -357,6 +357,20 @@ class ApiSourceTest(LeadsCase):
         self.assertEqual(self.run_api(api, max_errors_in_a_row=2), 5)
         self.assertEqual(api.asked, [A, B])
 
+    def test_if_every_organization_failed_it_is_not_reported_as_done(self):
+        api = FakeApi({i: CheckoApiError("нет соединения") for i in (A, B, C)})
+        self.assertEqual(self.run_api(api), 5)                          # ошибок меньше предела подряд, но результата нет
+        self.assertIn("Ни одну организацию проверить не удалось", "\n".join(self.logs))
+        self.assertEqual(self.read_csv(), [HEADER])
+
+    def test_a_partly_failed_run_is_still_done(self):
+        api = FakeApi({A: api_payload("a@example.ru"), B: CheckoApiError("HTTP 500"), C: CheckoApiNotFound("нет")})
+        self.assertEqual(self.run_api(api), 0)
+
+    def test_not_found_organizations_are_not_failures(self):
+        api = FakeApi({A: CheckoApiNotFound("нет"), B: CheckoApiNotFound("нет"), C: CheckoApiNotFound("нет")})
+        self.assertEqual(self.run_api(api), 0)                          # «ещё не появилась» - не сбой связи
+
     def test_log_has_no_personal_data(self):
         self.run_api(FakeApi({A: api_payload("secret@example.ru", fio="Тайный Человек"), B: api_payload(""), C: api_payload("")}))
         text = "\n".join(self.logs)

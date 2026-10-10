@@ -16,10 +16,12 @@
 Лимит API - 32 запроса в секунду с адреса, бесплатно 100 запросов в сутки (по документации Checko).
 """
 import re
+import ssl
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from egrul_pdf import find_email
 
@@ -146,22 +148,83 @@ def parse_company(payload: dict) -> CompanyInfo:
     return info
 
 
+class _Tls12Adapter(HTTPAdapter):
+    """Соединение не новее TLS 1.2: некоторые прокси и системы защиты обрывают более новое рукопожатие."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        context = ssl.create_default_context()
+        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        kwargs["ssl_context"] = context
+        super().init_poolmanager(*args, **kwargs)
+
+
+# Если обычное соединение обрывается при согласовании шифрования, пробуем без системных настроек прокси,
+# потом с TLS 1.2. Что сработало, то остаётся до конца работы программы.
+FALLBACK_MODES = ("no-proxy", "tls12")
+_TRANSPORT_ERRORS = (requests.exceptions.SSLError, requests.exceptions.ProxyError)
+
+
+def new_session(mode: str = "default") -> requests.Session:
+    session = requests.Session()
+    if mode == "no-proxy":
+        session.trust_env = False                   # без HTTP(S)_PROXY и настроек прокси Windows
+    elif mode == "tls12":
+        session.mount("https://", _Tls12Adapter())
+    return session
+
+
 class CheckoApi:
     def __init__(self, key: str, session: Optional[requests.Session] = None, timeout: float = 20.0):
         self.key = key
-        self.session = session or requests.Session()
+        self._own_session = session is None
+        self.session = session or new_session()
         self.timeout = timeout
+        self.mode = "default"
 
     def _scrub(self, text) -> str:
         return str(text).replace(self.key, "***") if self.key else str(text)
 
+    def _explain(self, exc) -> str:
+        """Причина сбоя простыми словами и короткий технический хвост (ключ скрыт)."""
+        if isinstance(exc, requests.exceptions.SSLError):
+            head = "защищённое соединение с api.checko.ru оборвано (SSL)"
+        elif isinstance(exc, requests.exceptions.ProxyError):
+            head = "прокси не пропустил запрос к api.checko.ru"
+        elif isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout)):
+            head = "api.checko.ru не ответил вовремя"
+        elif isinstance(exc, requests.exceptions.ConnectionError):
+            head = "нет соединения с api.checko.ru"
+        else:
+            head = "сбой запроса к api.checko.ru"
+        text = self._scrub(exc)
+        cause = re.search(r"Caused by (.*)$", text, re.S)
+        tail = (cause.group(1) if cause else text).strip().replace("\n", " ")
+        return f"{head}: {tail}"[:200]
+
+    def _get(self, inn: str):
+        """Запрос; при обрыве защищённого соединения пробует запасные пути (см. FALLBACK_MODES)."""
+        params = {"key": self.key, "inn": inn, "source": "true"}
+        try:
+            return self.session.get(API_URL, params=params, timeout=self.timeout)
+        except _TRANSPORT_ERRORS as first:
+            if not self._own_session or self.mode != "default":
+                raise
+            for mode in FALLBACK_MODES:
+                session = new_session(mode)
+                try:
+                    response = session.get(API_URL, params=params, timeout=self.timeout)
+                except requests.RequestException:
+                    continue
+                self.session, self.mode = session, mode      # дальше идём этим путём
+                return response
+            raise first
+
     def company(self, inn: str) -> dict:
         """Ответ API по ИНН (JSON). Бросает CheckoApiNotFound / CheckoApiQuotaExceeded / CheckoApiError."""
         try:
-            response = self.session.get(
-                API_URL, params={"key": self.key, "inn": inn, "source": "true"}, timeout=self.timeout)
+            response = self._get(inn)
         except requests.RequestException as exc:
-            raise CheckoApiError(f"Нет связи с API Checko: {self._scrub(exc)}"[:200]) from None
+            raise CheckoApiError(self._explain(exc)) from None
 
         status = response.status_code
         if status in (402, 429):

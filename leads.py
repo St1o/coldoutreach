@@ -228,6 +228,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
 
     code = 0
     errors_in_a_row = 0
+    processed = failed = 0
     for number, company in enumerate(todo, 1):
         if should_stop() or (number > 1 and _wait(pause, should_stop, sleep)):   # пауза: не нагружаем ФНС
             code = 4
@@ -258,6 +259,8 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
         log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
             + (f" ({entry['note']})" if entry["note"] else ""))
+        failure = entry["status"] == RETRY and entry["note"].startswith("ошибка")
+        processed, failed = processed + 1, failed + failure
         errors_in_a_row = errors_in_a_row + 1 if entry["note"].startswith("ошибка") else 0
         if errors_in_a_row >= max_errors_in_a_row:
             log(f"{errors_in_a_row} ошибок подряд - останавливаемся: сайт ФНС отвечает не как обычно. "
@@ -266,6 +269,9 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
             break
     if code == 4:
         log("Остановлено по запросу. Результат сохранён.")
+    elif code == 0 and processed and failed == processed:
+        log("Ни одну организацию проверить не удалось: все запросы закончились ошибкой. Причина в строках выше.")
+        code = 5
 
     save_results(out, state)                # файл создаётся и когда обработать нечего
     log(f"Готово. В таблице {out}: {count(state, OK)} организаций с почтой. "

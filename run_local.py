@@ -3,8 +3,8 @@
 Что делает:
     1. Берёт настройки из файла local.env рядом с программой (его нет в git: пароли в нём остаются
        только на вашем компьютере). Если файла нет, создаёт его из local.env.example и просит заполнить.
-    2. Берёт пароль страницы из LEADS_TOKEN в local.env; если его там нет, придумывает и дописывает туда один
-       раз. Вводить пароль не нужно: браузер открывается со ссылкой, в которой он уже есть. Сайт слушает
+    2. Берёт пароль страницы из LEADS_PASSWORD (или LEADS_TOKEN) в local.env; если подходящего там нет,
+       придумывает и дописывает туда один раз строкой LEADS_TOKEN. Вводить пароль не нужно: браузер открывается со ссылкой, в которой он уже есть. Сайт слушает
        только этот компьютер (127.0.0.1).
     3. Папка данных рассылки (таблицы, письма, журналы): OUTREACH_DATA из local.env, иначе папка outreach-data
        рядом с папкой проекта.
@@ -39,17 +39,23 @@ def token_problem(token: str) -> str:
     return ""
 
 
+PASSWORD_KEYS = ("LEADS_PASSWORD", "LEADS_TOKEN")       # пароль страниц /leads и /mail; первый из подходящих главнее
+# Ключ API Checko - другая переменная, CHECKO_API_KEY: пароль страницы к нему отношения не имеет.
+
+
 def stored_token(env_path: str, values: dict) -> str:
-    """Пароль страницы из local.env. Нет - создаёт новый и дописывает в файл, чтобы он не менялся от запуска к запуску.
-    Есть, но не подходит - на этот запуск создаёт другой, файл не трогает. Не удалось записать - пароль на этот запуск."""
-    token = values.get("LEADS_TOKEN", "")
-    if token and not token_problem(token):
-        return token
+    """Пароль страниц из local.env (LEADS_PASSWORD, затем LEADS_TOKEN). Подходящего нет - создаёт новый и дописывает
+    в файл строкой LEADS_TOKEN, чтобы он не менялся от запуска к запуску. Есть, но не подходит - на этот запуск
+    создаёт другой, файл не трогает. Не удалось записать - пароль на этот запуск."""
+    for key in PASSWORD_KEYS:
+        if values.get(key) and not token_problem(values[key]):
+            return values[key]
     token = secrets.token_urlsafe(16)
-    if values.get("LEADS_TOKEN"):
-        print(f"LEADS_TOKEN в local.env {token_problem(values['LEADS_TOKEN'])}: на этот запуск создан другой пароль, "
-              "вводить его не нужно. Замените строку в файле на пароль из латинских букв и цифр или удалите её.")
-        return token
+    for key in PASSWORD_KEYS:
+        if values.get(key):
+            print(f"{key} в local.env {token_problem(values[key])}: на этот запуск создан другой пароль, "
+                  "вводить его не нужно. Замените строку в файле на пароль из латинских букв и цифр или удалите её.")
+            return token
     try:
         with open(env_path, "a", encoding="utf-8") as fh:
             fh.write("\n# Пароль страниц /leads и /mail: создан автоматически, вводить его не нужно\n"
