@@ -1,7 +1,11 @@
+import json
+import subprocess
 import unittest
 from unittest import mock
 
 import requests
+
+import checko_api
 
 from checko_api import (
     CheckoApi, CheckoApiError, CheckoApiNotFound, CheckoApiQuotaExceeded, parse_company,
@@ -179,8 +183,8 @@ class TransportFallbackTest(unittest.TestCase):
     SSL = requests.exceptions.SSLError("Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol'))")
 
     def sessions(self, **by_mode):
-        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "tls12")}
-        patcher = mock.patch("checko_api.new_session", side_effect=lambda mode="default": made.get(mode) or FakeSession(error=self.SSL))
+        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "tls12", "curl")}
+        patcher = mock.patch("checko_api.new_session", side_effect=lambda mode="default": made[mode] if mode in made else FakeSession(error=self.SSL))
         patcher.start()
         self.addCleanup(patcher.stop)
         return made
@@ -202,6 +206,33 @@ class TransportFallbackTest(unittest.TestCase):
         self.assertEqual(api.mode, "no-proxy")
         self.assertEqual(made["tls12"].calls, [])
 
+    def test_curl_is_the_last_resort_and_is_remembered(self):
+        made = self.sessions(curl=FakeSession(FakeResponse(payload())))
+        api = CheckoApi(KEY)
+        self.assertEqual(api.company("1")["data"]["НаимСокр"], "ООО ФИРМА")
+        self.assertEqual(api.mode, "curl")
+        self.assertEqual((len(made["no-proxy"].calls), len(made["tls12"].calls)), (1, 1))     # сначала пробовали остальные
+        api.company("2")
+        self.assertEqual(len(made["curl"].calls), 2)
+
+    def test_a_computer_without_curl_just_skips_that_way(self):
+        made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
+        made["curl"] = None
+        self.assertEqual(CheckoApi(KEY).company("1")["data"]["НаимСокр"], "ООО ФИРМА")
+
+    def test_any_dropped_connection_triggers_the_fallbacks_but_a_timeout_does_not(self):
+        made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
+        api = CheckoApi(KEY)
+        api.session = FakeSession(error=requests.exceptions.ConnectionError("Connection aborted: ConnectionResetError"))
+        self.assertTrue(api.company("1"))
+        self.assertEqual(api.mode, "tls12")
+        slow = CheckoApi(KEY)
+        slow.session = FakeSession(error=requests.exceptions.ConnectTimeout("timed out"))
+        calls_before = len(made["tls12"].calls)
+        with self.assertRaises(CheckoApiError):
+            slow.company("1")
+        self.assertEqual(len(made["tls12"].calls), calls_before)
+
     def test_when_nothing_helps_the_first_error_is_reported(self):
         self.sessions()
         api = CheckoApi(KEY)
@@ -221,7 +252,7 @@ class TransportFallbackTest(unittest.TestCase):
         api.session = FakeSession(error=requests.exceptions.ConnectTimeout("timed out"))
         with self.assertRaises(CheckoApiError):
             api.company("1")                                    # таймаут - не повод менять способ соединения
-        self.assertEqual((made["no-proxy"].calls, made["tls12"].calls), ([], []))
+        self.assertEqual((made["no-proxy"].calls, made["tls12"].calls, made["curl"].calls), ([], [], []))
 
     def test_real_sessions_are_built_for_each_mode(self):
         import checko_api
@@ -229,6 +260,83 @@ class TransportFallbackTest(unittest.TestCase):
         adapter = checko_api.new_session("tls12").get_adapter("https://api.checko.ru/")
         self.assertIsInstance(adapter, checko_api._Tls12Adapter)
         self.assertTrue(checko_api.new_session().trust_env)
+
+
+class CurlSessionTest(unittest.TestCase):
+    """Запрос через curl: команда, ввод и разбор ответа (curl подменён); настоящий curl - в тесте ниже."""
+
+    def run_with(self, stdout=b'{"a": 1}\n200', stderr=b"", code=0, error=None):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if error:
+                raise error
+            return subprocess.CompletedProcess(command, code, stdout, stderr)
+
+        with mock.patch("checko_api.subprocess.run", fake_run):
+            try:
+                response = checko_api._CurlSession("/usr/bin/curl").get(
+                    "https://api.checko.ru/v2/company", {"key": KEY, "inn": "1"}, timeout=20)
+            except requests.exceptions.ConnectionError as exc:
+                return calls, exc
+        return calls, response
+
+    def test_the_key_goes_through_stdin_not_the_command_line(self):
+        calls, response = self.run_with()
+        command, kwargs = calls[0]
+        self.assertNotIn(KEY, " ".join(command))
+        self.assertIn(KEY, kwargs["input"].decode())
+        self.assertIn("--config", command)
+        self.assertEqual((response.status_code, response.json()), (200, {"a": 1}))
+
+    def test_http_errors_are_answers_not_failures(self):
+        _, response = self.run_with(stdout=b'{"meta": {"message": "x"}}\n403')
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_failed_curl_is_a_connection_error_with_its_reason(self):
+        _, error = self.run_with(stdout=b"", stderr=b"curl: (35) schannel: failed to receive handshake", code=35)
+        self.assertIsInstance(error, requests.exceptions.ConnectionError)
+        self.assertIn("schannel", str(error))
+        _, error = self.run_with(error=OSError("не найден"))
+        self.assertIn("curl не запустился", str(error))
+        _, error = self.run_with(stdout=b"garbage")
+        self.assertIn("не в том виде", str(error))
+
+    def test_a_missing_curl_means_no_such_way(self):
+        with mock.patch("checko_api.find_curl", return_value=None):
+            self.assertIsNone(checko_api.new_session("curl"))
+        with mock.patch("checko_api.find_curl", return_value="/x/curl"):
+            self.assertIsInstance(checko_api.new_session("curl"), checko_api._CurlSession)
+
+    @unittest.skipUnless(checko_api.find_curl(), "curl на этом компьютере нет")
+    def test_the_real_curl_against_a_local_server(self):
+        import http.server
+        import threading
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.path)
+                body = json.dumps(payload()).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/v2/company"
+        response = checko_api._CurlSession(checko_api.find_curl()).get(url, {"key": KEY, "inn": "7707083893", "source": "true"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["НаимСокр"], "ООО ФИРМА")
+        self.assertIn(f"key={KEY}", seen[0])
+        self.assertIn("inn=7707083893", seen[0])
 
 
 if __name__ == "__main__":

@@ -15,8 +15,13 @@
 Ключ в адрес запроса попадает, поэтому во всех сообщениях об ошибках он заменяется на ***.
 Лимит API - 32 запроса в секунду с адреса, бесплатно 100 запросов в сутки (по документации Checko).
 """
+import json
+import os
 import re
+import shutil
 import ssl
+import subprocess
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -158,13 +163,61 @@ class _Tls12Adapter(HTTPAdapter):
         super().init_poolmanager(*args, **kwargs)
 
 
-# Если обычное соединение обрывается при согласовании шифрования, пробуем без системных настроек прокси,
-# потом с TLS 1.2. Что сработало, то остаётся до конца работы программы.
-FALLBACK_MODES = ("no-proxy", "tls12")
-_TRANSPORT_ERRORS = (requests.exceptions.SSLError, requests.exceptions.ProxyError)
+def find_curl() -> Optional[str]:
+    """Системная программа curl: на Windows 10 и новее лежит в System32 и шифрует средствами Windows, а не Python."""
+    if os.name == "nt":
+        own = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+        if os.path.exists(own):
+            return own
+    return shutil.which("curl")
 
 
-def new_session(mode: str = "default") -> requests.Session:
+class _CurlResponse:
+    def __init__(self, status: int, body: str):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return json.loads(self._body)                   # не JSON - ValueError, как у requests
+
+
+class _CurlSession:
+    """Запрос через curl вместо Python. Ключ передаётся через стандартный ввод, а не в командной строке,
+    чтобы его не было в списке процессов."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def get(self, url, params=None, timeout=20.0):
+        query = urllib.parse.urlencode(params or {})
+        config = f'url = "{url}{"?" + query if query else ""}"\n'
+        command = [self.path, "--silent", "--show-error", "--max-time", str(max(1, int(timeout))),
+                   "--config", "-", "--write-out", "\n%{http_code}"]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            done = subprocess.run(command, input=config.encode("utf-8"), capture_output=True,
+                                  timeout=timeout + 5, creationflags=flags)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise requests.exceptions.ConnectionError(f"curl не запустился: {exc}") from None
+        if done.returncode != 0:
+            reason = done.stderr.decode("utf-8", errors="replace").strip().replace("\n", " ")
+            raise requests.exceptions.ConnectionError(f"curl: {reason[:150]}")
+        body, _, status = done.stdout.decode("utf-8", errors="replace").rpartition("\n")
+        try:
+            return _CurlResponse(int(status), body)
+        except ValueError:
+            raise requests.exceptions.ConnectionError("curl вернул ответ не в том виде") from None
+
+
+# Если обычное соединение обрывается, пробуем без системных настроек прокси, потом с TLS 1.2, потом через системный
+# curl. Что сработало, то остаётся до конца работы программы.
+FALLBACK_MODES = ("no-proxy", "tls12", "curl")
+
+
+def new_session(mode: str = "default"):
+    """Сеанс для запросов. Режим curl возвращает None, если curl на компьютере нет."""
+    if mode == "curl":
+        path = find_curl()
+        return _CurlSession(path) if path else None
     session = requests.Session()
     if mode == "no-proxy":
         session.trust_env = False                   # без HTTP(S)_PROXY и настроек прокси Windows
@@ -206,11 +259,13 @@ class CheckoApi:
         params = {"key": self.key, "inn": inn, "source": "true"}
         try:
             return self.session.get(API_URL, params=params, timeout=self.timeout)
-        except _TRANSPORT_ERRORS as first:
-            if not self._own_session or self.mode != "default":
-                raise
+        except requests.exceptions.ConnectionError as first:      # включая обрыв шифрования (SSLError) и прокси
+            if isinstance(first, requests.exceptions.Timeout) or not self._own_session or self.mode != "default":
+                raise                                              # долгое молчание - не повод менять способ соединения
             for mode in FALLBACK_MODES:
                 session = new_session(mode)
+                if session is None:
+                    continue
                 try:
                     response = session.get(API_URL, params=params, timeout=self.timeout)
                 except requests.RequestException:
