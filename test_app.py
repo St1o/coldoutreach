@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import threading
 import time
@@ -635,7 +636,8 @@ class MailWebTest(unittest.TestCase):
         self.assertFalse(json.loads(self.request("/api/mail/defaults")[2])["configured"])
 
         self.start(error=TimeoutError("timed out"))
-        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        with mock.patch.dict(os.environ, {"RENDER": "true"}):
+            status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
         self.assertEqual(status, 504)
         self.assertIn("Render", json.loads(body)["error"])
 

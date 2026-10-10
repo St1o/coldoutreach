@@ -6,7 +6,9 @@
 Ограничения: одно письмо за раз и не больше max_per_hour удачных отправок в час, чтобы страница
 (даже если пароль к ней утечёт) не превратилась в рассылку и не испортила репутацию ящика.
 """
+import os
 import smtplib
+import ssl
 import threading
 import time
 from collections import deque
@@ -16,6 +18,14 @@ import mailer
 from letter_template import DEFAULT_OFFER, render_letter
 
 CONNECT_TIMEOUT = 20.0
+
+
+def _connect_hint() -> str:
+    if os.environ.get("RENDER"):                    # Render сам ставит эту переменную в своих сервисах
+        return ("Сайт стоит на Render: на бесплатном плане он закрывает исходящие порты SMTP "
+                "(25, 465, 587), нужен платный тип сервиса.")
+    return ("Порт 465 может блокировать антивирус, брандмауэр или провайдер; проверьте, что интернет "
+            "работает, и попробуйте ещё раз.")
 
 
 class MailError(Exception):
@@ -100,11 +110,15 @@ class MailService:
             except smtplib.SMTPException as exc:           # раньше OSError: SMTPException - его подкласс
                 raise MailError(502, f"mail.ru отказал или оборвал связь: {mailer.reply_text(exc)}. "
                                      "Если это лимит отправки (451), повторите позже.") from exc
+            except ssl.SSLError as exc:                    # раньше OSError: SSLError - его подкласс
+                raise MailError(502, f"Не удалось проверить защищённое соединение с {mailer.SMTP_HOST}:{self.port}: "
+                                     f"{exc}. Чаще всего причина на этом компьютере: антивирус или другая программа, "
+                                     "которая подменяет сертификаты (проверка шифрованного трафика), либо "
+                                     "устаревший набор корневых сертификатов Windows. Пришлите этот текст целиком."
+                                ) from exc
             except OSError as exc:
                 raise MailError(504, f"Не удалось соединиться с {mailer.SMTP_HOST}:{self.port} "
-                                     f"({type(exc).__name__}). Если сайт стоит на бесплатном плане Render, "
-                                     "причина, скорее всего, в этом: Render закрывает исходящие порты SMTP "
-                                     "(25, 465, 587) для бесплатных сервисов. Нужен платный тип сервиса.") from exc
+                                     f"({type(exc).__name__}: {exc}). {_connect_hint()}") from exc
             finally:
                 sender.close()
             self._sent.append(self._clock())

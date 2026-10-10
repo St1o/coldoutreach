@@ -1,6 +1,9 @@
+import os
 import smtplib
+import ssl
 import threading
 import unittest
+from unittest import mock
 
 from mail_service import MailError, MailService
 
@@ -107,12 +110,27 @@ class MailServiceTest(unittest.TestCase):
         self.assertIn("451", message)
         self.assertIn("позже", message)
 
-    def test_blocked_smtp_port_mentions_render(self):
+    def test_blocked_smtp_port_mentions_render_only_on_render(self):
         for error in (TimeoutError("timed out"), OSError(101, "Network is unreachable")):
-            message = self.fail(self.make(error=error), 504)
+            with mock.patch.dict(os.environ, {"RENDER": "true"}):
+                message = self.fail(self.make(error=error), 504)
             self.assertIn("smtp.mail.ru:465", message)
             self.assertIn("Render", message)
             self.assertTrue(self.sender.closed)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RENDER", None)
+                message = self.fail(self.make(error=error), 504)
+            self.assertNotIn("Render", message)                 # у себя на компьютере Render ни при чём
+            self.assertIn("антивирус", message)
+
+    def test_certificate_error_shows_the_real_reason(self):
+        error = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                                                "unable to get local issuer certificate (_ssl.c:1006)")
+        message = self.fail(self.make(error=error), 502)
+        self.assertIn("unable to get local issuer certificate", message)
+        self.assertIn("антивирус", message)
+        self.assertNotIn("Render", message)
+        self.assertNotIn(SECRET, message)
 
     def test_second_send_while_busy_is_refused(self):
         service = self.make()
