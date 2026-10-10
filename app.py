@@ -32,7 +32,6 @@ from urllib.parse import parse_qs, urlparse
 from egrul_inn_search import (
     EgrulCaptchaRequired, EgrulClient, EgrulError, EgrulTimeout, validate_inn,
 )
-from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
 from letter_template import render_letter
 from mailing import config as mailcfg
@@ -44,6 +43,7 @@ LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
 MAIL_PAGE_PATH = os.path.join(HERE, "mail.html")
 MAIL_MAX_BODY = 100_000       # запрос страницы /mail: тема и текст одного письма
 MAIL_FIELDS = ("company", "director", "okved", "signature", "offer")
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
@@ -297,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "Таблицы пока нет.")
         else:
             name, content = table
-            self._send(200, content, "text/csv; charset=utf-8",
+            self._send(200, content, XLSX_TYPE,
                        [("Content-Disposition", f'attachment; filename="{name}"')])
 
     # ---- пробное письмо через mail.ru (страница /mail, тот же пароль, что у /leads) ----
@@ -391,28 +391,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             raw_date = str(body.get("date") or "").strip()
-            target = date.fromisoformat(raw_date) if raw_date else leads_today()
+            if not raw_date:
+                self._error(400, "Укажите дату регистрации (ГГГГ-ММ-ДД): она должна совпадать с датой в тексте с Checko.")
+                return
+            target = date.fromisoformat(raw_date)
             limit = int(body.get("limit") or 0)
             if not 0 <= limit <= 2000:
                 raise ValueError
             text = body.get("text") or ""
             if not isinstance(text, str):
                 raise ValueError
-            pause = float(body.get("pause") or 6)
-            if not 1 <= pause <= 60:
-                raise ValueError
-            source = body.get("source") or ("api" if job.api_available else "egrul")
-            if source not in ("api", "egrul"):
-                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
-            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, пауза 1-60 с, текст до 2 МБ.")
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, текст до 2 МБ.")
             return
-        if source == "api" and not job.api_available:
-            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY на сервере "
-                             "или выберите источник «Выписки ФНС».")
+        if not job.api_available:
+            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY в настройках сервера.")
             return
         try:
-            job.start(target, limit, text, pause, source)
+            job.start(target, limit, text)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return
