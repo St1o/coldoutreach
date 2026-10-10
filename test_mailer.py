@@ -217,5 +217,20 @@ class RunTest(unittest.TestCase):
         self.assertEqual([m["To"] for m in servers[1].sent], ["c@d.ru"])
 
 
+class SslContextTest(unittest.TestCase):
+    def test_verification_stays_on_and_certifi_roots_are_added(self):
+        import ssl
+        context = mailer.make_ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        self.assertGreater(len(context.get_ca_certs()), len(ssl.create_default_context().get_ca_certs()))
+
+    def test_extra_ca_file_from_environment_must_exist(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"MAILRU_CA_FILE": "/нет/такого/файла.pem"}):
+            with self.assertRaises(OSError):
+                mailer.make_ssl_context()
+
+
 if __name__ == "__main__":
     unittest.main()

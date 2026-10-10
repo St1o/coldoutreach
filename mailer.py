@@ -139,8 +139,24 @@ def save_state(path: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
-def default_connect(host: str, port: int, timeout: float):
+def make_ssl_context() -> ssl.SSLContext:
+    """Проверка сертификата сервера включена всегда. Доверяем центрам из хранилища системы, из набора
+    certifi (на Windows системный список пополняется лениво, и нужного корня в нём может не быть) и из
+    необязательного файла MAILRU_CA_FILE (PEM) с дополнительным корневым сертификатом."""
     context = ssl.create_default_context()
+    try:
+        import certifi
+        context.load_verify_locations(cafile=certifi.where())
+    except (ImportError, OSError):
+        pass
+    extra = os.environ.get("MAILRU_CA_FILE", "").strip()
+    if extra:
+        context.load_verify_locations(cafile=extra)       # неверный путь - понятная ошибка вместо молчания
+    return context
+
+
+def default_connect(host: str, port: int, timeout: float):
+    context = make_ssl_context()
     if port == 465:
         return smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
     server = smtplib.SMTP(host, port, timeout=timeout)
