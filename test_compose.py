@@ -198,6 +198,18 @@ class ValuesAndFillTest(unittest.TestCase):
         with self.assertRaises(ComposeError):
             make_composer(signature="")
 
+    def test_signature_is_needed_only_when_the_templates_use_it(self):
+        without = compose.parse_letters(LETTERS.replace("{{подпись}}\n", ""))
+        groups = compose.parse_segment(SEGMENT)
+        composer = compose.Composer(groups, without, LINK, "")                  # подпись не задана - и не нужна
+        text = composer.letter_text(1, "1")
+        self.assertNotIn("{{", text)
+        self.assertNotIn(SIGNATURE, text)
+        compose.Composer(groups, without, LINK, "[ЗАПОЛНИТЬ]")                  # лишнее значение не мешает
+        with self.assertRaises(ComposeError) as ctx:
+            compose.Composer(groups, compose.parse_letters(LETTERS), LINK, "")
+        self.assertIn("{{подпись}}", str(ctx.exception))
+
     def test_empty_words_remove_the_whole_clause(self):
         text = make_composer().letter_text(1, "12")
         self.assertIn("недавно зарегистрирована.", text)

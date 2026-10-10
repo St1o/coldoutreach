@@ -12,7 +12,7 @@
     * этап 1 - первое письмо; этап 2 (дожим) - тем, кому первое отправлено 3 рабочих дня назад и больше;
       этап 3 (закрывающее) - тем, кому дожим отправлен и с первого письма прошло 7 дней. Дожим и закрывающее
       не получают те, чей адрес есть в файле ответов опроса. Не больше трёх писем на адрес;
-    * нет ссылки на форму или подписи - письма не собираются.
+    * нет ссылки на форму - письма не собираются; то же с подписью, но только если в шаблонах есть {{подпись}}.
 
 Все файлы партии лежат в одной папке рядом с таблицей (она не должна быть в папке проекта агентов):
     leads_<дата>.csv          таблица с /leads
@@ -26,7 +26,7 @@
     python compose.py leads_2026-10-09.csv --letters ... --segment ... --limit 150
     python compose.py leads_2026-10-09.csv --letters ... --segment ... --stage 2
     python compose.py leads_2026-10-09.csv --letters ... --segment ... --test-to me@mail.ru,me2@gmail.com
-Ссылку на форму, подпись и пути к файлам агентов можно один раз вписать в local.env (рядом с mailer.py):
+Ссылку на форму, подпись (если она есть в шаблонах) и пути к файлам агентов можно один раз вписать в local.env:
 SURVEY_LINK=..., MAIL_SIGNATURE=..., OUTREACH_LETTERS=..., OUTREACH_SEGMENT=...; тогда --letters, --segment, --link
 и --signature не нужны. Параметры командной строки главнее local.env.
 """
@@ -227,10 +227,16 @@ def check_link(link: str) -> str:
     return link
 
 
+def uses_placeholder(texts: Texts, name: str) -> bool:
+    return any(match.group(1) == name for template in texts.templates.values()
+               for match in _PLACEHOLDER.finditer(template))
+
+
 def check_signature(signature: str) -> str:
     signature = (signature or "").replace("\\n", "\n").strip()
     if not signature or "заполнить" in signature.casefold() or "{{" in signature:
-        raise ComposeError("не задана подпись (--signature или MAIL_SIGNATURE в local.env): письма без неё не отправляем")
+        raise ComposeError("в шаблоне есть подстановка {{подпись}}, но подпись не задана (--signature или MAIL_SIGNATURE "
+                           "в local.env): задайте её или уберите подстановку из шаблона")
     return signature
 
 
@@ -280,7 +286,9 @@ class Composer:
         for group in groups:
             for cls in group.classes:
                 self.by_class.setdefault(cls, group.id)
-        self.texts, self.link, self.signature = texts, check_link(link), check_signature(signature)
+        self.texts, self.link = texts, check_link(link)
+        # Подпись нужна, только если в шаблонах есть {{подпись}}; нет такой подстановки - нет и подписи
+        self.signature = check_signature(signature) if uses_placeholder(texts, "подпись") else ""
         self.include_unwritten = include_unwritten
 
     def group_for(self, okved: str) -> str:
@@ -495,7 +503,8 @@ def main(argv=None, today=None, log=print) -> int:
     parser.add_argument("--stage", type=int, choices=(1, 2, 3), default=1,
                         help="1 - первое письмо, 2 - дожим, 3 - закрывающее (по умолчанию 1)")
     parser.add_argument("--link", default="", help="полная ссылка на опрос docs.google.com/forms/… (или SURVEY_LINK)")
-    parser.add_argument("--signature", default="", help="подпись: имя и должность (или MAIL_SIGNATURE)")
+    parser.add_argument("--signature", default="",
+                        help="подпись (или MAIL_SIGNATURE); нужна, только если в шаблонах есть {{подпись}}")
     parser.add_argument("--subject", type=int, default=0, help="номер темы из файла писем (по умолчанию рекомендованная)")
     parser.add_argument("--limit", type=int, default=0, help="сколько писем в партии (этап 1; 0 - все подходящие)")
     parser.add_argument("--min-days", type=int, default=0,
