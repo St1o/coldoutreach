@@ -35,6 +35,7 @@ import os
 import re
 import smtplib
 import ssl
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,10 @@ _ALIASES = {"почта": 0, "email": 0, "e-mail": 0, "to": 0,
 MAX_SUBJECT = 200
 MAX_BODY = 20_000
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.env")
+LOCK_NAME = "mailer.lock"        # в папке таблицы: пока он есть, в этой папке уже идёт отправка
+LOG_NAME = "mailer.log"          # журнал фоновой отправки (адреса в нём скрыты)
+DEFAULT_DAILY_LIMIT = 40
+LOCK_MAX_AGE = 24 * 3600         # замок старше суток считаем забытым
 
 SENT = "sent"             # письмо принято сервером
 REJECTED = "rejected"     # сервер отказал по адресу получателя (5xx): повторно не шлём
@@ -277,6 +282,109 @@ def reply_text(exc) -> str:
     return (f"{code} " if code else "") + (text or str(exc))[:200]
 
 
+def mask_email(address: str) -> str:
+    """name@mail.ru -> n***@mail.ru: для журналов и отчётов, которые читают не только вы."""
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}***@{domain}" if domain else "***"
+
+
+def redact(text: str) -> str:
+    return re.sub(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", lambda m: mask_email(m.group(0)), text)
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class Locked(Exception):
+    def __init__(self, pid: int):
+        super().__init__(f"в этой папке уже идёт отправка (процесс {pid})")
+        self.pid = pid
+
+
+def lock_holder(folder: str) -> int:
+    """PID работающей отправки в папке или 0. Замок мёртвого или забытого процесса удаляется."""
+    path = os.path.join(folder, LOCK_NAME)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            pid = int(fh.read().strip() or 0)
+        age = time.time() - os.path.getmtime(path)
+    except (OSError, ValueError):
+        pid, age = 0, 0
+    if pid and age < LOCK_MAX_AGE and pid_alive(pid):
+        return pid
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return 0
+
+
+class SendLock:
+    """Одна отправка на папку: две одновременные нарушили бы паузы между письмами и дневной лимит."""
+
+    def __init__(self, folder: str):
+        self.path = os.path.join(folder, LOCK_NAME)
+
+    def __enter__(self):
+        pid = lock_holder(os.path.dirname(self.path))
+        if pid and pid != os.getpid():
+            raise Locked(pid)
+        try:
+            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise Locked(lock_holder(os.path.dirname(self.path)) or -1)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+def status_lines(path: str, daily_limit: int, now=None) -> list:
+    """Сводка по таблице и журналу без адресов: сколько отправлено, осталось, идёт ли отправка."""
+    letters, problems = read_letters(path)
+    state = load_state(state_path(path))
+    folder = os.path.dirname(os.path.abspath(path))
+    counts = {kind: sum(1 for l in letters if state.get(l.email.lower(), {}).get("status") == kind)
+              for kind in (SENT, REJECTED)}
+    pending = sum(1 for l in letters if l.email.lower() not in state)
+    used = sent_last_24h(folder, now or datetime.now(timezone.utc))
+    holder = lock_holder(folder)
+    lines = [f"Писем в таблице: {len(letters)}; отправлено: {counts[SENT]}; адрес не принят: {counts[REJECTED]}; "
+             f"ещё не отправлялось: {pending}.",
+             f"За последние 24 часа по папке отправлено {used}" + (f" из {daily_limit}." if daily_limit else "."),
+             f"Сейчас идёт отправка (процесс {holder})." if holder else "Сейчас отправка не идёт."]
+    try:
+        with open(os.path.join(folder, LOG_NAME), encoding="utf-8", errors="replace") as fh:
+            tail = [line.rstrip() for line in fh.readlines()[-5:]]
+        if tail:
+            lines.append("Последние строки " + LOG_NAME + ":")
+            lines.extend("  " + line for line in tail)
+    except OSError:
+        pass
+    return lines
+
+
 def sent_last_24h(directory: str, now: datetime) -> int:
     """Сколько писем ушло за последние 24 часа по журналам всех таблиц letters*.sent.json в папке."""
     total = 0
@@ -306,10 +414,12 @@ def _entry(status: str, letter: Letter, note: str = "") -> dict:
 def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, user: str = "",
         password: str = "", from_name: str = "", port: int = SMTP_PORT, sender=None, log=print,
         sleep=time.sleep, max_temp_errors: int = 3, stoplist=frozenset(), daily_limit: int = 0,
-        unsubscribe: bool = False, now=None) -> int:
+        unsubscribe: bool = False, now=None, mask: bool = False) -> int:
     """Возвращает код выхода: 0 - готово, 1 - ошибка в таблице или настройках,
     2 - mail.ru не принял вход (логин/пароль), 3 - mail.ru отказал или ограничил отправку,
-    5 - несколько временных отказов по получателям подряд."""
+    5 - несколько временных отказов по получателям подряд. mask - в сообщениях адреса скрыты (n***@mail.ru)."""
+    who = mask_email if mask else (lambda address: address)
+    shown = redact if mask else (lambda text: text)
     try:
         letters, problems = read_letters(path)
     except LettersError as exc:
@@ -338,7 +448,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
 
     if not send:
         for number, letter in enumerate(todo, 1):
-            log(f"  {number}. {letter.email} - «{letter.subject}»")
+            log(f"  {number}. {who(letter.email)} - «{letter.subject}»")
         log("Проверка без отправки: ничего не ушло. Чтобы отправить, добавьте --send.")
         return 1 if problems else 0
 
@@ -363,7 +473,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             try:
                 sender.send(build_message(letter, sender.user, from_name, unsubscribe))
             except smtplib.SMTPAuthenticationError as exc:
-                log(f"mail.ru не принял логин/пароль ({reply_text(exc)}). Нужен «пароль для внешних приложений», "
+                log(f"mail.ru не принял логин/пароль ({shown(reply_text(exc))}). Нужен «пароль для внешних приложений», "
                     "а не обычный пароль от ящика. Остановлено.")
                 code = 2
                 break
@@ -374,18 +484,18 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                 if permanent:
                     state[letter.email.lower()] = _entry(REJECTED, letter, note)
                     save_state(state_file, state)
-                    log(f"[{number}/{len(todo)}] {letter.email}: адрес не принят ({note}) - пропускаем")
+                    log(f"[{number}/{len(todo)}] {who(letter.email)}: адрес не принят ({shown(note)}) - пропускаем")
                     temp_in_a_row = 0
                 else:
                     temp_in_a_row += 1
-                    log(f"[{number}/{len(todo)}] {letter.email}: временный отказ ({note}) - попробуем в следующий запуск")
+                    log(f"[{number}/{len(todo)}] {who(letter.email)}: временный отказ ({shown(note)}) - попробуем в следующий запуск")
                     if temp_in_a_row >= max_temp_errors:
                         log(f"{temp_in_a_row} временных отказов подряд - останавливаемся. Повторите позже.")
                         code = 5
                         break
                 continue
             except (smtplib.SMTPException, OSError) as exc:
-                log(f"mail.ru не принял письмо или оборвал связь ({reply_text(exc)}). Останавливаемся: "
+                log(f"mail.ru не принял письмо или оборвал связь ({shown(reply_text(exc))}). Останавливаемся: "
                     "если это лимит отправки (например 451 Ratelimit exceeded), продолжите позже, "
                     "а следующий запуск начнёт с этого письма.")
                 code = 3
@@ -394,7 +504,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             save_state(state_file, state)
             done += 1
             temp_in_a_row = 0
-            log(f"[{number}/{len(todo)}] {letter.email}: отправлено")
+            log(f"[{number}/{len(todo)}] {who(letter.email)}: отправлено")
     finally:
         sender.close()
 
@@ -407,11 +517,59 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def start_background(args, argv, user: str, password: str) -> int:
+    """Запускает ту же отправку отдельным процессом и сразу возвращает управление. Всё проверяется заранее,
+    чтобы ошибка была видна сразу, а не пропала в журнале."""
+    if not args.send:
+        print("Ошибка: --background работает только вместе с --send.")
+        return 1
+    try:
+        letters, _ = read_letters(args.letters)
+    except LettersError as exc:
+        print(f"Ошибка: {exc}")
+        return 1
+    if not user or not password or not check_email(user):
+        print("Ошибка: не заданы MAILRU_USER и MAILRU_APP_PASSWORD (local.env рядом с mailer.py). Отправка не запущена.")
+        return 1
+    folder = os.path.dirname(os.path.abspath(args.letters))
+    holder = lock_holder(folder)
+    if holder:
+        print(f"Ошибка: в этой папке уже идёт отправка (процесс {holder}). Состояние: --status.")
+        return 1
+    command = [sys.executable, os.path.abspath(__file__)] + [a for a in argv if a != "--background"]
+    if "--mask-addresses" not in command:
+        command.append("--mask-addresses")                       # в журнале фоновой отправки адресов нет
+    log_path = os.path.join(folder, LOG_NAME)
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(f"--- запуск {_now()} ---\n")
+    log_file = open(log_path, "ab")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": log_file, "stderr": subprocess.STDOUT, "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    kwargs["env"] = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")   # кириллица и сразу в журнал
+    process = subprocess.Popen(command, **kwargs)
+    log_file.close()
+    print(f"Отправка запущена в фоне (процесс {process.pid}): писем в таблице {len(letters)}, за запуск не больше "
+          f"{args.limit or 'всех'}, между письмами пауза {args.pause:g} с. Ждать не нужно. "
+          f"Состояние: python mailer.py \"{args.letters}\" --status ; журнал: {log_path}")
+    return 0
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Отправка писем из таблицы через mail.ru (SMTP)")
     parser.add_argument("letters", help="CSV с колонками «Почта», «Тема», «Текст»")
     parser.add_argument("--send", action="store_true",
                         help="реально отправить (без этого ключа - только проверка таблицы)")
+    parser.add_argument("--background", action="store_true",
+                        help="с --send: запустить отправку в фоне и сразу вернуться (ждать окончания не нужно; "
+                             "состояние - ключ --status)")
+    parser.add_argument("--status", action="store_true",
+                        help="показать, сколько отправлено и осталось и идёт ли отправка; ничего не отправляет")
+    parser.add_argument("--mask-addresses", action="store_true",
+                        help="в сообщениях скрывать адреса (n***@mail.ru); при --background включено само")
     parser.add_argument("--limit", type=int, default=20,
                         help="сколько писем отправить за запуск (по умолчанию 20; 0 - все)")
     parser.add_argument("--pause", type=float, default=30.0, help="пауза между письмами, с (по умолчанию 30)")
@@ -419,9 +577,10 @@ def main(argv=None) -> int:
                         help="имя отправителя в поле «От» (по умолчанию MAIL_FROM_NAME из local.env)")
     parser.add_argument("--port", type=int, default=SMTP_PORT, choices=(465, 587),
                         help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS)")
-    parser.add_argument("--daily-limit", type=int, default=40,
+    parser.add_argument("--daily-limit", type=int, default=None,
                         help="не больше писем за последние 24 часа по всем таблицам letters*.sent.json в папке "
-                             "(по умолчанию 40; для нового ящика правила рассылки советуют 30-50; 0 - без лимита)")
+                             f"(по умолчанию MAIL_DAILY_LIMIT из local.env, иначе {DEFAULT_DAILY_LIMIT}; для нового "
+                             "ящика правила рассылки советуют 30-50 и меньше в первые дни прогрева; 0 - без лимита)")
     parser.add_argument("--stoplist", default=None,
                         help="файл стоп-листа: адрес или @домен в строке (по умолчанию stoplist.txt рядом с таблицей, "
                              "если он есть)")
@@ -432,6 +591,12 @@ def main(argv=None) -> int:
         load_env_file(args.env)
     except (OSError, ValueError) as exc:
         print(f"Ошибка: не удалось прочитать {args.env}: {getattr(exc, 'strerror', None) or exc}")
+        return 1
+    try:
+        daily_limit = args.daily_limit if args.daily_limit is not None else int(
+            os.environ.get("MAIL_DAILY_LIMIT") or DEFAULT_DAILY_LIMIT)
+    except ValueError:
+        print("Ошибка: MAIL_DAILY_LIMIT в local.env должно быть целым числом.")
         return 1
     stop_path = args.stoplist or os.path.join(os.path.dirname(os.path.abspath(args.letters)), "stoplist.txt")
     try:
@@ -444,11 +609,31 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"Ошибка: не удалось прочитать стоп-лист {stop_path}: {getattr(exc, 'strerror', None) or exc}")
         return 1
-    try:
-        return run(args.letters, args.send, args.limit, args.pause,
-                   os.environ.get("MAILRU_USER", ""), os.environ.get("MAILRU_APP_PASSWORD", ""),
+
+    user, password = os.environ.get("MAILRU_USER", ""), os.environ.get("MAILRU_APP_PASSWORD", "")
+    if args.status:
+        try:
+            print("\n".join(status_lines(args.letters, daily_limit)))
+        except LettersError as exc:
+            print(f"Ошибка: {exc}")
+            return 1
+        return 0
+    if args.background:
+        return start_background(args, argv, user, password)
+
+    def go():
+        return run(args.letters, args.send, args.limit, args.pause, user, password,
                    args.from_name or os.environ.get("MAIL_FROM_NAME", ""), args.port,
-                   stoplist=stoplist, daily_limit=args.daily_limit, unsubscribe=True)
+                   stoplist=stoplist, daily_limit=daily_limit, unsubscribe=True, mask=args.mask_addresses)
+
+    try:
+        if not args.send:
+            return go()
+        with SendLock(os.path.dirname(os.path.abspath(args.letters))):
+            return go()
+    except Locked as exc:
+        print(f"Ошибка: {exc}. Две отправки одновременно нарушили бы паузы и дневной лимит.")
+        return 1
     except KeyboardInterrupt:
         print("Остановлено вами. Отправленное записано в журнал.")
         return 4

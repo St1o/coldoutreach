@@ -417,6 +417,167 @@ class JournalMetaAndUnsubscribeTest(unittest.TestCase):
         self.assertIn("List-Unsubscribe", server.sent[0])
 
 
+class MaskingTest(unittest.TestCase):
+    def test_mask_and_redact(self):
+        self.assertEqual(mailer.mask_email("Ivan.Petrov@Mail.ru"), "I***@Mail.ru")
+        self.assertEqual(mailer.mask_email("мусор"), "***")
+        self.assertEqual(mailer.redact("550 <a.b@x.ru>: no such user, cc c@y.com"),
+                         "550 <a***@x.ru>: no such user, cc c***@y.com")
+
+    def test_masked_run_prints_no_addresses(self):
+        logs = []
+        server = FakeServer(fail={"bad@b.ru": refused(550, b"<bad@b.ru>: no such user")})
+        t = TempTable(table("ok@b.ru;Т;Х", "bad@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        run(t.path, send=True, mask=True, pause=0, log=logs.append, sleep=lambda s: None,
+            sender=MailruSender(USER, SECRET, connect=lambda *a: server))
+        text = "\n".join(logs)
+        self.assertNotIn("@b.ru", text.replace("***@b.ru", ""))
+        self.assertIn("o***@b.ru: отправлено", text)
+        self.assertIn("b***@b.ru: адрес не принят", text)
+
+    def test_masked_check_run(self):
+        logs = []
+        t = TempTable(table("ok@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        run(t.path, mask=True, log=logs.append)
+        self.assertNotIn("ok@b.ru", "\n".join(logs))
+
+
+class SendLockTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, mailer.LOCK_NAME)
+
+    def test_lock_is_taken_and_released(self):
+        with mailer.SendLock(self.dir.name):
+            self.assertTrue(os.path.exists(self.path))
+            self.assertEqual(mailer.lock_holder(self.dir.name), os.getpid())
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_second_sender_is_refused_while_the_first_is_alive(self):
+        with open(self.path, "w") as fh:
+            fh.write(str(os.getppid()))                      # родительский процесс жив
+        with self.assertRaises(mailer.Locked) as ctx:
+            mailer.SendLock(self.dir.name).__enter__()
+        self.assertEqual(ctx.exception.pid, os.getppid())
+        self.assertTrue(os.path.exists(self.path))           # чужой замок не трогаем
+
+    def test_lock_of_a_dead_process_is_taken_over(self):
+        import subprocess
+        import sys
+        done = subprocess.Popen([sys.executable, "-c", "pass"])
+        done.wait()
+        with open(self.path, "w") as fh:
+            fh.write(str(done.pid))
+        with mailer.SendLock(self.dir.name):
+            self.assertEqual(mailer.lock_holder(self.dir.name), os.getpid())
+
+    def test_forgotten_old_lock_is_ignored(self):
+        with open(self.path, "w") as fh:
+            fh.write(str(os.getppid()))
+        old = mailer.time.time() - mailer.LOCK_MAX_AGE - 10
+        os.utime(self.path, (old, old))
+        self.assertEqual(mailer.lock_holder(self.dir.name), 0)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_main_holds_the_lock_while_sending_and_refuses_a_second_run(self):
+        from unittest import mock
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        lock = os.path.join(os.path.dirname(t.path), mailer.LOCK_NAME)
+        seen = []
+
+        def fake_run(*a, **k):
+            seen.append(os.path.exists(lock))
+            with open(lock, "w") as fh:                       # как если бы другой процесс взял замок
+                fh.write(str(os.getppid()))
+            self.assertEqual(mailer.main([t.path, "--send", "--env", self.path + ".нет"]), 1)
+            return 0
+
+        with mock.patch.object(mailer, "run", side_effect=fake_run):
+            mailer.main([t.path, "--send", "--env", self.path + ".нет"])
+        self.assertEqual(seen, [True])
+
+
+class StatusAndBackgroundTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("MAILRU_USER", "MAILRU_APP_PASSWORD", "MAIL_DAILY_LIMIT"):
+            os.environ.pop(key, None)
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.table = TempTable(table("a@b.ru;Т;Х", "c@b.ru;Т;Х", "d@b.ru;Т;Х"))
+        self.addCleanup(self.table.close)
+        self.folder = os.path.dirname(self.table.path)
+        self.env = os.path.join(self.dir.name, "local.env")
+
+    def write_env(self, text=f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n"):
+        with open(self.env, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_status_counts_without_addresses(self):
+        now = mailer._now()
+        mailer.save_state(mailer.state_path(self.table.path), {
+            "a@b.ru": {"status": "sent", "time": now}, "c@b.ru": {"status": "rejected", "time": now}})
+        with open(os.path.join(self.folder, mailer.LOG_NAME), "w", encoding="utf-8") as fh:
+            fh.write("--- запуск ---\n[1/3] a***@b.ru: отправлено\n")
+        lines = mailer.status_lines(self.table.path, 40)
+        text = "\n".join(lines)
+        self.assertIn("Писем в таблице: 3; отправлено: 1; адрес не принят: 1; ещё не отправлялось: 1.", text)
+        self.assertIn("За последние 24 часа по папке отправлено 1 из 40.", text)
+        self.assertIn("Сейчас отправка не идёт.", text)
+        self.assertIn("a***@b.ru: отправлено", text)
+        self.assertNotIn("a@b.ru", text)
+
+    def test_status_command_sends_nothing(self):
+        self.write_env()
+        self.assertEqual(mailer.main([self.table.path, "--status", "--env", self.env]), 0)
+
+    def test_background_start_returns_at_once_and_hides_addresses(self):
+        from unittest import mock
+        self.write_env()
+        with mock.patch.object(mailer.subprocess, "Popen") as popen:
+            popen.return_value.pid = 4242
+            code = mailer.main([self.table.path, "--send", "--limit", "5", "--background", "--env", self.env])
+        self.assertEqual(code, 0)
+        command = popen.call_args.args[0]
+        self.assertNotIn("--background", command)
+        self.assertIn("--mask-addresses", command)
+        self.assertEqual(command[2], self.table.path)
+        self.assertIn("--send", command)
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONUNBUFFERED"], "1")
+        self.assertTrue(os.path.exists(os.path.join(self.folder, mailer.LOG_NAME)))
+
+    def test_background_refuses_without_access_without_send_or_while_busy(self):
+        from unittest import mock
+        with mock.patch.object(mailer.subprocess, "Popen") as popen:
+            self.write_env("")
+            self.assertEqual(mailer.main([self.table.path, "--send", "--background", "--env", self.env]), 1)
+            self.write_env()
+            self.assertEqual(mailer.main([self.table.path, "--background", "--env", self.env]), 1)
+            with open(os.path.join(self.folder, mailer.LOCK_NAME), "w") as fh:
+                fh.write(str(os.getppid()))
+            self.assertEqual(mailer.main([self.table.path, "--send", "--background", "--env", self.env]), 1)
+            popen.assert_not_called()
+
+    def test_daily_limit_comes_from_local_env_unless_given(self):
+        from unittest import mock
+        self.write_env(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\nMAIL_DAILY_LIMIT=12\n")
+        with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+            mailer.main([self.table.path, "--env", self.env])
+            self.assertEqual(fake_run.call_args.kwargs["daily_limit"], 12)
+            mailer.main([self.table.path, "--env", self.env, "--daily-limit", "7"])
+            self.assertEqual(fake_run.call_args.kwargs["daily_limit"], 7)
+        self.write_env("MAIL_DAILY_LIMIT=много\n")
+        os.environ.pop("MAIL_DAILY_LIMIT", None)
+        self.assertEqual(mailer.main([self.table.path, "--env", self.env]), 1)
+
+
 class SslContextTest(unittest.TestCase):
     def test_verification_stays_on_and_certifi_roots_are_added(self):
         import ssl

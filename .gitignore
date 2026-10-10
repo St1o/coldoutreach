@@ -8,6 +8,8 @@ letters*.csv
 letters*.sent.json
 stoplist*.txt
 responses*.csv
+mailer.log
+mailer.lock
 # локальный запуск: пароли и служебные папки PyCharm остаются на компьютере
 local.env
 .idea/
