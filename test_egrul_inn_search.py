@@ -56,7 +56,7 @@ SBER_ROW = {"i": "7707083893", "o": "1027700132195", "p": "773601001", "k": "ul"
 
 def make_client(post, get):
     session = FakeSession(post, get)
-    return EgrulClient(session=session, poll_interval=0, max_wait=0.05), session
+    return EgrulClient(session=session, poll_interval=0.001, max_wait=0.05), session
 
 
 class ValidateInnTest(unittest.TestCase):
