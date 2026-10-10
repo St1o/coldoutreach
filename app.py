@@ -231,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain; charset=utf-8")
         elif url.path == "/leads":
             self._leads_page()
-        elif url.path in ("/api/leads/status", "/api/leads/download"):
+        elif url.path in ("/api/leads/status", "/api/leads/rows", "/api/leads/download"):
             self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
             wait = self.server.limiter.check(self.client_ip())
@@ -279,6 +279,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/leads/status":
             self._json(200, job.status())
+            return
+        if path == "/api/leads/rows":
+            self._json(200, {"rows": job.rows()})
             return
         table = job.table()
         if table is None:

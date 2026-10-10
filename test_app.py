@@ -272,6 +272,7 @@ class RateLimiterTest(unittest.TestCase):
 # ---- закрытая выгрузка «новые компании» (/leads) ----
 
 import datetime
+import os
 import tempfile
 
 import leads
@@ -517,6 +518,44 @@ class LeadsWebTest(unittest.TestCase):
         data = json.loads(self.request("/api/leads/status")[2])
         self.assertEqual(data["state"], "error")
         self.assertIn("сломалось", data["message"])
+
+    def test_rows_are_the_table_with_inn_keys(self):
+        job = self.start()
+        self.assertEqual(json.loads(self.request("/api/leads/rows")[2]), {"rows": []})    # до запуска таблицы нет
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09"})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/rows")[2])
+        self.assertEqual(data, {"rows": [
+            {"inn": "7707083004", "name": "ФИРМА", "director": "Иванов Иван", "email": "a@b.ru"}]})
+
+    def test_rows_skip_companies_without_email_and_keep_table_order(self):
+        job = self.start()
+        out = os.path.join(self.tmp.name, "leads_2026-10-09.csv")
+
+        def entry(status, name):
+            return {"status": status, "name": name, "director": "Д " + name, "email": name + "@x.ru", "note": ""}
+
+        def run(target, out, **kwargs):
+            leads.save_results(out, {"1": entry(leads.OK, "A"), "2": entry(leads.NO_EMAIL, "B"),
+                                     "3": entry(leads.RETRY, "C"), "4": entry(leads.OK, "D")})
+            return 0
+
+        job._run = run
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09"})
+        job.join(5)
+        rows = json.loads(self.request("/api/leads/rows")[2])["rows"]
+        self.assertEqual([(r["inn"], r["name"]) for r in rows], [("1", "A"), ("4", "D")])
+        with open(out, encoding="utf-8-sig") as fh:       # те же организации и в том же порядке, что в CSV
+            self.assertEqual([line.split(";")[0] for line in fh.read().splitlines()[1:]], ["A", "D"])
+
+    def test_rows_need_the_password(self):
+        self.start()
+        self.assertEqual(self.request("/api/leads/rows", token=None)[0], 401)
+        self.assertEqual(self.request("/api/leads/rows", token="wrong")[0], 401)
+
+    def test_rows_disabled_without_a_sufficient_token(self):
+        self.start("short")
+        self.assertEqual(self.request("/api/leads/rows", token="short")[0], 404)
 
     def test_download_before_any_run(self):
         self.start()

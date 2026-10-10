@@ -123,6 +123,15 @@ class LeadsJob:
             "api_available": self.api_available,
         }
 
+    def rows(self) -> list:
+        """Строки таблицы (организации с почтой) в том же порядке, что в CSV. ИНН - ключ строки:
+        по нему страница помнит, какие строки уже скопированы."""
+        if not self._out:
+            return []
+        saved = leads.load_state(leads.state_path(self._out))
+        return [{"inn": inn, "name": entry["name"], "director": entry["director"], "email": entry["email"]}
+                for inn, entry in saved.items() if entry["status"] == leads.OK]
+
     def table(self):
         """(имя файла, содержимое CSV) или None."""
         out = self._out
