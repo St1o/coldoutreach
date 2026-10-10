@@ -35,6 +35,7 @@ from egrul_inn_search import (
 from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
 from letter_template import render_letter
+import mailer
 from mail_service import MailError, MailService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -240,6 +241,8 @@ class Handler(BaseHTTPRequestHandler):
             self._mail_page()
         elif url.path == "/api/mail/defaults":
             self._mail_defaults()
+        elif url.path == "/api/mail/settings":
+            self._mail_settings()
         elif url.path in ("/api/leads/status", "/api/leads/download"):
             self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
@@ -318,6 +321,18 @@ class Handler(BaseHTTPRequestHandler):
         if service is not None and self._leads_authorized(self.server.leads_job):
             self._json(200, service.defaults())
 
+    def _limit_payload(self):
+        value, source = mailer.resolve_daily_limit(settings_path=self.server.settings_path)
+        return {"daily_limit": value, "source": source, "min": mailer.DAILY_LIMIT_MIN, "max": mailer.DAILY_LIMIT_MAX}
+
+    def _mail_settings(self):
+        """Лимит писем в сутки на один ящик, который действует для mailer.py (страница /mail)."""
+        if self._mail_enabled() is not None and self._leads_authorized(self.server.leads_job):
+            try:
+                self._json(200, self._limit_payload())
+            except ValueError:
+                self._error(500, "В MAIL_DAILY_LIMIT (файл local.env) не число: исправьте или задайте лимит здесь.")
+
     def _mail_post(self, path):
         service = self._mail_enabled()
         if service is None or not self._leads_authorized(self.server.leads_job):
@@ -336,6 +351,21 @@ class Handler(BaseHTTPRequestHandler):
             subject, text = render_letter(**{k: body.get(k, "") for k in MAIL_FIELDS})
             self._json(200, {"subject": subject, "body": text})
             return
+        if path == "/api/mail/settings":
+            try:
+                limit = mailer.parse_daily_limit(body.get("daily_limit", ""))
+            except ValueError as exc:
+                self._error(400, str(exc))
+                return
+            settings = mailer.load_settings(self.server.settings_path)
+            settings[mailer.DAILY_LIMIT_KEY] = limit
+            try:
+                mailer.save_settings(settings, self.server.settings_path)
+            except OSError as exc:
+                self._error(500, f"Не удалось сохранить настройку: {exc.strerror or exc}")
+                return
+            self._json(200, self._limit_payload())
+            return
         try:
             self._json(200, service.send(body.get("to", ""), body.get("subject", ""), body.get("body", "")))
         except MailError as exc:
@@ -343,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path in ("/api/mail/preview", "/api/mail/send"):
+        if path in ("/api/mail/preview", "/api/mail/send", "/api/mail/settings"):
             self._mail_post(path)
             return
         if path not in ("/api/leads/start", "/api/leads/stop"):
@@ -418,7 +448,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0,
-                leads_job=None, mail_service=None):
+                leads_job=None, mail_service=None, settings_path=None):
     server = ThreadingHTTPServer((host, port), Handler)
     server.service = service or Service()
     server.limiter = limiter or RateLimiter()
@@ -426,6 +456,7 @@ def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted
     server.trusted_proxies = trusted_proxies
     server.leads_job = leads_job
     server.mail_service = mail_service
+    server.settings_path = settings_path or mailer.SETTINGS_FILE
     return server
 
 

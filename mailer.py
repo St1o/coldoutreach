@@ -55,6 +55,9 @@ ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local.env")
 LOCK_NAME = "mailer.lock"        # в папке таблицы: пока он есть, в этой папке уже идёт отправка
 LOG_NAME = "mailer.log"          # журнал фоновой отправки (адреса в нём скрыты)
 DEFAULT_DAILY_LIMIT = 40
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")   # пишет страница /mail
+DAILY_LIMIT_KEY = "daily_limit_per_mailbox"
+DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 200
 LOCK_MAX_AGE = 24 * 3600         # замок старше суток считаем забытым
 
 SENT = "sent"             # письмо принято сервером
@@ -280,6 +283,50 @@ def reply_text(exc) -> str:
     error = getattr(exc, "smtp_error", b"")
     text = error.decode("utf-8", "replace") if isinstance(error, bytes) else str(error)
     return (f"{code} " if code else "") + (text or str(exc))[:200]
+
+
+def load_settings(path: str = "") -> dict:
+    """Настройки, сохранённые на сайте (страница /mail). Нет файла или он испорчен - пустые настройки."""
+    try:
+        with open(path or SETTINGS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(values: dict, path: str = "") -> None:
+    path = path or SETTINGS_FILE
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(values, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def parse_daily_limit(raw) -> int:
+    """Лимит писем в сутки на один ящик: целое число от 1 до 200, иначе ValueError."""
+    try:
+        number = int(str(raw).strip())
+    except ValueError:
+        number = 0
+    if not DAILY_LIMIT_MIN <= number <= DAILY_LIMIT_MAX:
+        raise ValueError(f"Лимит должен быть целым числом от {DAILY_LIMIT_MIN} до {DAILY_LIMIT_MAX}.")
+    return number
+
+
+def resolve_daily_limit(cli_value=None, settings_path: str = "", environ=None):
+    """(лимит, откуда): ключ --daily-limit, затем настройка с сайта, затем MAIL_DAILY_LIMIT из local.env, затем 40.
+    Испорченное значение с сайта пропускается; испорченное в local.env - ValueError."""
+    if cli_value is not None:
+        return cli_value, "ключ --daily-limit"
+    try:
+        return parse_daily_limit(load_settings(settings_path).get(DAILY_LIMIT_KEY)), "сайт"
+    except ValueError:
+        pass
+    raw = (environ if environ is not None else os.environ).get("MAIL_DAILY_LIMIT", "")
+    if str(raw).strip():
+        return int(raw), "local.env"
+    return DEFAULT_DAILY_LIMIT, "по умолчанию"
 
 
 def mask_email(address: str) -> str:
@@ -599,9 +646,11 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=SMTP_PORT, choices=(465, 587),
                         help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS)")
     parser.add_argument("--daily-limit", type=int, default=None,
-                        help="не больше писем за последние 24 часа по всем таблицам letters*.sent.json в папке "
-                             f"(по умолчанию MAIL_DAILY_LIMIT из local.env, иначе {DEFAULT_DAILY_LIMIT}; для нового "
-                             "ящика правила рассылки советуют 30-50 и меньше в первые дни прогрева; 0 - без лимита)")
+                        help="не больше писем за последние 24 часа по всем таблицам letters*.sent.json в папке, на один "
+                             "почтовый ящик (по умолчанию значение, заданное на странице /mail сайта, затем "
+                             f"MAIL_DAILY_LIMIT из local.env, иначе {DEFAULT_DAILY_LIMIT}; для нового ящика правила "
+                             "рассылки советуют 30-50 и меньше в первые дни прогрева; 0 - без лимита)")
+    parser.add_argument("--settings", default=SETTINGS_FILE, help="файл настроек сайта (settings.json рядом с программой)")
     parser.add_argument("--stoplist", default=None,
                         help="файл стоп-листа: адрес или @домен в строке (по умолчанию stoplist.txt рядом с таблицей, "
                              "если он есть)")
@@ -614,8 +663,7 @@ def main(argv=None) -> int:
         print(f"Ошибка: не удалось прочитать {args.env}: {getattr(exc, 'strerror', None) or exc}")
         return 1
     try:
-        daily_limit = args.daily_limit if args.daily_limit is not None else int(
-            os.environ.get("MAIL_DAILY_LIMIT") or DEFAULT_DAILY_LIMIT)
+        daily_limit, _ = resolve_daily_limit(args.daily_limit, args.settings)
     except ValueError:
         print("Ошибка: MAIL_DAILY_LIMIT в local.env должно быть целым числом.")
         return 1

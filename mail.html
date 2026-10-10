@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Пробное письмо через mail.ru</title>
+<title>Отправка через mail.ru</title>
 <link rel="icon" href="data:,">
 <style>
   :root {
@@ -55,12 +55,17 @@
   #status.error { color: var(--error); }
   .banner { border: 1px solid var(--error); color: var(--error); border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
   .meta { color: var(--muted); font-size: .9rem; margin: 0 0 14px; }
+  .inline { display: flex; gap: 12px; align-items: flex-start; }
+  .inline input { max-width: 160px; }
+  #limit-status { margin: 10px 0 0; color: var(--muted); min-height: 1.5em; }
+  #limit-status.ok { color: var(--ok); }
+  #limit-status.error { color: var(--error); }
   @media (max-width: 480px) { .row { flex-direction: column; gap: 0; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>Пробное письмо через mail.ru</h1>
+  <h1>Отправка через mail.ru</h1>
   <p class="sub">Проверка всей цепочки: данные компании → письмо по шаблону → отправка с вашего ящика на mail.ru.</p>
 
   <form id="login" class="card" autocomplete="off">
@@ -127,6 +132,21 @@
       <p id="status" role="status" aria-live="polite"></p>
     </section>
   </form>
+
+  <section id="settings" class="card" hidden>
+    <h2>Лимит отправки</h2>
+    <div class="field">
+      <label for="daily">Писем в сутки с одного почтового ящика</label>
+      <div class="inline">
+        <input id="daily" type="number" min="1" max="200" step="1" inputmode="numeric">
+        <button id="save-limit" type="button">Сохранить</button>
+      </div>
+    </div>
+    <p class="meta">Новый ящик «прогревают»: начните с малого (10-15 писем в сутки) и поднимайте понемногу; правила
+      рассылки советуют 30-50. Лимит относится к одному почтовому ящику, сейчас подключён один. Программа отправки
+      читает это значение при каждом запуске: уже идущая отправка доработает со старым.</p>
+    <p id="limit-status" role="status" aria-live="polite"></p>
+  </section>
 </main>
 
 <script>
@@ -184,6 +204,39 @@ async function rebuild(force) {
   }
 }
 
+const SOURCES = { 'сайт': 'задано здесь', 'local.env': 'взято из local.env, пока здесь не задано',
+                  'по умолчанию': 'по умолчанию, пока здесь не задано' };
+
+function showLimit(data, text, kind) {
+  $('daily').min = data.min; $('daily').max = data.max;
+  $('daily').value = data.daily_limit;
+  const el = $('limit-status');
+  el.textContent = text || ('Сейчас действует ' + data.daily_limit + ' в сутки (' + (SOURCES[data.source] || data.source) + ').');
+  el.className = kind || '';
+}
+
+async function loadLimit() {
+  try {
+    showLimit(await api('/api/mail/settings'));
+  } catch (error) {
+    $('limit-status').textContent = error.message;
+    $('limit-status').className = 'error';
+  }
+  $('settings').hidden = false;
+}
+
+async function saveLimit() {
+  $('save-limit').disabled = true;
+  try {
+    const data = await api('/api/mail/settings', { daily_limit: $('daily').value });
+    showLimit(data, 'Сохранено: ' + data.daily_limit + ' писем в сутки с одного ящика. Действует со следующего запуска отправки.', 'ok');
+  } catch (error) {
+    $('limit-status').textContent = 'Не сохранено: ' + error.message;
+    $('limit-status').className = 'error';
+  }
+  $('save-limit').disabled = false;
+}
+
 async function enter(auto) {
   $('enter').disabled = true;
   try {
@@ -196,6 +249,7 @@ async function enter(auto) {
     $('login').hidden = true;
     $('letter').hidden = false;
     rememberPassword($('remember').checked);
+    loadLimit();
   } catch (error) {
     if (auto) { rememberPassword(false); $('token').value = ''; }     // старый пароль не подошёл
     else $('login-status').textContent = error.message;
@@ -211,6 +265,8 @@ FIELDS.forEach((name) => $(name).addEventListener('input', () => {
 }));
 ['subject', 'body'].forEach((name) => $(name).addEventListener('input', () => { edited = true; }));
 $('rebuild').addEventListener('click', () => rebuild(true));
+$('save-limit').addEventListener('click', saveLimit);
+$('daily').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); saveLimit(); } });
 
 $('letter').addEventListener('submit', async (event) => {
   event.preventDefault();

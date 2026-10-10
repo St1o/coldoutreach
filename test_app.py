@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+import mailer
 from app import RateLimiter, Service, make_server
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord, EgrulTimeout
 
@@ -563,8 +564,11 @@ class MailWebTest(unittest.TestCase):
         self.outbox = []
         mail = MailService("sender@internet.ru" if configured else "", "secret-app-password" if configured else "",
                            sender_factory=lambda: FakeMailSender(self.outbox, error))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.settings_path = os.path.join(tmp.name, "settings.json")          # настоящий settings.json не трогаем
         server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
-                             leads_job=LeadsJob(token), mail_service=mail)
+                             leads_job=LeadsJob(token), mail_service=mail, settings_path=self.settings_path)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(AppTest.stop, server)
         self.base = f"http://127.0.0.1:{server.server_port}"
@@ -596,6 +600,45 @@ class MailWebTest(unittest.TestCase):
         self.assertNotIn("secret-app-password", text)
         self.assertNotIn("sender@internet.ru", text)
         self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))      # ни одного адреса почты в самой странице
+
+    def test_limit_setting_needs_the_password_and_is_hidden_without_one(self):
+        self.start("short")
+        self.assertEqual(self.request("/api/mail/settings", token="short")[0], 404)
+        self.assertEqual(self.request("/api/mail/settings", "POST", {"daily_limit": "5"}, token="short")[0], 404)
+        self.start()
+        self.assertEqual(self.request("/api/mail/settings", token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/settings", "POST", {"daily_limit": "5"}, token=None)[0], 401)
+        self.assertFalse(os.path.exists(self.settings_path))
+
+    def test_limit_setting_is_saved_and_read_back(self):
+        self.start()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MAIL_DAILY_LIMIT", None)
+            status, _, body = self.request("/api/mail/settings")
+            self.assertEqual((status, json.loads(body)["daily_limit"], json.loads(body)["source"]),
+                             (200, 40, "по умолчанию"))
+            os.environ["MAIL_DAILY_LIMIT"] = "15"
+            self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["source"], "local.env")
+            status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": " 12 "})
+            data = json.loads(body)
+            self.assertEqual((status, data["daily_limit"], data["source"]), (200, 12, "сайт"))
+            self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["daily_limit"], 12)
+            # то же значение видит программа отправки и оно главнее local.env
+            self.assertEqual(mailer.resolve_daily_limit(settings_path=self.settings_path), (12, "сайт"))
+
+    def test_bad_limit_is_refused_and_nothing_is_saved(self):
+        self.start()
+        for bad in ("0", "201", "-5", "abc", "", "1.5"):
+            status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": bad})
+            self.assertEqual(status, 400, bad)
+            self.assertIn("от 1 до 200", json.loads(body)["error"])
+        self.assertFalse(os.path.exists(self.settings_path))
+
+    def test_page_has_the_limit_block_for_one_mailbox(self):
+        self.start()
+        text = self.request("/mail", token=None)[2].decode("utf-8")
+        self.assertIn("Писем в сутки с одного почтового ящика", text)
+        self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))
 
     def test_defaults_give_a_ready_example(self):
         self.start()

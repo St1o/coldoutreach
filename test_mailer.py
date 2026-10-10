@@ -501,6 +501,54 @@ class SendLockTest(unittest.TestCase):
         self.assertEqual(seen, [True])
 
 
+class DailyLimitSettingTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "settings.json")
+
+    def test_parse_accepts_whole_numbers_in_range_only(self):
+        self.assertEqual(mailer.parse_daily_limit(" 12 "), 12)
+        self.assertEqual(mailer.parse_daily_limit(200), 200)
+        for bad in ("0", "201", "-1", "abc", "", None, "1.5"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                mailer.parse_daily_limit(bad)
+
+    def test_save_and_load_round_trip_and_broken_file_is_empty(self):
+        self.assertEqual(mailer.load_settings(self.path), {})
+        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
+        self.assertEqual(mailer.load_settings(self.path), {mailer.DAILY_LIMIT_KEY: 9})
+        with open(self.path, "w") as fh:
+            fh.write("{не json")
+        self.assertEqual(mailer.load_settings(self.path), {})
+
+    def test_order_of_sources(self):
+        env = {"MAIL_DAILY_LIMIT": "15"}
+        self.assertEqual(mailer.resolve_daily_limit(None, self.path, {}), (40, "по умолчанию"))
+        self.assertEqual(mailer.resolve_daily_limit(None, self.path, env), (15, "local.env"))
+        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
+        self.assertEqual(mailer.resolve_daily_limit(None, self.path, env), (9, "сайт"))
+        self.assertEqual(mailer.resolve_daily_limit(3, self.path, env), (3, "ключ --daily-limit"))
+        self.assertEqual(mailer.resolve_daily_limit(0, self.path, env), (0, "ключ --daily-limit"))
+
+    def test_bad_site_value_is_skipped_but_bad_env_value_is_an_error(self):
+        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 999}, self.path)
+        self.assertEqual(mailer.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "15"}), (15, "local.env"))
+        with self.assertRaises(ValueError):
+            mailer.resolve_daily_limit(None, self.path, {"MAIL_DAILY_LIMIT": "много"})
+
+    def test_main_takes_the_limit_saved_on_the_site(self):
+        from unittest import mock
+        mailer.save_settings({mailer.DAILY_LIMIT_KEY: 9}, self.path)
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        with mock.patch.dict(os.environ):
+            os.environ["MAIL_DAILY_LIMIT"] = "15"
+            with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+                mailer.main([t.path, "--env", os.path.join(self.dir.name, "нет.env"), "--settings", self.path])
+        self.assertEqual(fake_run.call_args.kwargs["daily_limit"], 9)
+
+
 class WindowsPidTest(unittest.TestCase):
     """Логика проверки процесса на Windows на подставном kernel32 (на других системах настоящий недоступен)."""
 
@@ -554,6 +602,7 @@ class StatusAndBackgroundTest(unittest.TestCase):
         self.addCleanup(self.table.close)
         self.folder = os.path.dirname(self.table.path)
         self.env = os.path.join(self.dir.name, "local.env")
+        self.nowhere_json = os.path.join(self.dir.name, "нет.json")          # настоящий settings.json не читаем
 
     def write_env(self, text=f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\n"):
         with open(self.env, "w", encoding="utf-8") as fh:
@@ -608,13 +657,13 @@ class StatusAndBackgroundTest(unittest.TestCase):
         from unittest import mock
         self.write_env(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\nMAIL_DAILY_LIMIT=12\n")
         with mock.patch.object(mailer, "run", return_value=0) as fake_run:
-            mailer.main([self.table.path, "--env", self.env])
+            mailer.main([self.table.path, "--env", self.env, "--settings", self.nowhere_json])
             self.assertEqual(fake_run.call_args.kwargs["daily_limit"], 12)
-            mailer.main([self.table.path, "--env", self.env, "--daily-limit", "7"])
+            mailer.main([self.table.path, "--env", self.env, "--settings", self.nowhere_json, "--daily-limit", "7"])
             self.assertEqual(fake_run.call_args.kwargs["daily_limit"], 7)
         self.write_env("MAIL_DAILY_LIMIT=много\n")
         os.environ.pop("MAIL_DAILY_LIMIT", None)
-        self.assertEqual(mailer.main([self.table.path, "--env", self.env]), 1)
+        self.assertEqual(mailer.main([self.table.path, "--env", self.env, "--settings", self.nowhere_json]), 1)
 
 
 class SslContextTest(unittest.TestCase):
