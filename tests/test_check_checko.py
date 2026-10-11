@@ -86,7 +86,13 @@ class VerdictTest(unittest.TestCase):
 
 
 class OutputTest(unittest.TestCase):
-    def run_main(self, env_text, adapter=12, **kw):
+    CARD = {"ifIndex": 12, "NextHop": "192.168.1.1", "Metric": 25, "Name": "Ethernet",
+            "Description": "Realtek PCIe GbE Family Controller", "Hardware": True}
+    TUNNEL = {"ifIndex": 20, "NextHop": "10.8.0.1", "Metric": 1, "Name": "VPN", "Description": "Wintun Userspace Tunnel",
+              "Hardware": False}
+
+    def run_main(self, env_text, adapters=None, **kw):
+        adapters = adapters or {"candidates": [self.TUNNEL, self.CARD], "error": "", "chosen": self.CARD}
         with tempfile.TemporaryDirectory() as tmp:
             env = os.path.join(tmp, "local.env")
             with open(env, "w", encoding="utf-8") as fh:
@@ -98,7 +104,7 @@ class OutputTest(unittest.TestCase):
                     mock.patch.object(cc, "probe_api", p["api"]), mock.patch.object(cc, "probe_key", p["key"]), \
                     mock.patch.object(cc, "probe_public_dns", p["public_dns"]), \
                     mock.patch.object(cc, "probe_control", p["control"]), \
-                    mock.patch.object(cc, "probe_adapter", lambda: adapter):
+                    mock.patch.object(cc, "probe_adapter", lambda: adapters):
                 code = cc.main(["check_checko.py", env], out=lines.append)
         return code, "\n".join(lines)
 
@@ -117,7 +123,9 @@ class OutputTest(unittest.TestCase):
                      "4. Другой сайт из Python, checko.ru", "4. Другой сайт из Python, ya.ru",
                      "5. Запрос к API (как в программе)", "5. Запрос к API (без прокси)",
                      "5. Запрос к API (в обход VPN, через сетевую карту)", "5. Запрос к API (с TLS 1.2)",
-                     "6. Сетевая карта для обхода VPN: найдена (номер 12)",
+                     "6. Сетевые карты с выходом в интернет:",
+                     "№12 Ethernet (Realtek PCIe GbE Family Controller): метрика 25, шлюз 192.168.1.1, настоящая  <- через неё идёт обход VPN",
+                     "№20 VPN (Wintun Userspace Tunnel): метрика 1, шлюз 10.8.0.1, виртуальная",
                      "5. Запрос к API (через curl, шифрование Windows): нет такого способа"):
             self.assertIn(part, out)
 
@@ -128,9 +136,14 @@ class OutputTest(unittest.TestCase):
         _, out = self.run_main("", default=OK)
         self.assertNotIn("добавьте туда", out)
 
-    def test_no_adapter_is_said_plainly(self):
-        _, out = self.run_main("", adapter=None)
-        self.assertIn("6. Сетевая карта для обхода VPN: не найдена", out)
+    def test_when_no_adapter_fits_or_the_list_failed_the_reason_is_printed(self):
+        _, out = self.run_main("", adapters={"candidates": [self.TUNNEL], "error": "", "chosen": None})
+        self.assertIn("№20 VPN", out)
+        self.assertIn("Подходящей карты для обхода VPN нет", out)
+        _, out = self.run_main("", adapters={"candidates": [], "error": "PowerShell не запустился (нет файла)", "chosen": None})
+        self.assertIn("список получить не удалось: PowerShell не запустился", out)
+        _, out = self.run_main("", adapters={"candidates": [], "error": "", "chosen": None})
+        self.assertIn("нет ни одной подключённой карты", out)
 
     def test_a_computer_without_curl_is_not_a_failure_of_the_connection(self):
         code, _ = self.run_main("", curl=NO_WAY)

@@ -354,48 +354,94 @@ class CurlSessionTest(unittest.TestCase):
 class BypassVpnTest(unittest.TestCase):
     """Запрос мимо VPN: поиск настоящей сетевой карты и соединение, привязанное к ней."""
 
-    def setUp(self):
-        checko_api._physical_index_cache.clear()
-        self.addCleanup(checko_api._physical_index_cache.clear)
+    ETHERNET = {"ifIndex": 12, "NextHop": "192.168.1.1", "Metric": 25, "Name": "Ethernet",
+                "Description": "Realtek PCIe GbE Family Controller", "Hardware": True}
+    TUNNEL = {"ifIndex": 20, "NextHop": "10.8.0.1", "Metric": 1, "Name": "Подключение VPN",
+              "Description": "Wintun Userspace Tunnel", "Hardware": False}
 
-    def run_powershell(self, stdout=b'{"ifIndex":12,"NextHop":"192.168.1.1"}', code=0, error=None):
+    def setUp(self):
+        checko_api._adapters_cache.clear()
+        self.addCleanup(checko_api._adapters_cache.clear)
+
+    def run_powershell(self, stdout=None, code=0, error=None, stderr=b""):
+        stdout = json.dumps([self.TUNNEL, self.ETHERNET]).encode() if stdout is None else stdout
         calls = []
 
         def fake_run(command, **kwargs):
             calls.append(command)
             if error:
                 raise error
-            return subprocess.CompletedProcess(command, code, stdout, b"")
+            return subprocess.CompletedProcess(command, code, stdout, stderr)
 
         with mock.patch("checko_api._is_windows", return_value=True), mock.patch("checko_api.subprocess.run", fake_run):
-            return checko_api.physical_interface_index(), calls
+            return checko_api.adapter_candidates(), calls
 
     def test_not_windows_means_no_such_way_and_no_command_is_run(self):
         with mock.patch("checko_api.subprocess.run") as run:
+            self.assertEqual(checko_api.adapter_candidates(), ([], "это не Windows"))
             self.assertIsNone(checko_api.physical_interface_index())
         run.assert_not_called()
 
-    def test_the_physical_adapter_is_read_from_powershell_without_admin_rights(self):
-        index, calls = self.run_powershell()
-        self.assertEqual(index, 12)
+    def test_all_connected_adapters_with_a_route_to_the_internet_are_listed_without_admin_rights(self):
+        (candidates, error), calls = self.run_powershell()
+        self.assertEqual((error, [c["ifIndex"] for c in candidates]), ("", [20, 12]))
+        self.assertEqual(candidates[1], self.ETHERNET)
         command = calls[0]
         self.assertEqual(command[0], "powershell")
         self.assertIn("-NoProfile", command)
-        self.assertIn("Get-NetAdapter -Physical", command[-1])                 # только настоящие карты, без туннелей VPN
+        self.assertIn("Get-NetAdapter", command[-1])
         self.assertIn("0.0.0.0/0", command[-1])
+
+    def test_one_adapter_arrives_as_an_object_not_a_list(self):
+        (candidates, _), _ = self.run_powershell(stdout=json.dumps(self.ETHERNET).encode())
+        self.assertEqual(candidates, [self.ETHERNET])
 
     def test_the_answer_is_remembered(self):
         with mock.patch("checko_api._is_windows", return_value=True), \
-                mock.patch("checko_api.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b'{"ifIndex":7}', b"")) as run:
-            self.assertEqual((checko_api.physical_interface_index(), checko_api.physical_interface_index()), (7, 7))
+                mock.patch("checko_api.subprocess.run",
+                           return_value=subprocess.CompletedProcess([], 0, json.dumps([self.ETHERNET]).encode(), b"")) as run:
+            self.assertEqual(checko_api.physical_interface_index(), 12)
+            self.assertEqual(checko_api.physical_interface_index(), 12)
         self.assertEqual(run.call_count, 1)
 
-    def test_no_adapter_or_broken_output_is_no_such_way(self):
-        for stdout, code in ((b"", 0), (b"not json", 0), (b'{"NextHop":"1.1.1.1"}', 0), (b'{"ifIndex":3}', 1)):
-            checko_api._physical_index_cache.clear()
-            self.assertIsNone(self.run_powershell(stdout, code)[0], (stdout, code))
-        checko_api._physical_index_cache.clear()
-        self.assertIsNone(self.run_powershell(error=OSError("нет powershell"))[0])
+    def test_failures_are_explained(self):
+        cases = ((dict(stdout=b"", code=1, stderr="Get-NetAdapter : нет доступа".encode("utf-8")), "PowerShell вернул ошибку: Get-NetAdapter"),
+                 (dict(stdout=b"not json"), "не удалось разобрать"),
+                 (dict(stdout=b'[{"NextHop":"1.1.1.1"}]'), "не удалось разобрать"),
+                 (dict(error=OSError(2, "нет powershell")), "PowerShell не запустился"),
+                 (dict(error=subprocess.TimeoutExpired("powershell", 40)), "не ответил за 40 секунд"))
+        for kwargs, expected in cases:
+            checko_api._adapters_cache.clear()
+            (candidates, error), _ = self.run_powershell(**kwargs)
+            self.assertEqual(candidates, [], kwargs)
+            self.assertIn(expected, error)
+        checko_api._adapters_cache.clear()
+        (candidates, error), _ = self.run_powershell(stdout=b"")                  # нет подходящих карт - не ошибка
+        self.assertEqual((candidates, error), ([], ""))
+
+    def test_a_tunnel_is_never_picked_and_the_real_adapter_with_the_lowest_metric_wins(self):
+        pick = checko_api.pick_adapter
+        self.assertEqual(pick([self.TUNNEL, self.ETHERNET])["ifIndex"], 12)
+        wifi = dict(self.ETHERNET, ifIndex=9, Name="Wi-Fi", Description="Intel(R) Wi-Fi 6 AX201", Metric=40)
+        self.assertEqual(pick([self.TUNNEL, wifi, self.ETHERNET])["ifIndex"], 12)
+        self.assertEqual(pick([wifi, dict(self.ETHERNET, Metric=50)])["ifIndex"], 9)
+        self.assertIsNone(pick([self.TUNNEL]))
+        self.assertIsNone(pick([]))
+
+    def test_tunnels_and_virtual_machines_are_recognised_by_name_or_description(self):
+        for description in ("WireGuard Tunnel", "TAP-Windows Adapter V9", "Wintun Userspace Tunnel", "OpenVPN Data Channel Offload",
+                            "Hyper-V Virtual Ethernet Adapter", "VirtualBox Host-Only Ethernet Adapter", "Cloudflare WARP Interface",
+                            "NordLynx Tunnel", "Amnezia Virtual Network", "sing-box Tunnel"):
+            card = dict(self.ETHERNET, Description=description, Name="Ethernet 2")
+            self.assertIsNone(checko_api.pick_adapter([card]), description)
+        for description in ("Realtek PCIe GbE Family Controller", "Intel(R) Wi-Fi 6 AX201 160MHz", "Qualcomm Atheros AR9485"):
+            card = dict(self.ETHERNET, Description=description)
+            self.assertIsNotNone(checko_api.pick_adapter([card]), description)
+
+    def test_a_real_looking_adapter_flagged_virtual_is_still_used_as_the_second_choice(self):
+        modem = dict(self.ETHERNET, Name="Ethernet 3", Description="Remote NDIS based Internet Sharing Device", Hardware=False)
+        self.assertEqual(checko_api.pick_adapter([self.TUNNEL, modem])["ifIndex"], 12)
+        self.assertEqual(checko_api.pick_adapter([modem, self.ETHERNET])["ifIndex"], 12)      # настоящая карта всё же главнее
 
     def test_the_session_exists_only_when_there_is_an_adapter(self):
         with mock.patch("checko_api.physical_interface_index", return_value=None):

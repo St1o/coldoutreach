@@ -213,36 +213,73 @@ class _CurlSession:
 
 IP_UNICAST_IF = 31          # параметр сокета Windows: слать пакеты через указанную сетевую карту, а не по таблице маршрутов
 
-_PHYSICAL_ROUTE = (
+# Все карты со статусом Up и маршрутом по умолчанию: имя, описание, метрика, шлюз, настоящая ли (не виртуальная) карта.
+_ADAPTER_SCRIPT = (
     "$ErrorActionPreference='Stop';"
-    "$phys=@(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex });"
-    "$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $phys -contains $_.ifIndex } "
-    "| Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1;"
-    "if ($r) { @{ ifIndex=[int]$r.ifIndex; NextHop=[string]$r.NextHop } | ConvertTo-Json -Compress }")
-_physical_index_cache = []
+    "$up=@(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' });"
+    "$routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0');"
+    "$out=@(foreach ($r in $routes) {"
+    " $a=$up | Where-Object { $_.ifIndex -eq $r.ifIndex } | Select-Object -First 1;"
+    " if ($a) { [pscustomobject]@{ ifIndex=[int]$r.ifIndex; NextHop=[string]$r.NextHop;"
+    " Metric=[int]($r.RouteMetric + $r.InterfaceMetric); Name=[string]$a.Name;"
+    " Description=[string]$a.InterfaceDescription; Hardware=[bool]$a.HardwareInterface } } });"
+    "ConvertTo-Json -InputObject $out -Compress")
+# Туннели VPN, виртуальные машины и подобное: через них мимо VPN не выйти
+_VIRTUAL_LIKE = re.compile(
+    r"\btap\b|\btun\b|wintun|wireguard|openvpn|vpn|tailscale|zerotier|hyper-v|virtualbox|vmware|loopback|bluetooth|"
+    r"vethernet|npcap|anyconnect|fortinet|nord|proton|surfshark|windscribe|amnezia|hiddify|sing-box|clash|xray|v2ray|"
+    r"outline|warp|mullvad|expressvpn|cyberghost|hotspot shield|softether|pritunl|tunnel", re.IGNORECASE)
+_adapters_cache = []
 
 
 def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def physical_interface_index() -> Optional[int]:
-    """Номер настоящей (не виртуальной) сетевой карты с выходом в интернет: Ethernet или Wi-Fi, а не туннель VPN.
-    Только Windows, права администратора не нужны. Нет такой карты или не Windows - None."""
+def adapter_candidates() -> tuple:
+    """([карты со статусом Up и выходом в интернет], причина сбоя или ''). Только Windows, права администратора не нужны."""
     if not _is_windows():
-        return None
-    if not _physical_index_cache:
-        index = None
-        try:
-            done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _PHYSICAL_ROUTE],
-                                  capture_output=True, timeout=25,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if done.returncode == 0:
-                index = int(json.loads(done.stdout.decode("utf-8", errors="replace"))["ifIndex"])
-        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
-            index = None
-        _physical_index_cache.append(index)
-    return _physical_index_cache[0]
+        return [], "это не Windows"
+    if _adapters_cache:
+        return _adapters_cache[0]
+    candidates, error = [], ""
+    try:
+        done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _ADAPTER_SCRIPT],
+                              capture_output=True, timeout=40, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        text = done.stdout.decode("utf-8", errors="replace").strip()
+        if done.returncode != 0:
+            error = "PowerShell вернул ошибку: " + (done.stderr.decode("utf-8", errors="replace").strip() or text)[:150]
+        elif text:
+            data = json.loads(text)
+            for item in (data if isinstance(data, list) else [data]):
+                candidates.append({"ifIndex": int(item["ifIndex"]), "NextHop": str(item.get("NextHop", "")),
+                                   "Metric": int(item.get("Metric", 0)), "Name": str(item.get("Name", "")),
+                                   "Description": str(item.get("Description", "")),
+                                   "Hardware": bool(item.get("Hardware"))})
+    except subprocess.TimeoutExpired:
+        error = "PowerShell не ответил за 40 секунд"
+    except OSError as exc:
+        error = f"PowerShell не запустился ({exc.strerror or exc})"
+    except (ValueError, KeyError, TypeError):
+        error = "не удалось разобрать ответ PowerShell"
+    _adapters_cache.append((candidates, error))
+    return _adapters_cache[0]
+
+
+def pick_adapter(candidates: list) -> Optional[dict]:
+    """Какая карта годится для обхода VPN: сначала настоящая и не похожая на туннель, потом просто не похожая на туннель
+    (флаг «настоящая» у некоторых карт, например USB-модема, бывает неверным); из подходящих - с меньшей метрикой."""
+    plain = [c for c in candidates if not _VIRTUAL_LIKE.search(c["Name"] + " " + c["Description"])]
+    for tier in ([c for c in plain if c["Hardware"]], plain):
+        if tier:
+            return min(tier, key=lambda c: c["Metric"])
+    return None
+
+
+def physical_interface_index() -> Optional[int]:
+    """Номер сетевой карты для обхода VPN (Ethernet или Wi-Fi, а не туннель) или None."""
+    chosen = pick_adapter(adapter_candidates()[0])
+    return chosen["ifIndex"] if chosen else None
 
 
 class _BoundHTTPSConnection(http.client.HTTPSConnection):

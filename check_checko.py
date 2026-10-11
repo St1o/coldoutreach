@@ -9,7 +9,6 @@ import errno
 import socket
 import ssl
 import sys
-from typing import Optional
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -125,9 +124,27 @@ def probe_api(mode: str, key: str = PROBE_KEY) -> tuple:
     return True, f"ответ получен (HTTP {response.status_code})"
 
 
-def probe_adapter() -> Optional[int]:
-    """Номер настоящей сетевой карты (Ethernet или Wi-Fi), через которую запросы идут в обход VPN."""
-    return checko_api.physical_interface_index()
+def probe_adapter() -> dict:
+    """Сетевые карты с выходом в интернет и та, через которую запросы пойдут в обход VPN."""
+    candidates, error = checko_api.adapter_candidates()
+    return {"candidates": candidates, "error": error, "chosen": checko_api.pick_adapter(candidates)}
+
+
+def adapter_lines(adapters: dict) -> list:
+    """Список карт для вывода: имя, метрика, шлюз, настоящая или виртуальная, выбранная для обхода VPN."""
+    lines = ["6. Сетевые карты с выходом в интернет:"]
+    if adapters["error"]:
+        lines.append("   список получить не удалось: " + adapters["error"])
+    elif not adapters["candidates"]:
+        lines.append("   нет ни одной подключённой карты с маршрутом в интернет")
+    for card in adapters["candidates"]:
+        kind = "настоящая" if card["Hardware"] else "виртуальная"
+        mark_chosen = "  <- через неё идёт обход VPN" if card is adapters["chosen"] else ""
+        lines.append(f"   №{card['ifIndex']} {card['Name']} ({card['Description']}): метрика {card['Metric']}, "
+                     f"шлюз {card['NextHop']}, {kind}{mark_chosen}")
+    if adapters["candidates"] and not adapters["chosen"]:
+        lines.append("   Подходящей карты для обхода VPN нет: все выглядят как туннели VPN или виртуальные.")
+    return lines
 
 
 def exclusion_hint() -> str:
@@ -267,8 +284,8 @@ def main(argv=None, out=print) -> int:
     for mode in MODES:
         ok, text = report.api[mode]
         out(f"5. Запрос к API ({MODE_NAMES[mode]}): {mark(ok)} - {text}")
-    index = probe_adapter()
-    out("6. Сетевая карта для обхода VPN: " + (f"найдена (номер {index})" if index else "не найдена"))
+    for line in adapter_lines(probe_adapter()):
+        out(line)
     out("")
     for line in verdict(report):
         out(line)
