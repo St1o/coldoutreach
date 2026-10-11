@@ -13,6 +13,7 @@ import ssl
 import sys
 import tempfile
 import textwrap
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -228,11 +229,26 @@ def cert_lines(cert) -> list:
     return lines
 
 
-def cert_advice(cert) -> list:
+def cert_valid_until(cert):
+    """Дата конца действия присланного сертификата (секунды) или None, если прочитать не удалось."""
+    try:
+        return ssl.cert_time_to_seconds(cert["valid"].split(" - ")[1].strip())
+    except (KeyError, IndexError, ValueError, AttributeError):
+        return None
+
+
+def cert_advice(cert, now=None) -> list:
     """Что делать, если сертификат не принят: по тому, кем он выдан."""
     if not cert or cert["verified"] is not False:
         return []
     issuer = cert.get("issuer", "")
+    until = cert_valid_until(cert)
+    if "истёк" in cert.get("verify_error", "") and until and (now or time.time()) < until:
+        return ["Просрочен не сам сертификат Checko (он действует до " + cert["valid"].split(" - ")[1].strip() + "), а другое "
+                "звено цепочки, которую присылает сервер: так бывает, когда на сервере остался старый промежуточный "
+                "сертификат. Браузеры и Windows это обходят (находят нужное звено сами), Python нет. Установите пакет "
+                "truststore (pip install -r requirements.txt): программа тогда проверит сертификат средствами Windows, "
+                "проверка при этом не отключается."]
     if RUSSIAN_CA.search(issuer):
         return ["Сертификат Checko выдан российским удостоверяющим центром (Минцифры): Windows и Python по умолчанию ему не "
                 f"доверяют. Скачайте корневой сертификат {RUSSIAN_ROOT_URL}, положите файл в любую папку и впишите в "
@@ -314,7 +330,7 @@ def verdict(report: Report) -> list:
                      "по-прежнему идёт через VPN.")
     elif api["bypass-os"]:
         lines.append("Checko закрыт для адреса вашего VPN, но открыт напрямую, и Windows принимает его сертификат, а Python "
-                     "сам не может его проверить (так бывает, когда сервер присылает неполную цепочку сертификатов). "
+                     "сам не может его проверить (так бывает, когда сервер присылает неполную или устаревшую цепочку сертификатов). "
                      "Программа сама отправляет запросы к Checko в обход VPN и проверяет сертификат средствами Windows: "
                      "выключать VPN не нужно, проверка сертификата при этом не отключается.")
     elif api["tls12"]:
@@ -347,7 +363,8 @@ def verdict(report: Report) -> list:
                      "в сети. Если у VPN включена блокировка трафика вне VPN («kill switch»), она не даёт обойти его: "
                      "выключите её или добавьте программу в исключения VPN (см. ниже). Если и это не поможет, напишите "
                      "в поддержку Checko, что запросы к api.checko.ru с вашего адреса обрываются при шифровании.")
-    lines.extend(cert_advice(report.cert))
+    if not any(api.values()):                           # пока ничего не работает, подсказываем по сертификату
+        lines.extend(cert_advice(report.cert))
     if dns_mismatch(report):
         lines.append(f"Ваш DNS отдаёт для api.checko.ru адрес {', '.join(report.dns_ips)}, а публичный DNS - "
                      f"{report.public_dns[1]}: адрес, вероятно, подменён у провайдера или в настройках. Поставьте в "

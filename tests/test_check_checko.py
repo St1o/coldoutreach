@@ -125,6 +125,24 @@ class CertificateTest(unittest.TestCase):
         text = self.advice(verify_error="сервер прислал неполную цепочку сертификатов [unable to get local issuer certificate]")
         self.assertIn("truststore", text)
 
+    def test_an_expired_chain_link_with_a_valid_certificate_is_explained_as_checkos_leftover(self):
+        valid = "Sep 12 13:27:42 2026 GMT - Dec 11 13:27:41 2026 GMT"
+        now = ssl.cert_time_to_seconds("Oct 11 12:00:00 2026 GMT")
+        text = " ".join(cc.cert_advice(dict(cert(verify_error="срок сертификата истёк [certificate has expired]"), valid=valid), now))
+        self.assertIn("Просрочен не сам сертификат Checko (он действует до Dec 11 13:27:41 2026 GMT)", text)
+        self.assertIn("truststore", text)
+        later = ssl.cert_time_to_seconds("Dec 20 12:00:00 2026 GMT")                # сертификат и правда истёк
+        self.assertEqual(cc.cert_advice(dict(cert(verify_error="срок сертификата истёк"), valid=valid), later), [])
+        self.assertEqual(cc.cert_advice(dict(cert(verify_error="срок сертификата истёк"), valid="не дата"), now), [])
+
+    def test_nothing_is_advised_once_a_way_works(self):
+        advice_text = text_of(bypass_os=OK, adapters={"candidates": [OutputTest.CARD], "error": "", "chosen": OutputTest.CARD},
+                              cert=cert(issuer="countryName=US, organizationName=Let's Encrypt, commonName=YE2",
+                                        verify_error="срок сертификата истёк [certificate has expired]"))
+        self.assertIn("Windows принимает его сертификат", advice_text)
+        self.assertNotIn("Просрочен не сам", advice_text)
+        self.assertIn("неполную или устаревшую цепочку", advice_text)
+
     def test_no_advice_when_the_certificate_is_fine_or_unknown(self):
         self.assertEqual(cc.cert_advice(None), [])
         self.assertEqual(cc.cert_advice(cert(verified=True)), [])
