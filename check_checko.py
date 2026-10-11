@@ -12,6 +12,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import textwrap
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -35,6 +36,8 @@ RUSSIAN_CA = re.compile(r"russian trusted|минцифр|российск", re.I
 ANTIVIRUS_CA = re.compile(r"kaspersky|eset|avast|\bavg\b|dr\.?web|bitdefender|fortinet|zscaler|mcafee|norton|sophos|"
                           r"trend micro|panda|comodo|cisco umbrella|securly", re.IGNORECASE)
 RUSSIAN_ROOT_URL = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
+REPORT_FILE = os.path.join(config.ROOT, "check_checko.txt")      # копия вывода: её можно прислать вместо скриншота
+WIDTH = 130                                                       # длинные строки в окне Run обрезаются: переносим сами
 CONTROL_SITES = (("checko.ru", "https://checko.ru/"), ("ya.ru", "https://ya.ru/"))
 DOH_URL = "https://dns.google/resolve"   # публичный DNS поверх HTTPS: чтобы сверить адрес, который отдаёт ваш DNS
 
@@ -361,41 +364,65 @@ def mark(ok) -> str:
     return "ок" if ok else ("нет такого способа" if ok is None else "СБОЙ")
 
 
-def main(argv=None, out=print) -> int:
+def wrap(line: str) -> list:
+    """Длинную строку разбивает на несколько, чтобы она не обрезалась в окне; продолжение с отступом."""
+    if len(line) <= WIDTH:
+        return [line]
+    indent = re.match(r"\s*", line).group(0)
+    return textwrap.wrap(line, width=WIDTH, subsequent_indent=indent + "   ", break_long_words=False,
+                         break_on_hyphens=False) or [line]
+
+
+def main(argv=None, out=print, save_to=None) -> int:
+    """save_to - файл, куда дописывается весь вывод (адрес, карты, сертификат; ключа в нём нет)."""
+    saved = []
+
+    def emit(line=""):
+        for part in wrap(line):
+            saved.append(part)
+            out(part)
+
     env_file = argv[1] if argv and len(argv) > 1 else config.ENV_FILE        # python check_checko.py [файл.env]
     key = ""
     try:
         key = config.read_env_file(env_file).get("CHECKO_API_KEY", "")
     except (OSError, ValueError):
         pass
-    out(f"Проверяем соединение с {HOST} (ключ: {'задан, ' + str(len(key)) + ' знаков' if key else 'не задан в local.env'})...")
+    emit(f"Проверяем соединение с {HOST} (ключ: {'задан, ' + str(len(key)) + ' знаков' if key else 'не задан в local.env'})...")
     report = collect(key)
-    out("Прокси на этом компьютере: " + (", ".join(f"{kind} {addr}" for kind, addr in report.proxies.items())
-                                         if report.proxies else "нет"))
-    out(f"1. Адрес api.checko.ru: {'найден' if report.dns[0] else 'НЕ найден'} - {report.dns[1]}")
-    out(f"   Публичный DNS (Google) отдаёт: {report.public_dns[1]}")
+    emit("Прокси на этом компьютере: " + (", ".join(f"{kind} {addr}" for kind, addr in report.proxies.items())
+                                          if report.proxies else "нет"))
+    emit(f"1. Адрес api.checko.ru: {'найден' if report.dns[0] else 'НЕ найден'} - {report.dns[1]}")
+    emit(f"   Публичный DNS (Google) отдаёт: {report.public_dns[1]}")
     if report.dns[0]:
-        out(f"2. Соединение (порт 443): {'есть' if report.tcp[0] else 'НЕТ'} - {report.tcp[1]}")
+        emit(f"2. Соединение (порт 443): {'есть' if report.tcp[0] else 'НЕТ'} - {report.tcp[1]}")
     for name, label in (("default", "Обычное шифрование"), ("tls12", "Шифрование TLS 1.2")):
         if name in report.tls:
             ok, text = report.tls[name]
-            out(f"3. {label}: {mark(ok)} - {text}")
+            emit(f"3. {label}: {mark(ok)} - {text}")
     for site, (ok, text) in report.control.items():
-        out(f"4. Другой сайт из Python, {site}: {mark(ok)} - {text}")
+        emit(f"4. Другой сайт из Python, {site}: {mark(ok)} - {text}")
     for mode in MODES:
         ok, text = report.api[mode]
-        out(f"5. Запрос к API ({MODE_NAMES[mode]}): {mark(ok)} - {text}")
+        emit(f"5. Запрос к API ({MODE_NAMES[mode]}): {mark(ok)} - {text}")
     for line in adapter_lines(report.adapters):
-        out(line)
+        emit(line)
     for line in cert_lines(report.cert):
-        out(line)
-    out("")
+        emit(line)
+    emit("")
     for line in verdict(report):
-        out(line)
+        emit(line)
     if not report.api["default"][0]:
-        out(exclusion_hint())
+        emit(exclusion_hint())
+    if save_to:
+        try:
+            with open(save_to, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(saved) + "\n")
+            out(f"Полный текст сохранён в файл {save_to}: его можно прислать вместо скриншота.")
+        except OSError as exc:
+            out(f"Файл с результатом сохранить не удалось ({exc.strerror or exc}).")
     return 0 if any(ok is True for ok, _ in report.api.values()) else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main(sys.argv, save_to=REPORT_FILE))

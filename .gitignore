@@ -16,3 +16,5 @@ local.env
 .idea/
 .venv/
 venv/
+# результат диагностики связи с Checko: адреса и имена сетевых карт этого компьютера
+check_checko.txt

@@ -265,6 +265,48 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+class WrapAndSaveTest(unittest.TestCase):
+    def test_a_long_line_is_split_with_an_indent_and_nothing_is_lost(self):
+        text = "Обычные сайты из Python открываются, а api.checko.ru нет: " + "слово " * 60
+        parts = cc.wrap(text)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= cc.WIDTH for part in parts))
+        self.assertTrue(all(part.startswith("   ") for part in parts[1:]))
+        self.assertEqual(" ".join(" ".join(parts).split()), " ".join(text.split()))
+        self.assertEqual(cc.wrap("короткая"), ["короткая"])
+        self.assertEqual(cc.wrap("   отступ " + "x " * 100)[1][:6], "      ")      # продолжение глубже исходного отступа
+
+    def run_main(self, save_to):
+        lines = []
+        p = probes(default=OK)
+        with mock.patch.object(cc, "probe_proxies", p["proxies"]), mock.patch.object(cc, "probe_dns", p["dns"]), \
+                mock.patch.object(cc, "probe_tcp", p["tcp"]), mock.patch.object(cc, "probe_tls", p["tls"]), \
+                mock.patch.object(cc, "probe_api", p["api"]), mock.patch.object(cc, "probe_key", p["key"]), \
+                mock.patch.object(cc, "probe_public_dns", p["public_dns"]), mock.patch.object(cc, "probe_control", p["control"]), \
+                mock.patch.object(cc, "probe_adapter", lambda: NO_ADAPTERS):
+            code = cc.main(["check_checko.py", os.devnull], out=lines.append, save_to=save_to)
+        return code, lines
+
+    def test_the_whole_output_is_saved_when_asked_and_only_then(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "check_checko.txt")
+            code, lines = self.run_main(path)
+            with open(path, encoding="utf-8") as fh:
+                saved = fh.read()
+            self.assertIn("1. Адрес api.checko.ru: найден", saved)
+            self.assertIn("работает так же, как в программе", saved)
+            self.assertIn("Полный текст сохранён в файл", lines[-1])
+            self.assertNotIn("Полный текст сохранён", saved)               # сообщение о файле в сам файл не пишется
+            self.assertEqual(code, 0)
+            code, lines = self.run_main(None)
+            self.assertFalse(any("сохранён" in line for line in lines))
+
+    def test_an_unwritable_file_is_reported_not_raised(self):
+        code, lines = self.run_main(os.path.join(tempfile.gettempdir(), "нет-такой-папки-xyz", "r.txt"))
+        self.assertIn("сохранить не удалось", lines[-1])
+        self.assertEqual(code, 0)
+
+
 class HelpersTest(unittest.TestCase):
     def test_proxy_address_is_shown_without_login_and_password(self):
         self.assertEqual(cc.hide_login("http://user:pass@10.0.0.1:3128"), "10.0.0.1:3128")
