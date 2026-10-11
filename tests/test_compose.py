@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import io
 import json
 import os
 import tempfile
@@ -517,6 +519,77 @@ class MainTest(unittest.TestCase):
         letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_2.csv"))
         self.assertEqual([l.email for l in letters], ["a@x.ru"])
         self.assertIn("Ещё вопрос", letters[0].body)
+
+    # ---- вместо таблицы указана папка данных: все сохранённые таблицы leads_<дата>.csv ----
+
+    def write_table(self, day, rows, header=HEADER):
+        with open(os.path.join(self.work, f"leads_{day}.csv"), "w", encoding="utf-8-sig", newline="") as fh:
+            csv.writer(fh, delimiter=";").writerows([header] + rows)
+
+    def sent_letters(self):
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
+        return [letter.email for letter in letters]
+
+    def test_a_folder_takes_every_saved_table_oldest_first_and_only_those_without_letters(self):
+        self.write_table("2026-10-09", [lead("c@x.ru", "47.91"), lead("a@x.ru", "47.91")])
+        self.write_table("2026-10-08", [lead("a@x.ru", "47.91"), lead("b@x.ru", "47.91"), lead("d@x.ru", "47.91")])
+        journal.save_state(compose.journal_path(self.work, 1), dict([sent("b@x.ru", date(2026, 10, 5), "1")]))
+        self.assertEqual(self.go(leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["a@x.ru", "d@x.ru", "c@x.ru"])        # b уже получал; a второй раз не пишем
+        self.assertIn("2026-10-08, 2026-10-09; компаний в них: 5", self.output())
+        self.assertIn("уже получал письма из этой рассылки - 1", self.output())
+        self.assertNotIn("@x.ru", self.output().split("Файл:")[0])                    # адресов на экране нет
+
+    def test_the_limit_counts_letters_across_tables(self):
+        self.write_table("2026-10-08", [lead("a@x.ru", "47.91"), lead("b@x.ru", "47.91")])
+        self.write_table("2026-10-09", [lead("c@x.ru", "47.91")])
+        self.assertEqual(self.go("--limit", "3", leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["a@x.ru", "b@x.ru", "c@x.ru"])
+        self.assertEqual(self.go("--limit", "1", leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["a@x.ru"])
+
+    def test_date_keeps_one_table_only(self):
+        self.write_table("2026-10-08", [lead("a@x.ru", "47.91")])
+        self.write_table("2026-10-09", [lead("c@x.ru", "47.91")])
+        self.assertEqual(self.go("--date", "2026-10-09", leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["c@x.ru"])
+        self.assertEqual(self.go("--date", "2026-10-07", leads=self.work), 1)
+        self.assertIn("нет таблицы leads_2026-10-07.csv", self.output())
+
+    def test_date_needs_a_folder_and_a_real_date(self):
+        self.assertEqual(self.go("--date", "2026-10-09"), 1)
+        self.assertIn("вместо таблицы указана папка", self.output())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):        # argparse печатает usage
+            self.go("--date", "вчера", leads=self.work)
+
+    def test_a_folder_without_tables_says_what_to_do(self):
+        self.assertEqual(self.go(leads=self.work), 1)                     # leads.csv без даты в имени не считается
+        self.assertIn("сначала соберите компании на странице /leads", self.output())
+        self.assertFalse(os.path.exists(os.path.join(self.work, "letters_1.csv")))
+
+    def test_an_old_table_without_okved_columns_is_skipped_not_fatal(self):
+        self.write_table("2026-10-07", [["ООО", "Иванов", "old@x.ru"]], header=["Название", "ФИО директора", "Почта"])
+        self.write_table("2026-10-09", [lead("c@x.ru", "47.91")])
+        self.assertEqual(self.go(leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["c@x.ru"])
+        self.assertIn("Пропущены без колонок ОКВЭД и источника почты: 2026-10-07", self.output())
+        self.write_table("2026-10-09", [["ООО", "Иванов", "old@x.ru"]], header=["Название", "ФИО директора", "Почта"])
+        self.assertEqual(self.go(leads=self.work), 1)
+        self.assertIn("ни одну таблицу прочитать не удалось", self.output())
+
+    def test_stage_columns_in_the_table_do_not_matter(self):
+        self.write_table("2026-10-09", [lead("c@x.ru", "47.91") + ["да", "нет", "нет"]],
+                         header=HEADER + ["Первое письмо", "Дожим", "Закрывающее"])
+        self.assertEqual(self.go(leads=self.work), 0)
+        self.assertEqual(self.sent_letters(), ["c@x.ru"])                     # решает журнал отправки, а не колонка «да»
+
+    def test_follow_up_and_test_letters_work_with_a_folder_too(self):
+        journal.save_state(compose.journal_path(self.work, 1), dict([sent("a@x.ru", date(2026, 10, 5), "1")]))
+        self.assertEqual(self.go("--stage", "2", leads=self.work, today=date(2026, 10, 9)), 0)
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_2.csv"))
+        self.assertEqual([l.email for l in letters], ["a@x.ru"])
+        self.assertEqual(self.go("--test-to", "me@x.ru", leads=self.work), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.work, "letters_test.csv")))
 
 
 if __name__ == "__main__":

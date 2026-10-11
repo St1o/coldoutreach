@@ -2,10 +2,14 @@
 Порядок работы и все команды: LOCAL.md, раздел «Рассылка».
 
     python compose.py leads_<дата>.csv --limit 150 --preview        # этап 1, первое письмо
+    python compose.py <папка данных> --limit 15 --preview           # то же по всем сохранённым таблицам leads_<дата>.csv
     python compose.py leads_<дата>.csv --stage 2 --preview          # дожим (3 рабочих дня после первого письма)
     python compose.py leads_<дата>.csv --stage 3                    # закрывающее (7 дней после первого)
     python compose.py leads_<дата>.csv --test-to me@mail.ru         # пробные письма на свои ящики
 
+Вместо таблицы можно указать папку данных: тогда берутся все таблицы leads_<дата>.csv в ней, от старых дат к новым
+(ключ --date оставляет одну дату), а письма собираются тем, кому из этих компаний ещё ничего не отправляли. Так
+отправляют по уже собранной базе, без нового запроса к Checko (сайт может работать, но для сборки писем он не нужен).
 Из таблицы читаются только почта, ОКВЭД и источник почты (ФИО и названия в письма не попадают). Группа - по первым
 двум знакам ОКВЭД (таблица групп в файле сегмента), запасная группа 12 - для неизвестного. Только адреса из ЕГРЮЛ,
 без повторов, стоп-листа и ответивших на опрос. Нет ссылки на форму (и подписи, если в шаблоне есть {{подпись}}),
@@ -38,6 +42,7 @@ LEAD_COLUMNS = {"email": "Почта", "okved": "ОКВЭД (код)", "source":
 NAME_COLUMN = "Название"                          # из него берётся только форма организации (ООО, МБУ…); название дальше не идёт
 OKVED_NAME_COLUMN = "ОКВЭД (название)"            # нужна только для списка кодов агенту; в старых выгрузках её может не быть
 OKVED_MAP_NAME, OKVED_REPORT_NAME = "okved-map.md", "okved_to_classify.md"
+LEADS_TABLE = re.compile(r"leads_(\d{4}-\d{2}-\d{2})\.csv")        # таблица, которую сайт сохраняет в папку данных
 SOURCE_REGISTER = "ЕГРЮЛ"
 FIRST_ID, MIN_BUSINESS_DAYS, MIN_DAYS_TO_LAST = 1, 3, 7       # дожим через 3 рабочих дня, закрывающее через 7 дней
 KNOWN_PLACEHOLDERS = {"группа_словами", "боль_1", "боль_2", "ссылка_на_опрос", "подпись"}
@@ -235,6 +240,41 @@ def read_leads(path: str) -> list:
                 lead["form"] = org_form(row[name_at] if name_at < len(row) else "")
             leads.append(lead)
     return leads
+
+
+def iso_date(value: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError("нужна дата в виде ГГГГ-ММ-ДД") from None
+
+
+def read_folder_leads(folder: str, day: str = ""):
+    """Все таблицы leads_<дата>.csv в папке данных, от старых дат к новым (day - только эта дата) ->
+    (компании, даты прочитанных таблиц, даты пропущенных). Таблица без нужных колонок (старая выгрузка) пропускается
+    с пометкой, а не останавливает остальные."""
+    try:
+        names = sorted(name for name in os.listdir(folder) if LEADS_TABLE.fullmatch(name))
+    except OSError as exc:
+        raise ComposeError(f"не удалось открыть папку {folder}: {exc.strerror or exc}") from exc
+    if day:
+        names = [name for name in names if LEADS_TABLE.fullmatch(name).group(1) == day]
+    if not names:
+        raise ComposeError((f"в папке нет таблицы leads_{day}.csv" if day else "в папке нет таблиц leads_<дата>.csv")
+                           + ": сначала соберите компании на странице /leads (вставьте текст Checko, нажмите «Запустить»)")
+    leads, used, skipped = [], [], []
+    for name in names:
+        when = LEADS_TABLE.fullmatch(name).group(1)
+        try:
+            leads.extend(read_leads(os.path.join(folder, name)))
+        except ComposeError:
+            skipped.append(when)
+        else:
+            used.append(when)
+    if not used:
+        raise ComposeError("ни одну таблицу прочитать не удалось (нет колонок ОКВЭД и источника почты): выгрузите компании "
+                           "на странице /leads заново, в новой выгрузке они есть")
+    return leads, used, skipped
 
 
 def read_responded(path: str) -> frozenset:
@@ -450,7 +490,10 @@ def inside(folder: str, root: str) -> bool:
 
 def main(argv=None, today=None, log=print) -> int:
     parser = argparse.ArgumentParser(description="Сборка писем рассылки из таблицы /leads и текстов агентов")
-    parser.add_argument("leads", help="таблица leads_<дата>.csv; рядом с ней лежат и появляются остальные файлы партии")
+    parser.add_argument("leads", help="таблица leads_<дата>.csv или папка данных (тогда все таблицы leads_<дата>.csv в ней); "
+                                      "рядом лежат и появляются остальные файлы партии")
+    parser.add_argument("--date", default=None, type=iso_date,
+                        help="с папкой данных: взять только таблицу за эту дату регистрации (ГГГГ-ММ-ДД)")
     parser.add_argument("--letters", default="", help="файл писем агентов (02-Write/output/….md) или OUTREACH_LETTERS")
     parser.add_argument("--segment", default="",
                         help="файл сегмента (01-Segment/output/….md): таблица групп ОКВЭД, или OUTREACH_SEGMENT")
@@ -486,7 +529,10 @@ def main(argv=None, today=None, log=print) -> int:
         if not letters_path or not segment_path:
             raise ComposeError("не указаны файлы агентов: --letters и --segment (или OUTREACH_LETTERS и OUTREACH_SEGMENT "
                                "в local.env)")
-        folder = os.path.dirname(os.path.abspath(args.leads))
+        by_folder = os.path.isdir(args.leads)
+        if args.date and not by_folder:
+            raise ComposeError("--date работает, только когда вместо таблицы указана папка данных")
+        folder = os.path.abspath(args.leads) if by_folder else os.path.dirname(os.path.abspath(args.leads))
         root = project_root(letters_path)
         if root and inside(folder, root):
             raise ComposeError(f"таблица с адресами лежит в папке проекта агентов ({root}). Адреса в проект не кладём: "
@@ -517,6 +563,7 @@ def main(argv=None, today=None, log=print) -> int:
         responded = read_responded(resp_path) if (args.responded or os.path.exists(resp_path)) else frozenset()
         when = today or date.today()
 
+        tables_note = ""
         if args.test_to:
             addresses = [a.strip() for a in args.test_to.split(",") if a.strip()]
             bad = [a for a in addresses if not config.check_email(a)]
@@ -525,7 +572,13 @@ def main(argv=None, today=None, log=print) -> int:
             result = compose_test(composer, subject, args.stage, addresses)
             out = os.path.join(folder, "letters_test.csv")
         elif args.stage == 1:
-            result = compose_first(composer, read_leads(args.leads), subject, folder, stoplist, responded, args.limit)
+            if by_folder:
+                leads, used, skipped = read_folder_leads(folder, args.date or "")
+                tables_note = (f"Таблицы выгрузки (даты регистрации): {', '.join(used)}; компаний в них: {len(leads)}."
+                               + (f" Пропущены без колонок ОКВЭД и источника почты: {', '.join(skipped)}." if skipped else ""))
+            else:
+                leads, tables_note = read_leads(args.leads), ""
+            result = compose_first(composer, leads, subject, folder, stoplist, responded, args.limit)
             out = os.path.join(folder, "letters_1.csv")
         else:
             result = compose_next(composer, args.stage, folder, stoplist, responded, when, args.min_days)
@@ -536,6 +589,8 @@ def main(argv=None, today=None, log=print) -> int:
 
     names = {group_id: group.name for group_id, group in composer.groups.items()}
     log(f"Этап {args.stage}: тема «{subject}»; стоп-лист: {len(stoplist)}; адресов в ответах опроса: {len(responded)}.")
+    if tables_note:
+        log(tables_note)
     for reason, number in result.skipped.most_common():
         log(f"  пропущено: {reason} - {number}")
     for group_id, number in sorted(result.unwritten.items()):
