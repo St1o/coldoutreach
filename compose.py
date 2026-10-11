@@ -17,6 +17,11 @@
 Ссылка, подпись и пути к файлам агентов берутся из local.env: SURVEY_LINK, MAIL_SIGNATURE, OUTREACH_LETTERS,
 OUTREACH_SEGMENT (ключи командной строки главнее).
 
+Варианты фраз (необязательно): раздел «## Варианты фраз» файла писем («### место» и строки «- вариант»); в шаблонах это
+{{приветствие}}, {{призыв_1}} и т. п. Программа подставляет варианты по кругу (соседние письма разные), приветствие - по
+часу сборки письма (пометки «утро:», «день:», «вечер:»), место «тема» раздаёт темы. Базовая проверка на повторы:
+средняя разница между письмами одной группы не меньше --min-unique (по умолчанию 25%), иначе письма не собираются.
+
 Карта ОКВЭД (необязательно): файл okved-map.md агента рядом с файлом сегмента (или --okved-map, OUTREACH_OKVED_MAP).
 Агент решает по смыслу, к какой группе относится каждый код ОКВЭД (или «не писать»); решение по коду главнее таблицы
 классов. Коды, по которым решения ещё нет, программа выписывает в okved_to_classify.md (коды и названия видов
@@ -32,10 +37,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+import random
+
 from mailing import config, journal
 from mailing.agentmd import (
-    EXCLUDE_ID, FALLBACK_ID, ComposeError, Texts, _key, check_texts, okved_digits, parse_form_rules, parse_letters,
-    parse_okved_map, parse_segment)
+    EXCLUDE_ID, FALLBACK_ID, SUBJECT_SLOT, TIME_TAGS, ComposeError, Texts, _key, check_texts, okved_digits,
+    parse_form_rules, parse_letters, parse_okved_map, parse_segment)
 
 OUT_FIELDS = ["Почта", "Тема", "Текст", "Группа", "Источник адреса"]
 LEAD_COLUMNS = {"email": "Почта", "okved": "ОКВЭД (код)", "source": "Источник почты"}
@@ -47,7 +54,16 @@ SOURCE_REGISTER = "ЕГРЮЛ"
 FIRST_ID, MIN_BUSINESS_DAYS, MIN_DAYS_TO_LAST = 1, 3, 7       # дожим через 3 рабочих дня, закрывающее через 7 дней
 KNOWN_PLACEHOLDERS = {"группа_словами", "боль_1", "боль_2", "ссылка_на_опрос", "подпись"}
 _PLACEHOLDER = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
-_EMPTY_WORDS_CLAUSE = re.compile(r",\s*вид деятельности\s*[—–-]\s*\{\{\s*группа_словами\s*\}\}")
+_EMPTY_WORDS_CLAUSE = re.compile(r",\s*(?:вид деятельности|сфера деятельности|сфера)\s*[—–-]\s*\{\{\s*группа_словами\s*\}\}")
+SUBJECT_WORDS = "группа_кратко"      # подстановка только в вариантах темы: «{{группа_кратко}}» -> «торговля»
+# Бесплатные почты: на таком домене сидят разные люди и компании. На любом другом домене одна организация: одно письмо
+# на домен (два одинаковых письма подряд на ящики одного домена похожи на автоматическую рассылку).
+PUBLIC_DOMAINS = frozenset("""
+    mail.ru bk.ru list.ru inbox.ru internet.ru yandex.ru ya.ru yandex.com yandex.by yandex.kz yandex.ua rambler.ru ro.ru
+    autorambler.ru myrambler.ru lenta.ru gmail.com googlemail.com outlook.com hotmail.com live.com msn.com icloud.com
+    me.com yahoo.com yahoo.ru ukr.net mail.ua tut.by qip.ru pochta.ru
+""".split())
+MIN_UNIQUE = 25.0           # средняя разница между письмами одной группы, % (--min-unique; 0 - не проверять)
 _LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle)/\S*")
 _EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 
@@ -68,9 +84,9 @@ def check_link(link: str) -> str:
 
 
 def uses_placeholder(texts: Texts, name: str) -> bool:
-    return any(match.group(1) == name
-               for template in list(texts.templates.values()) + list(texts.fallback_templates.values())
-               for match in _PLACEHOLDER.finditer(template))
+    pieces = (list(texts.templates.values()) + list(texts.fallback_templates.values())
+              + [text for items in texts.variants.values() for _, text in items])
+    return any(match.group(1) == name for template in pieces for match in _PLACEHOLDER.finditer(template))
 
 
 def check_signature(signature: str) -> str:
@@ -92,7 +108,37 @@ def pick_subject(texts: Texts, number: int = 0) -> str:
     return texts.subjects[0][0]
 
 
-def fill(template: str, values: dict) -> str:
+def day_period(hour: int) -> str:
+    """Час -> «утро» (5-10), «день» (11-16), «вечер» (с 17 и ночью): для приветствий с пометкой времени суток."""
+    return "утро" if 5 <= hour < 11 else "день" if 11 <= hour < 17 else "вечер"
+
+
+def check_variants(variants: dict) -> None:
+    """Раздел «Варианты фраз» файла писем: у каждого места есть варианты на любое время суток, в вариантах только
+    обычные подстановки ({{группа_словами}}, {{ссылка_на_опрос}}, {{подпись}}), вложенных мест нет."""
+    for slot, items in variants.items():
+        if slot in KNOWN_PLACEHOLDERS:
+            raise ComposeError(f"в разделе вариантов место «{slot}» совпадает с обычной подстановкой: назовите иначе")
+        if not items:
+            raise ComposeError(f"в разделе вариантов у места «{slot}» нет ни одного варианта (строки вида «- текст»)")
+        for period in TIME_TAGS:
+            if not any(tag in ("", period) for tag, _ in items):
+                raise ComposeError(f"у места «{slot}» нет варианта для времени суток «{period}»: добавьте вариант без пометки")
+        allowed = {SUBJECT_WORDS} if slot == SUBJECT_SLOT else KNOWN_PLACEHOLDERS
+        if slot == SUBJECT_SLOT and all(SUBJECT_WORDS in text for _, text in items):
+            raise ComposeError("у места «тема» нужен хотя бы один вариант без {{группа_кратко}}: у запасной группы "
+                               "названия нет")
+        for _, text in items:
+            for found in _PLACEHOLDER.finditer(text):
+                if found.group(1) not in allowed:
+                    raise ComposeError(f"в варианте места «{slot}» неизвестная подстановка {{{{{found.group(1)}}}}}: "
+                                       + ("в теме можно только {{группа_кратко}}" if slot == SUBJECT_SLOT else
+                                          "в вариантах можно только обычные подстановки, не другие места"))
+
+
+def fill(template: str, values: dict, slots: dict = None) -> str:
+    if slots:                               # места с вариантами {{приветствие}} и т. п. заменяются выбранным вариантом
+        template = _PLACEHOLDER.sub(lambda m: slots.get(m.group(1).casefold(), m.group(0)), template)
     if not values.get("группа_словами"):
         template = _EMPTY_WORDS_CLAUSE.sub("", template)
 
@@ -147,7 +193,10 @@ def okved_class(code: str):
 
 class Composer:
     def __init__(self, groups: list, texts: Texts, link: str, signature: str, include_unwritten: bool = False,
-                 okved_map: dict = None, form_rules: dict = None):
+                 okved_map: dict = None, form_rules: dict = None, now: datetime = None):
+        check_variants(texts.variants)
+        self.now = now or datetime.now()               # время суток для приветствий: по часу сборки письма
+        self._counts = Counter()                       # (этап, группа) -> сколько писем уже собрано: варианты идут по кругу
         self.groups = {group.id: group for group in groups}
         self.okved_map = okved_map or {}
         self.form_rules = form_rules or {}             # форма -> писать (True) или не писать (False), решение агента
@@ -188,6 +237,23 @@ class Composer:
         """Блок боли для письма 1 написан (или это запасная группа)."""
         return group_id == FALLBACK_ID or _key(self.groups[group_id].name) in self.texts.pain1
 
+    def pick_variant(self, slot: str, stage: int, group_id: str) -> str:
+        """Вариант фразы для места: по кругу среди подходящих по времени суток. Письма одной группы и этапа идут подряд,
+        поэтому соседние письма получают разные варианты; одно и то же письмо при той же сборке получает тот же вариант."""
+        period = day_period(self.now.hour)
+        options = [text for tag, text in self.texts.variants[slot] if tag in ("", period)]
+        return options[(self._counts[(stage, group_id)] + sum(map(ord, slot))) % len(options)]
+
+    def subject_variant(self, group_id: str):
+        """Тема из места «тема» раздела вариантов (по кругу); места нет - None, тогда тема одна, рекомендованная.
+        {{группа_кратко}} в теме заменяется названием вида деятельности; у запасной группы берутся темы без неё."""
+        if SUBJECT_SLOT not in self.texts.variants:
+            return None
+        short = self.groups[group_id].short
+        options = [text for _, text in self.texts.variants[SUBJECT_SLOT] if short or "{{" + SUBJECT_WORDS + "}}" not in text]
+        text = options[(self._counts[(1, group_id)] + sum(map(ord, SUBJECT_SLOT))) % len(options)]
+        return text.replace("{{" + SUBJECT_WORDS + "}}", short)
+
     def letter_text(self, stage: int, group_id: str) -> str:
         group = self.groups[group_id]
         key = _key(group.name)
@@ -196,13 +262,17 @@ class Composer:
         # Запасная группа и группа без своего блока боли: свой шаблон письма, если агент его написал
         own = group_id == FALLBACK_ID or not self.is_written(group_id)
         template = (self.texts.fallback_templates.get(stage) if own else None) or self.texts.templates[stage]
-        return fill(template, {
+        slots = {name.casefold(): self.pick_variant(name.casefold(), stage, group_id)
+                 for name in {m.group(1) for m in _PLACEHOLDER.finditer(template)} if name.casefold() in self.texts.variants}
+        text = fill(template, {
             "группа_словами": group.words,
             "боль_1": pain1 or self.texts.fallback1,
             "боль_2": pain2 or self.texts.fallback2,
             "ссылка_на_опрос": self.link,
             "подпись": self.signature,
-        })
+        }, slots)
+        self._counts[(stage, group_id)] += 1
+        return text
 
 
 # --- вход: таблица, стоп-лист, ответы, журналы ------------------------------------------------------------
@@ -324,9 +394,10 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
     handled = set()
     for stage in (1, 2, 3):
         handled.update(journal.load_state(journal_path(folder, stage)))
-    seen = set()
+    seen, seen_domains = set(), {address.rsplit("@", 1)[-1] for address in handled} - PUBLIC_DOMAINS
     for lead in leads:
         address = lead["email"].lower()
+        domain = address.rsplit("@", 1)[-1]
         if not config.check_email(lead["email"]):
             result.skipped["некорректный адрес"] += 1
         elif lead["source"] != SOURCE_REGISTER:
@@ -343,6 +414,8 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
             result.skipped["повтор адреса (одна цепочка на адрес)"] += 1
         elif address in handled:
             result.skipped["уже получал письма из этой рассылки"] += 1
+        elif domain in seen_domains:
+            result.skipped["второй адрес той же организации (тот же домен почты): одно письмо на домен"] += 1
         elif config.is_stopped(address, stoplist):
             result.skipped["в стоп-листе"] += 1
         elif address in responded:
@@ -360,10 +433,13 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
             if not composer.is_written(group_id) and not composer.include_unwritten:
                 result.unwritten[group_id] += 1
                 seen.add(address)
+                seen_domains.add(domain) if domain not in PUBLIC_DOMAINS else None
                 continue
             seen.add(address)
-            result.letters.append((lead["email"], subject, composer.letter_text(1, group_id), group_id,
-                                   lead["source"]))
+            if domain not in PUBLIC_DOMAINS:
+                seen_domains.add(domain)
+            result.letters.append((lead["email"], composer.subject_variant(group_id) or subject,
+                                   composer.letter_text(1, group_id), group_id, lead["source"]))
     if limit:
         result.letters = result.letters[:limit]
     return result
@@ -459,6 +535,35 @@ def write_okved_report(folder: str, composer: Composer, unmapped: Counter, unkno
     return path
 
 
+def _shingles(text: str, size: int = 3) -> set:
+    """Письмо -> набор троек подряд идущих слов (без ссылки): так сравнивают тексты на повторы."""
+    words = re.findall(r"\w+", _LINK.sub(" ", text).casefold())
+    return {tuple(words[i:i + size]) for i in range(max(1, len(words) - size + 1))}
+
+
+def uniqueness_by_group(letters: list, max_pairs: int = 500) -> dict:
+    """Базовая проверка на повторы: группа -> (средняя разница между письмами, наименьшая разница, число пар), в процентах.
+    Разница двух писем = 100% минус доля общих троек слов (коэффициент Жаккара). Сравниваются письма одной группы:
+    у разных групп свои тексты. Группы из одного письма пропускаются. Пар много - берётся одна и та же выборка."""
+    by_group = {}
+    for letter in letters:
+        by_group.setdefault(letter[3], []).append(_shingles(letter[2]))
+    report = {}
+    for group_id, sets in by_group.items():
+        count = len(sets)
+        if count < 2:
+            continue
+        all_pairs = count * (count - 1) // 2
+        if all_pairs <= max_pairs:
+            pairs = [(i, j) for i in range(count) for j in range(i + 1, count)]
+        else:
+            rng = random.Random(0)
+            pairs = [tuple(sorted(rng.sample(range(count), 2))) for _ in range(max_pairs)]
+        diffs = [100.0 * (1 - len(sets[i] & sets[j]) / len(sets[i] | sets[j])) for i, j in pairs]
+        report[group_id] = (sum(diffs) / len(diffs), min(diffs), len(diffs))
+    return report
+
+
 def write_letters(path: str, letters: list) -> None:
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
@@ -516,6 +621,10 @@ def main(argv=None, today=None, log=print) -> int:
     parser.add_argument("--include-unwritten", action="store_true",
                         help="группам, для которых блок боли ещё не написан, подставить запасной вариант "
                              "(по умолчанию такие письма не собираются)")
+    parser.add_argument("--min-unique", type=float, default=MIN_UNIQUE,
+                        help="базовая проверка на повторы: средняя разница между письмами одной группы, не меньше этого "
+                             f"процента (по умолчанию {MIN_UNIQUE:g}; 0 - не проверять). Меньше - письма не собираются: "
+                             "нужны варианты формулировок в файле писем (раздел «Варианты фраз»)")
     parser.add_argument("--preview", action="store_true", help="показать по одному примеру письма на группу")
     parser.add_argument("--test-to", default="",
                         help="адреса через запятую: собрать letters_test.csv с пробными письмами им (таблица не читается)")
@@ -588,7 +697,9 @@ def main(argv=None, today=None, log=print) -> int:
         return 1
 
     names = {group_id: group.name for group_id, group in composer.groups.items()}
-    log(f"Этап {args.stage}: тема «{subject}»; стоп-лист: {len(stoplist)}; адресов в ответах опроса: {len(responded)}.")
+    subject_note = (f"темы по кругу ({len(composer.texts.variants[SUBJECT_SLOT])} шт.)"
+                    if SUBJECT_SLOT in composer.texts.variants and args.stage == 1 else f"тема «{subject}»")
+    log(f"Этап {args.stage}: {subject_note}; стоп-лист: {len(stoplist)}; адресов в ответах опроса: {len(responded)}.")
     if tables_note:
         log(tables_note)
     for reason, number in result.skipped.most_common():
@@ -620,6 +731,20 @@ def main(argv=None, today=None, log=print) -> int:
         fallback = Counter(letter[3] for letter in result.letters if not composer.is_written(letter[3]))
         for group_id, number in sorted(fallback.items()):
             log(f"  запасной вариант текста: для группы {group_id} «{names[group_id]}» блок боли ещё не написан - писем {number}")
+    if not args.test_to and args.min_unique > 0:
+        report = uniqueness_by_group(result.letters)
+        for group_id, (mean, lowest, pairs) in sorted(report.items()):
+            log(f"  уникальность писем группы {group_id}: в среднем {mean:.0f}% отличий, наименьшее {lowest:.0f}% "
+                f"(сравнено пар: {pairs}; порог {args.min_unique:g}%)")
+        if not composer.texts.variants and any(number > 1 for number in per_group.values()):
+            log("  внимание: в файле писем нет раздела «Варианты фраз», письма одной группы одинаковые (спам-признак). "
+                "Попросите агента outreach-write добавить варианты.")
+        weak = sorted(group_id for group_id, (mean, _, _) in report.items() if mean < args.min_unique)
+        if weak and composer.texts.variants:
+            log(f"Ошибка: письма группы {', '.join(weak)} слишком похожи друг на друга (порог {args.min_unique:g}% отличий): "
+                "почтовые сервисы считают такую рассылку спамом. Файл писем не создан. Нужно больше вариантов формулировок "
+                "(агент outreach-write, раздел «Варианты фраз»).")
+            return 1
     if args.preview:
         shown = set()
         for letter in result.letters:
