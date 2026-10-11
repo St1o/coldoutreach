@@ -292,6 +292,17 @@ class HelpersTest(unittest.TestCase):
         with mock.patch("checko_api.new_session", return_value=Session()):
             self.assertEqual(cc.probe_api("default"), (True, "ответ получен (HTTP 403)"))
 
+    def test_a_missing_truststore_is_named_directly_and_a_missing_adapter_is_not_blamed_on_it(self):
+        with mock.patch("checko_api.new_session", return_value=None), mock.patch("checko_api.os_trust_context", return_value=None):
+            ok, text = cc.probe_api("bypass-os")
+        self.assertIsNone(ok)
+        self.assertIn("пакет truststore не установлен", text)
+        self.assertIn("pip install -r requirements.txt", text)
+        with mock.patch("checko_api.new_session", return_value=None), \
+                mock.patch("checko_api.os_trust_context", return_value=ssl.create_default_context()):
+            ok, text = cc.probe_api("bypass-os")
+        self.assertNotIn("truststore не установлен", text)
+
     def test_no_curl_is_reported_as_no_such_way(self):
         with mock.patch("checko_api.new_session", return_value=None):
             self.assertEqual(cc.probe_api("curl")[0], None)

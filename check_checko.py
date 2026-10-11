@@ -126,6 +126,9 @@ def probe_api(mode: str, key: str = PROBE_KEY) -> tuple:
     """Запрос так, как его делает программа. Годится любой ответ сервера: даже «неверный ключ» значит, что связь есть."""
     session = checko_api.new_session(mode)
     if session is None:
+        if mode == "bypass-os" and checko_api.os_trust_context() is None:
+            return None, ("пакет truststore не установлен: выполните pip install -r requirements.txt "
+                          "(установить нужно в то окружение, которым запускается проект)")
         return None, NO_WAY.get(mode, "способа нет")
     try:
         response = session.get(checko_api.API_URL, params={"key": key, "inn": SAMPLE_INN, "source": "false"}, timeout=20)
