@@ -22,6 +22,7 @@ import dataclasses
 import os
 import random
 import smtplib
+import ssl
 import subprocess
 import sys
 import time
@@ -30,7 +31,7 @@ from collections import Counter
 from mailing import journal, mailboxes as boxes
 from mailing.config import (
     ENV_FILE, SETTINGS_FILE, DEFAULT_DAILY_LIMIT, check_email, is_stopped, load_env_file, load_settings, mask_email,
-    read_stoplist, redact, resolve_daily_limit)
+    read_stoplist, redact, resolve_daily_limit, resolve_port)
 from mailing.lock import Locked, SendLock, lock_holder
 from mailing.smtp import SMTP_PORT, MailruSender, build_message, reply_text
 from mailing.table import LettersError, read_letters
@@ -211,6 +212,12 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                         code = 5
                         break
                 continue
+            except ssl.SSLError as exc:
+                log(f"Не удалось установить защищённое соединение с smtp.mail.ru{note} ({shown(reply_text(exc))}). Это не пароль и не "
+                    "лимит: чаще всего мешает VPN, прокси или антивирус с проверкой HTTPS, реже провайдер. Остановлено. "
+                    "Запустите check_cert.py (правой кнопкой, Run 'check_cert') и пришлите вывод; письмо останется в очереди.")
+                code = 3
+                break
             except (smtplib.SMTPException, OSError) as exc:
                 log(f"mail.ru не принял письмо или оборвал связь{note} ({shown(reply_text(exc))}). Останавливаемся: "
                     "если это лимит отправки (например 451 Ratelimit exceeded), продолжите позже, "
@@ -303,8 +310,8 @@ def main(argv=None) -> int:
                              f"(по умолчанию {DEFAULT_JITTER:g}, то есть 30-75 с; 0 - ровная пауза, она похожа на программу)")
     parser.add_argument("--from-name", default="",
                         help="имя отправителя в поле «От» (по умолчанию MAIL_FROM_NAME из local.env; одно для всех ящиков)")
-    parser.add_argument("--port", type=int, default=SMTP_PORT, choices=(465, 587),
-                        help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS)")
+    parser.add_argument("--port", type=int, default=None, choices=(465, 587),
+                        help="порт smtp.mail.ru: 465 (SSL, по умолчанию) или 587 (STARTTLS); по умолчанию MAILRU_PORT из local.env")
     parser.add_argument("--daily-limit", type=int, default=None,
                         help="не больше писем за последние 24 часа на каждый почтовый ящик, считая по всем таблицам "
                              "letters*.sent.json в папке (по умолчанию значение, заданное на странице /mail сайта, затем "
@@ -329,6 +336,11 @@ def main(argv=None) -> int:
         daily_limit, _ = resolve_daily_limit(args.daily_limit, args.settings)
     except ValueError:
         print("Ошибка: MAIL_DAILY_LIMIT в local.env должно быть целым числом.")
+        return 1
+    try:
+        port = resolve_port(args.port)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
         return 1
 
     # ящики: первый - MAILRU_USER, второй - MAILRU_USER_2 и так далее; ни одного нет - работает прежний путь с одним ящиком
@@ -382,7 +394,7 @@ def main(argv=None) -> int:
 
     def go():
         return run(args.letters, args.send, args.limit, args.pause, user, password,
-                   args.from_name or os.environ.get("MAIL_FROM_NAME", ""), args.port,
+                   args.from_name or os.environ.get("MAIL_FROM_NAME", ""), port,
                    stoplist=stoplist, daily_limit=daily_limit, unsubscribe=True, mask=args.mask_addresses,
                    mailboxes=selected, configured=ready, jitter=args.jitter, settings_path=args.settings)
 

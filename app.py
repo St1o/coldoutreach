@@ -601,8 +601,13 @@ def main(argv=None):
     if data_dir:
         os.makedirs(data_dir, exist_ok=True)
     leads_job = LeadsJob(env("LEADS_TOKEN", ""), out_dir=data_dir or None, api_key=env("CHECKO_API_KEY", ""))
+    try:
+        smtp_port = mailcfg.resolve_port()                 # MAILRU_PORT из local.env: 465 (по умолчанию) или 587
+    except ValueError as exc:
+        print(f"{exc} Использую 465.")
+        smtp_port = 465
     mail_service = MailService(
-        env("MAILRU_USER", ""), env("MAILRU_APP_PASSWORD", ""), env("MAIL_FROM_NAME", ""),
+        env("MAILRU_USER", ""), env("MAILRU_APP_PASSWORD", ""), env("MAIL_FROM_NAME", ""), port=smtp_port,
         example={"to": env("MAIL_EXAMPLE_TO", ""), "director": env("MAIL_EXAMPLE_DIRECTOR", "")},
         mailboxes=mailboxes_mod.load_mailboxes())           # первый ящик и дополнительные MAILRU_USER_2, ...
     send_service = SendService(data_dir) if data_dir else None

@@ -723,5 +723,45 @@ class PauseSpreadTest(RunTest):
         self.assertEqual(fake.call_args.kwargs["jitter"], 1.5)
 
 
+class PortAndDroppedConnectionTest(RunTest):
+    def test_resolve_port_takes_the_key_then_local_env_then_465(self):
+        self.assertEqual(cfg.resolve_port(None, {}), 465)
+        self.assertEqual(cfg.resolve_port(None, {"MAILRU_PORT": " 587 "}), 587)
+        self.assertEqual(cfg.resolve_port(465, {"MAILRU_PORT": "587"}), 465)               # ключ главнее local.env
+        for bad in ("25", "587.5", "порт", "0"):
+            with self.assertRaises(ValueError, msg=bad):
+                cfg.resolve_port(None, {"MAILRU_PORT": bad})
+
+    def test_main_uses_the_port_from_local_env_unless_the_key_says_otherwise(self):
+        from unittest import mock
+        env = os.path.join(tempfile.mkdtemp(), "local.env")
+        self.addCleanup(lambda: os.path.exists(env) and os.remove(env))
+        with open(env, "w", encoding="utf-8") as fh:
+            fh.write(f"MAILRU_USER={USER}\nMAILRU_APP_PASSWORD={SECRET}\nMAILRU_PORT=587\n")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MAILRU_PORT", None)
+            with mock.patch.object(mailer, "run", return_value=0) as fake_run:
+                mailer.main(["letters.csv", "--env", env, "--settings", os.devnull])
+                self.assertEqual(fake_run.call_args.args[7], 587)
+                mailer.main(["letters.csv", "--port", "465", "--env", env, "--settings", os.devnull])
+                self.assertEqual(fake_run.call_args.args[7], 465)
+        with open(env, "w", encoding="utf-8") as fh:
+            fh.write("MAILRU_PORT=25\n")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MAILRU_PORT", None)
+            self.assertEqual(mailer.main(["letters.csv", "--env", env, "--settings", os.devnull]), 1)
+
+    def test_a_dropped_secure_connection_stops_the_run_with_a_clear_hint_and_keeps_the_letter(self):
+        import ssl
+        error = ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:997)")
+        code = self.go(table("a@b.ru;Т;Х", "c@d.ru;Т;Х"), server=FakeServer(fail={"a@b.ru": error}), send=True, pause=0)
+        self.assertEqual(code, 3)
+        text = self.output()
+        for word in ("не пароль", "VPN", "check_cert"):
+            self.assertIn(word, text)
+        self.assertNotIn("лимит отправки", text)                 # это не про лимит
+        self.assertEqual(journal.load_state(journal.state_path(self.path)), {})
+
+
 if __name__ == "__main__":
     unittest.main()

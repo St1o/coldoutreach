@@ -10,6 +10,7 @@ MSK = timezone(timedelta(hours=3))                                        # «с
 ENV_FILE = os.path.join(ROOT, "local.env")
 SETTINGS_FILE = os.path.join(ROOT, "settings.json")                       # пишет страница /mail
 DEFAULT_DAILY_LIMIT = 40
+SMTP_PORTS = (465, 587)                                                    # 465 - SSL сразу, 587 - STARTTLS (запасной путь)
 DAILY_LIMIT_KEY = "daily_limit_per_mailbox"
 DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 50          # лимит с /mail: выше 50 не ставится; предел недели прогрева задан в mailboxes.py
 _EMAIL_RE = re.compile(r"^[^@\s<>,;\"'()\[\]]+@[^@\s<>,;\"'()\[\]]+\.[^@\s<>,;\"'()\[\]]+$")
@@ -115,3 +116,17 @@ def mask_email(address: str) -> str:
 
 def redact(text: str) -> str:
     return re.sub(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", lambda m: mask_email(m.group(0)), text)
+
+
+def resolve_port(cli_value=None, environ=None) -> int:
+    """Порт smtp.mail.ru: ключ --port, затем MAILRU_PORT из local.env, иначе 465. Допустимы 465 и 587; иное - ValueError."""
+    raw = cli_value if cli_value is not None else (environ if environ is not None else os.environ).get("MAILRU_PORT", "")
+    if raw in (None, ""):
+        return SMTP_PORTS[0]
+    try:
+        number = int(str(raw).strip())
+    except ValueError:
+        number = 0
+    if number not in SMTP_PORTS:
+        raise ValueError("Порт SMTP: 465 или 587 (MAILRU_PORT в local.env или ключ --port).")
+    return number

@@ -139,11 +139,18 @@ class MailService:
             except smtplib.SMTPException as exc:           # раньше OSError: SMTPException - его подкласс
                 raise MailError(502, f"mail.ru отказал или оборвал связь: {smtp.reply_text(exc)}. "
                                      "Если это лимит отправки (451), повторите позже.") from exc
-            except ssl.SSLError as exc:                    # раньше OSError: SSLError - его подкласс
-                raise MailError(502, f"Не удалось проверить защищённое соединение с {smtp.SMTP_HOST}:{self.port}: "
+            except ssl.SSLCertVerificationError as exc:    # сертификат сервера не принят
+                raise MailError(502, f"Не удалось проверить сертификат {smtp.SMTP_HOST}:{self.port}: "
                                      f"{exc}. Вероятно, на этом компьютере нет корневого сертификата, которому доверяет mail.ru "
                                      "(на Windows список обновляется не сразу), либо соединение подменяет антивирус. "
                                      "Запустите check_cert.py и пришлите его вывод."
+                                ) from exc
+            except ssl.SSLError as exc:                    # соединение оборвано при установке шифрования (EOF и подобное)
+                raise MailError(502, f"Соединение с {smtp.SMTP_HOST}:{self.port} оборвалось при установке защищённого соединения "
+                                     f"({exc}). Это не пароль и не сертификат: чаще всего мешает VPN, прокси или антивирус с "
+                                     "проверкой HTTPS, реже провайдер или порт. Запустите check_cert.py (правой кнопкой, "
+                                     "Run 'check_cert'): он проверит порты 465 и 587 и скажет, что делать. "
+                                     "Если рабочим окажется 587, впишите в local.env строку MAILRU_PORT=587."
                                 ) from exc
             except OSError as exc:
                 raise MailError(504, f"Не удалось соединиться с {smtp.SMTP_HOST}:{self.port} "

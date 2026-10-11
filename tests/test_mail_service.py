@@ -132,6 +132,15 @@ class MailServiceTest(unittest.TestCase):
         self.assertNotIn("Render", message)
         self.assertNotIn(SECRET, message)
 
+    def test_a_dropped_secure_connection_is_not_blamed_on_a_certificate(self):
+        error = ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:997)")
+        message = self.fail(self.make(error=error), 502)
+        self.assertIn("оборвалось", message)
+        for word in ("VPN", "антивирус", "check_cert", "MAILRU_PORT=587", "не пароль"):
+            self.assertIn(word, message)
+        self.assertNotIn("корневого сертификата", message)
+        self.assertNotIn(SECRET, message)
+
     def test_second_send_while_busy_is_refused(self):
         service = self.make()
         self.sender.gate = gate = threading.Event()
