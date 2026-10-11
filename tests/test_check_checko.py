@@ -1,20 +1,21 @@
 import errno
 import os
 import ssl
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import check_checko as cc
 
-OK, FAIL, NO_WAY = (True, "ответ получен (HTTP 403)"), (False, "SSLError: обрыв"), (None, "программы curl на этом компьютере нет")
+OK, FAIL, NO_WAY = (True, "ответ получен (HTTP 403)"), (False, "SSLError: обрыв"), (None, "способа нет")
 SITE_OK, SITE_FAIL = (True, "открылся (HTTP 200)"), (False, "SSLError")
 KEY = "SECRET-CHECKO-KEY-1"
 
 
-def probes(default=FAIL, no_proxy=FAIL, tls12=FAIL, curl=FAIL, dns=(True, "1.2.3.4"), tcp=(True, "порт 443 открыт"),
+def probes(default=FAIL, no_proxy=FAIL, bypass=FAIL, tls12=FAIL, curl=FAIL, dns=(True, "1.2.3.4"), tcp=(True, "порт 443 открыт"),
            proxies=None, key=(True, "ключ принят"), public_dns=(True, "1.2.3.4"), sites=SITE_OK):
-    modes = {"default": default, "no-proxy": no_proxy, "tls12": tls12, "curl": curl}
+    modes = {"default": default, "no-proxy": no_proxy, "bypass": bypass, "tls12": tls12, "curl": curl}
     return {"proxies": lambda: proxies or {}, "dns": lambda: dns, "tcp": lambda: tcp, "public_dns": lambda: public_dns,
             "tls": lambda tls12_only: (True, "шифрование установлено (TLSv1.3)"),
             "control": lambda url: sites, "api": lambda mode: modes[mode], "key": lambda k: key}
@@ -27,12 +28,17 @@ def text_of(**kw):
 
 class VerdictTest(unittest.TestCase):
     def test_all_good(self):
-        self.assertIn("работает так же, как в программе", text_of(default=OK, no_proxy=OK, tls12=OK, curl=OK))
+        self.assertIn("работает так же, как в программе", text_of(default=OK, no_proxy=OK, bypass=OK, tls12=OK, curl=OK))
 
     def test_only_without_proxy_works(self):
         text = text_of(no_proxy=OK, proxies={"https": "10.0.0.1:3128"})
         self.assertIn("БЕЗ прокси", text)
         self.assertIn("настроен прокси", text)
+
+    def test_only_the_direct_way_around_the_vpn_works(self):
+        text = text_of(bypass=OK)
+        self.assertIn("Checko закрыт для адреса вашего VPN", text)
+        self.assertIn("выключать VPN не нужно", text)
 
     def test_only_tls12_works(self):
         self.assertIn("TLS 1.2", text_of(tls12=OK))
@@ -46,6 +52,7 @@ class VerdictTest(unittest.TestCase):
     def test_nothing_works_but_other_sites_open_means_checko_closed_for_this_network(self):
         text = text_of(curl=NO_WAY)
         self.assertIn("api.checko.ru нет", text)
+        self.assertIn("kill switch", text)
         self.assertIn("раздача с телефона", text)
         self.assertIn("поддержку Checko", text)
 
@@ -79,7 +86,7 @@ class VerdictTest(unittest.TestCase):
 
 
 class OutputTest(unittest.TestCase):
-    def run_main(self, env_text, **kw):
+    def run_main(self, env_text, adapter=12, **kw):
         with tempfile.TemporaryDirectory() as tmp:
             env = os.path.join(tmp, "local.env")
             with open(env, "w", encoding="utf-8") as fh:
@@ -90,7 +97,8 @@ class OutputTest(unittest.TestCase):
                     mock.patch.object(cc, "probe_tcp", p["tcp"]), mock.patch.object(cc, "probe_tls", p["tls"]), \
                     mock.patch.object(cc, "probe_api", p["api"]), mock.patch.object(cc, "probe_key", p["key"]), \
                     mock.patch.object(cc, "probe_public_dns", p["public_dns"]), \
-                    mock.patch.object(cc, "probe_control", p["control"]):
+                    mock.patch.object(cc, "probe_control", p["control"]), \
+                    mock.patch.object(cc, "probe_adapter", lambda: adapter):
                 code = cc.main(["check_checko.py", env], out=lines.append)
         return code, "\n".join(lines)
 
@@ -107,9 +115,22 @@ class OutputTest(unittest.TestCase):
         _, out = self.run_main("", default=OK, curl=NO_WAY)
         for part in ("1. Адрес", "Публичный DNS", "2. Соединение", "3. Обычное шифрование", "3. Шифрование TLS 1.2",
                      "4. Другой сайт из Python, checko.ru", "4. Другой сайт из Python, ya.ru",
-                     "5. Запрос к API (как в программе)", "5. Запрос к API (без прокси)", "5. Запрос к API (с TLS 1.2)",
+                     "5. Запрос к API (как в программе)", "5. Запрос к API (без прокси)",
+                     "5. Запрос к API (в обход VPN, через сетевую карту)", "5. Запрос к API (с TLS 1.2)",
+                     "6. Сетевая карта для обхода VPN: найдена (номер 12)",
                      "5. Запрос к API (через curl, шифрование Windows): нет такого способа"):
             self.assertIn(part, out)
+
+    def test_the_exclusion_hint_names_both_pythons_only_when_the_connection_failed(self):
+        _, out = self.run_main("")
+        self.assertIn("добавьте туда", out)
+        self.assertIn(sys.executable, out)
+        _, out = self.run_main("", default=OK)
+        self.assertNotIn("добавьте туда", out)
+
+    def test_no_adapter_is_said_plainly(self):
+        _, out = self.run_main("", adapter=None)
+        self.assertIn("6. Сетевая карта для обхода VPN: не найдена", out)
 
     def test_a_computer_without_curl_is_not_a_failure_of_the_connection(self):
         code, _ = self.run_main("", curl=NO_WAY)

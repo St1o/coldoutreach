@@ -9,6 +9,7 @@ import errno
 import socket
 import ssl
 import sys
+from typing import Optional
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -21,9 +22,11 @@ from mailing import config
 HOST, PORT = "api.checko.ru", 443
 PROBE_KEY = "check-checko-probe"         # заведомо неверный ключ: для проверки соединения хватает любого ответа
 SAMPLE_INN = "7707083893"                # известная организация для одного настоящего запроса с вашим ключом
-MODES = ("default", "no-proxy", "tls12", "curl")
-MODE_NAMES = {"default": "как в программе", "no-proxy": "без прокси", "tls12": "с TLS 1.2",
-              "curl": "через curl, шифрование Windows"}
+MODES = ("default", "no-proxy", "bypass", "tls12", "curl")
+MODE_NAMES = {"default": "как в программе", "no-proxy": "без прокси", "bypass": "в обход VPN, через сетевую карту",
+              "tls12": "с TLS 1.2", "curl": "через curl, шифрование Windows"}
+NO_WAY = {"bypass": "настоящая сетевая карта не найдена (или это не Windows)",
+          "curl": "программы curl на этом компьютере нет"}
 CONTROL_SITES = (("checko.ru", "https://checko.ru/"), ("ya.ru", "https://ya.ru/"))
 DOH_URL = "https://dns.google/resolve"   # публичный DNS поверх HTTPS: чтобы сверить адрес, который отдаёт ваш DNS
 
@@ -113,13 +116,29 @@ def probe_api(mode: str, key: str = PROBE_KEY) -> tuple:
     """Запрос так, как его делает программа. Годится любой ответ сервера: даже «неверный ключ» значит, что связь есть."""
     session = checko_api.new_session(mode)
     if session is None:
-        return None, "программы curl на этом компьютере нет"
+        return None, NO_WAY.get(mode, "способа нет")
     try:
         response = session.get(checko_api.API_URL, params={"key": key, "inn": SAMPLE_INN, "source": "false"}, timeout=20)
     except Exception as exc:                          # любой сбой: ключ в тексте скрываем
         text = str(exc).replace(key, "***") if key else str(exc)
         return False, f"{type(exc).__name__}: {text[:160]}"
     return True, f"ответ получен (HTTP {response.status_code})"
+
+
+def probe_adapter() -> Optional[int]:
+    """Номер настоящей сетевой карты (Ethernet или Wi-Fi), через которую запросы идут в обход VPN."""
+    return checko_api.physical_interface_index()
+
+
+def exclusion_hint() -> str:
+    """Что добавить в исключения VPN, если у него есть раздельное туннелирование по программам. Venv-овский python.exe на
+    Windows запускает базовый, поэтому нужны оба пути."""
+    paths = []
+    for path in (sys.executable, getattr(sys, "_base_executable", "")):
+        if path and path not in paths:
+            paths.append(path)
+    return ("Если в вашем VPN есть исключения по программам (раздельное туннелирование), добавьте туда: "
+            + "; ".join(paths) + ". Или исключите адреса api.checko.ru и checko.ru.")
 
 
 def probe_key(key: str) -> tuple:
@@ -174,6 +193,10 @@ def verdict(report: Report) -> list:
     elif api["no-proxy"]:
         lines.append("С этого компьютера Checko не отвечает напрямую, но отвечает БЕЗ прокси. Мешает прокси или VPN: "
                      "отключите его или исключите api.checko.ru. Программа сама пробует путь без прокси.")
+    elif api["bypass"]:
+        lines.append("Checko закрыт для адреса вашего VPN, но открыт напрямую, через настоящую сетевую карту. Программа "
+                     "сама отправляет запросы к Checko в обход VPN: выключать VPN не нужно. Остальной интернет у вас "
+                     "по-прежнему идёт через VPN.")
     elif api["tls12"]:
         lines.append("Checko отвечает только при шифровании TLS 1.2: новое рукопожатие что-то обрывает по дороге "
                      "(антивирус, прокси, провайдер). Программа сама переключается на TLS 1.2.")
@@ -197,12 +220,13 @@ def verdict(report: Report) -> list:
                      "антивирус с проверкой защищённых соединений (Kaspersky, ESET, Dr.Web), программа обхода блокировок "
                      "(zapret, GoodbyeDPI) или VPN: отключите их на время проверки и запустите её снова.")
     else:
-        lines.append("Обычные сайты из Python открываются, а api.checko.ru нет: ни из Python, ни через curl соединение "
-                     "не устанавливается. Значит, адрес Checko API закрыт для вашей сети. Чаще всего так закрывают "
-                     "не российские адреса (VPN, зарубежный интернет) или это блокировка у провайдера. Проверьте с "
-                     "другого интернета (например, раздача с телефона) и без VPN: если заработает, причина в сети. "
-                     "Если не поможет, напишите в поддержку Checko, что запросы к api.checko.ru с вашего адреса "
-                     "обрываются при шифровании, и укажите свой внешний адрес.")
+        lines.append("Обычные сайты из Python открываются, а api.checko.ru нет: ни из Python, ни через curl, ни в обход "
+                     "VPN соединение не устанавливается. Значит, адрес Checko API закрыт для вашей сети. Чаще всего так "
+                     "закрывают не российские адреса (VPN, зарубежный интернет) или это блокировка у провайдера. "
+                     "Проверьте с другого интернета (например, раздача с телефона) и без VPN: если заработает, причина "
+                     "в сети. Если у VPN включена блокировка трафика вне VPN («kill switch»), она не даёт обойти его: "
+                     "выключите её или добавьте программу в исключения VPN (см. ниже). Если и это не поможет, напишите "
+                     "в поддержку Checko, что запросы к api.checko.ru с вашего адреса обрываются при шифровании.")
     if dns_mismatch(report):
         lines.append(f"Ваш DNS отдаёт для api.checko.ru адрес {', '.join(report.dns_ips)}, а публичный DNS - "
                      f"{report.public_dns[1]}: адрес, вероятно, подменён у провайдера или в настройках. Поставьте в "
@@ -243,9 +267,13 @@ def main(argv=None, out=print) -> int:
     for mode in MODES:
         ok, text = report.api[mode]
         out(f"5. Запрос к API ({MODE_NAMES[mode]}): {mark(ok)} - {text}")
+    index = probe_adapter()
+    out("6. Сетевая карта для обхода VPN: " + (f"найдена (номер {index})" if index else "не найдена"))
     out("")
     for line in verdict(report):
         out(line)
+    if not report.api["default"][0]:
+        out(exclusion_hint())
     return 0 if any(ok is True for ok, _ in report.api.values()) else 1
 
 

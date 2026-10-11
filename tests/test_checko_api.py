@@ -1,4 +1,9 @@
 import json
+import os
+import shutil
+import socket
+import ssl
+import struct
 import subprocess
 import unittest
 from unittest import mock
@@ -183,7 +188,7 @@ class TransportFallbackTest(unittest.TestCase):
     SSL = requests.exceptions.SSLError("Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol'))")
 
     def sessions(self, **by_mode):
-        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "tls12", "curl")}
+        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "bypass", "tls12", "curl")}
         patcher = mock.patch("checko_api.new_session", side_effect=lambda mode="default": made[mode] if mode in made else FakeSession(error=self.SSL))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -214,6 +219,13 @@ class TransportFallbackTest(unittest.TestCase):
         self.assertEqual((len(made["no-proxy"].calls), len(made["tls12"].calls)), (1, 1))     # сначала пробовали остальные
         api.company("2")
         self.assertEqual(len(made["curl"].calls), 2)
+
+    def test_bypassing_the_vpn_comes_before_tls12_and_curl(self):
+        made = self.sessions(bypass=FakeSession(FakeResponse(payload())))
+        api = CheckoApi(KEY)
+        self.assertTrue(api.company("1"))
+        self.assertEqual(api.mode, "bypass")
+        self.assertEqual((len(made["no-proxy"].calls), made["tls12"].calls, made["curl"].calls), (1, [], []))
 
     def test_a_computer_without_curl_just_skips_that_way(self):
         made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
@@ -337,6 +349,134 @@ class CurlSessionTest(unittest.TestCase):
         self.assertEqual(response.json()["data"]["НаимСокр"], "ООО ФИРМА")
         self.assertIn(f"key={KEY}", seen[0])
         self.assertIn("inn=7707083893", seen[0])
+
+
+class BypassVpnTest(unittest.TestCase):
+    """Запрос мимо VPN: поиск настоящей сетевой карты и соединение, привязанное к ней."""
+
+    def setUp(self):
+        checko_api._physical_index_cache.clear()
+        self.addCleanup(checko_api._physical_index_cache.clear)
+
+    def run_powershell(self, stdout=b'{"ifIndex":12,"NextHop":"192.168.1.1"}', code=0, error=None):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if error:
+                raise error
+            return subprocess.CompletedProcess(command, code, stdout, b"")
+
+        with mock.patch("checko_api._is_windows", return_value=True), mock.patch("checko_api.subprocess.run", fake_run):
+            return checko_api.physical_interface_index(), calls
+
+    def test_not_windows_means_no_such_way_and_no_command_is_run(self):
+        with mock.patch("checko_api.subprocess.run") as run:
+            self.assertIsNone(checko_api.physical_interface_index())
+        run.assert_not_called()
+
+    def test_the_physical_adapter_is_read_from_powershell_without_admin_rights(self):
+        index, calls = self.run_powershell()
+        self.assertEqual(index, 12)
+        command = calls[0]
+        self.assertEqual(command[0], "powershell")
+        self.assertIn("-NoProfile", command)
+        self.assertIn("Get-NetAdapter -Physical", command[-1])                 # только настоящие карты, без туннелей VPN
+        self.assertIn("0.0.0.0/0", command[-1])
+
+    def test_the_answer_is_remembered(self):
+        with mock.patch("checko_api._is_windows", return_value=True), \
+                mock.patch("checko_api.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b'{"ifIndex":7}', b"")) as run:
+            self.assertEqual((checko_api.physical_interface_index(), checko_api.physical_interface_index()), (7, 7))
+        self.assertEqual(run.call_count, 1)
+
+    def test_no_adapter_or_broken_output_is_no_such_way(self):
+        for stdout, code in ((b"", 0), (b"not json", 0), (b'{"NextHop":"1.1.1.1"}', 0), (b'{"ifIndex":3}', 1)):
+            checko_api._physical_index_cache.clear()
+            self.assertIsNone(self.run_powershell(stdout, code)[0], (stdout, code))
+        checko_api._physical_index_cache.clear()
+        self.assertIsNone(self.run_powershell(error=OSError("нет powershell"))[0])
+
+    def test_the_session_exists_only_when_there_is_an_adapter(self):
+        with mock.patch("checko_api.physical_interface_index", return_value=None):
+            self.assertIsNone(checko_api.new_session("bypass"))
+        with mock.patch("checko_api.physical_interface_index", return_value=12):
+            session = checko_api.new_session("bypass")
+        self.assertIsInstance(session, checko_api._BoundSession)
+        self.assertEqual(session.if_index, 12)
+        self.assertTrue(session.context.check_hostname)                         # проверка сертификата не отключена
+
+    def test_the_socket_is_pinned_to_the_adapter_before_connecting(self):
+        recorded = []
+
+        class FakeSocket:
+            def __init__(self, *args):
+                recorded.append(("created",))
+
+            def setsockopt(self, *args):
+                recorded.append(("setsockopt",) + args)
+
+            def settimeout(self, value):
+                recorded.append(("settimeout", value))
+
+            def connect(self, address):
+                recorded.append(("connect", address))
+                raise OSError("нет пути")
+
+            def close(self):
+                recorded.append(("close",))
+
+        conn = checko_api._BoundHTTPSConnection("localhost", 443, 12, 5, ssl.create_default_context())
+        with mock.patch("checko_api.socket.socket", FakeSocket), self.assertRaises(OSError):
+            conn.connect()
+        option = [item for item in recorded if item[0] == "setsockopt"][0]
+        self.assertEqual(option[1:], (socket.IPPROTO_IP, 31, struct.pack("!I", 12)))   # IP_UNICAST_IF, номер карты в сетевом порядке
+        self.assertLess(recorded.index(option), recorded.index([i for i in recorded if i[0] == "connect"][0]))
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl на этом компьютере нет")
+    def test_a_request_through_the_bound_connection_with_a_real_tls_server(self):
+        import http.server
+        import tempfile
+        import threading
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cert, key = os.path.join(tmp.name, "c.pem"), os.path.join(tmp.name, "k.pem")
+        made = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                               "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                              capture_output=True)
+        if made.returncode != 0:
+            self.skipTest("openssl не создал сертификат")
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Host")))
+                body = json.dumps(payload()).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(cert, key)
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = server_context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"https://localhost:{server.server_port}/v2/company"
+
+        trusting = ssl.create_default_context(cafile=cert)
+        response = checko_api._BoundSession(1, trusting, bind=False).get(url, {"key": KEY, "inn": "7707083893"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["НаимСокр"], "ООО ФИРМА")
+        self.assertIn("key=" + KEY, seen[0][0])
+        with self.assertRaises(requests.exceptions.ConnectionError) as ctx:      # сертификат не доверенный: обрыв, не «успех»
+            checko_api._BoundSession(1, ssl.create_default_context(), bind=False).get(url, {})
+        self.assertIn("в обход VPN", str(ctx.exception))
 
 
 if __name__ == "__main__":

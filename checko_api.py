@@ -15,11 +15,14 @@
 Ключ в адрес запроса попадает, поэтому во всех сообщениях об ошибках он заменяется на ***.
 Лимит API - 32 запроса в секунду с адреса, бесплатно 100 запросов в сутки (по документации Checko).
 """
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import ssl
+import struct
 import subprocess
 import urllib.parse
 from dataclasses import dataclass
@@ -172,7 +175,7 @@ def find_curl() -> Optional[str]:
     return shutil.which("curl")
 
 
-class _CurlResponse:
+class _PlainResponse:
     def __init__(self, status: int, body: str):
         self.status_code, self._body = status, body
 
@@ -203,18 +206,102 @@ class _CurlSession:
             raise requests.exceptions.ConnectionError(f"curl: {reason[:150]}")
         body, _, status = done.stdout.decode("utf-8", errors="replace").rpartition("\n")
         try:
-            return _CurlResponse(int(status), body)
+            return _PlainResponse(int(status), body)
         except ValueError:
             raise requests.exceptions.ConnectionError("curl вернул ответ не в том виде") from None
 
 
-# Если обычное соединение обрывается, пробуем без системных настроек прокси, потом с TLS 1.2, потом через системный
-# curl. Что сработало, то остаётся до конца работы программы.
-FALLBACK_MODES = ("no-proxy", "tls12", "curl")
+IP_UNICAST_IF = 31          # параметр сокета Windows: слать пакеты через указанную сетевую карту, а не по таблице маршрутов
+
+_PHYSICAL_ROUTE = (
+    "$ErrorActionPreference='Stop';"
+    "$phys=@(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex });"
+    "$r=Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object { $phys -contains $_.ifIndex } "
+    "| Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1;"
+    "if ($r) { @{ ifIndex=[int]$r.ifIndex; NextHop=[string]$r.NextHop } | ConvertTo-Json -Compress }")
+_physical_index_cache = []
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def physical_interface_index() -> Optional[int]:
+    """Номер настоящей (не виртуальной) сетевой карты с выходом в интернет: Ethernet или Wi-Fi, а не туннель VPN.
+    Только Windows, права администратора не нужны. Нет такой карты или не Windows - None."""
+    if not _is_windows():
+        return None
+    if not _physical_index_cache:
+        index = None
+        try:
+            done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _PHYSICAL_ROUTE],
+                                  capture_output=True, timeout=25,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if done.returncode == 0:
+                index = int(json.loads(done.stdout.decode("utf-8", errors="replace"))["ifIndex"])
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            index = None
+        _physical_index_cache.append(index)
+    return _physical_index_cache[0]
+
+
+class _BoundHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS-соединение, привязанное к сетевой карте: на Windows IP_UNICAST_IF уводит его мимо туннеля VPN, у которого
+    маршрут по умолчанию выше. Только IPv4 (параметр для IPv4 задаётся в сетевом порядке байтов)."""
+
+    def __init__(self, host, port, if_index, timeout, context, bind=True):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self.if_index, self._bind = if_index, bind
+
+    def connect(self):
+        errors = []
+        for family, kind, proto, _, address in socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM):
+            sock = socket.socket(family, kind, proto)
+            try:
+                if self._bind:
+                    sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", self.if_index))
+                sock.settimeout(self.timeout)
+                sock.connect(address)
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                return
+            except OSError as exc:
+                sock.close()
+                errors.append(exc)
+        raise errors[-1] if errors else OSError("адрес не найден")
+
+
+class _BoundSession:
+    """Запрос в обход VPN: напрямую через настоящую сетевую карту (см. _BoundHTTPSConnection)."""
+
+    def __init__(self, if_index: int, context: Optional[ssl.SSLContext] = None, bind: bool = True):
+        self.if_index, self.bind = if_index, bind
+        self.context = context or ssl.create_default_context()          # проверка сертификата включена
+
+    def get(self, url, params=None, timeout=20.0):
+        parts = urllib.parse.urlsplit(url)
+        query = urllib.parse.urlencode(params or {})
+        conn = _BoundHTTPSConnection(parts.hostname, parts.port or 443, self.if_index, timeout, self.context, self.bind)
+        try:
+            conn.request("GET", parts.path + ("?" + query if query else ""),
+                         headers={"Accept": "application/json", "User-Agent": "coldoutreach", "Connection": "close"})
+            response = conn.getresponse()
+            return _PlainResponse(response.status, response.read().decode("utf-8", errors="replace"))
+        except (OSError, http.client.HTTPException) as exc:             # включая обрыв шифрования
+            raise requests.exceptions.ConnectionError(f"в обход VPN: {type(exc).__name__}: {exc}"[:150]) from None
+        finally:
+            conn.close()
+
+
+# Если обычное соединение обрывается, пробуем без системных настроек прокси, потом в обход VPN (напрямую через сетевую
+# карту), потом с TLS 1.2, потом через системный curl. Что сработало, то остаётся до конца работы программы.
+FALLBACK_MODES = ("no-proxy", "bypass", "tls12", "curl")
 
 
 def new_session(mode: str = "default"):
-    """Сеанс для запросов. Режим curl возвращает None, если curl на компьютере нет."""
+    """Сеанс для запросов. Режимы curl и bypass возвращают None, если curl или подходящей сетевой карты нет."""
+    if mode == "bypass":
+        index = physical_interface_index()
+        return _BoundSession(index) if index else None
     if mode == "curl":
         path = find_curl()
         return _CurlSession(path) if path else None
