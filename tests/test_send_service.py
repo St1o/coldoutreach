@@ -267,9 +267,16 @@ class TwoMailboxesTest(ServiceCase):
     def test_the_date_of_the_first_letter_is_part_of_the_picture(self):
         cfg.save_settings({"mailboxes": {"2": {"first_message": "2026-01-01"}}}, self.settings)
         box = self.service.mailbox_infos()[1]
-        self.assertEqual((box["first_message"], box["source"]), ("2026-01-01", "задана вручную"))
+        self.assertEqual((box["first_message"], box["source"]), ("2026-01-01", "задана на странице /mail"))
         self.assertEqual(box["room"], 40)                          # давно прогрет: действует только лимит в сутки
         self.assertEqual((box["week"], box["week_cap"]), (3, 40))
+
+    def test_a_date_written_once_in_local_env_covers_both_mailboxes_and_the_page_shows_where_it_came_from(self):
+        env = {"MAIL_FIRST_MESSAGE": "2026-01-01", "MAIL_FIRST_MESSAGE_2": "2026-01-02"}
+        with mock.patch.dict(os.environ, env):
+            first, second = self.service.mailbox_infos()
+        self.assertEqual([(box["first_message"], box["source"], box["week_cap"]) for box in (first, second)],
+                         [("2026-01-01", "задана в local.env", 40), ("2026-01-02", "задана в local.env", 40)])
 
     def test_the_week_cap_limits_what_the_page_promises_for_today(self):
         cfg.save_settings({"mailboxes": {"1": {"first_message": "2026-01-01"}}}, self.settings)   # ящик 1 давно прогрет

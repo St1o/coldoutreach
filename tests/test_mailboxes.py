@@ -69,6 +69,18 @@ class LoadMailboxesTest(unittest.TestCase):
         self.assertIn("полный адрес", " ".join(boxes.problems([Mailbox("2", "не адрес", PW2)])))
 
 
+class DateInLocalEnvProblemTest(unittest.TestCase):
+    def test_a_broken_date_is_reported_by_name_without_secrets(self):
+        env = {"MAIL_FIRST_MESSAGE": "2026-10-10", "MAIL_FIRST_MESSAGE_2": "вчера"}
+        text = " ".join(boxes.problems(two_boxes(), environ=env))
+        self.assertIn("MAIL_FIRST_MESSAGE_2", text)
+        self.assertNotIn("MAIL_FIRST_MESSAGE ", text)
+        for secret in (PW1, PW2, FIRST, SECOND):
+            self.assertNotIn(secret, text)
+        self.assertEqual(boxes.problems(two_boxes(), environ={"MAIL_FIRST_MESSAGE_2": "2026-10-12"}), [])
+        self.assertEqual(boxes.problems(two_boxes(), environ={"MAIL_FIRST_MESSAGE_2": " "}), [])      # пусто - не ошибка
+
+
 class SelectTest(unittest.TestCase):
     def test_default_is_all_ready_mailboxes(self):
         self.assertEqual([b.id for b in boxes.select(two_boxes())], ["1", "2"])
@@ -194,6 +206,27 @@ class MailboxStateTest(unittest.TestCase):
         self.journal("letters_1.sent.json", {"a@x.ru": sent_entry("2026-10-11", "2")})
         state = self.state(settings={"mailboxes": {"2": {"first_message": "2026-10-08"}}})
         self.assertEqual((state["day"], state["quota"], state["source"]), (5, 15, boxes.SOURCE_SETTING))   # 19 по росту, 15 по неделе
+
+    def test_a_date_in_local_env_beats_the_journal_and_loses_to_the_page(self):
+        self.journal("letters_1.sent.json", {"a@x.ru": sent_entry("2026-10-11", "2")})
+        env = {"MAIL_FIRST_MESSAGE_2": "2026-10-09"}
+        with mock.patch.dict(os.environ, env):
+            state = self.state()
+            self.assertEqual((state["first_message"], state["source"], state["day"]), ("2026-10-09", boxes.SOURCE_ENV, 4))
+            site = {"mailboxes": {"2": {"first_message": "2026-10-10"}}}
+            state = self.state(settings=site)
+            self.assertEqual((state["first_message"], state["source"], state["day"]), ("2026-10-10", boxes.SOURCE_SETTING, 3))
+
+    def test_each_mailbox_reads_its_own_variable_and_a_broken_value_is_skipped(self):
+        env = {"MAIL_FIRST_MESSAGE": "2026-10-10", "MAIL_FIRST_MESSAGE_2": "2026-10-12"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual((self.state("1")["day"], self.state("1")["quota"]), (3, 13))      # 12 октября: день 3 -> 13
+            self.assertEqual((self.state("2")["day"], self.state("2")["quota"]), (1, 7))
+        with mock.patch.dict(os.environ, {"MAIL_FIRST_MESSAGE_2": "вчера"}):
+            state = self.state()
+            self.assertEqual((state["day"], state["source"]), (1, boxes.SOURCE_NONE))
+        self.assertEqual((boxes.first_message_env(1), boxes.first_message_env(2), boxes.first_message_env(5)),
+                         ("MAIL_FIRST_MESSAGE", "MAIL_FIRST_MESSAGE_2", "MAIL_FIRST_MESSAGE_5"))
 
     def test_the_daily_limit_still_caps_the_quota_and_the_rolling_day(self):
         settings = {"mailboxes": {"2": {"first_message": "2026-09-01"}}}      # давно прогретый ящик
@@ -573,6 +606,27 @@ class MainWithMailboxesTest(unittest.TestCase):
         self.assertNotIn("Писем в таблице", out.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(mailer.main([folder, "--env", self.env]), 1)       # без --status папку не принимаем
+
+    def test_dates_written_once_in_local_env_show_in_the_status_and_a_broken_one_stops_a_real_send(self):
+        today = boxes.today_msk()
+        self.write_env(extra=f"MAIL_FIRST_MESSAGE={(today - timedelta(days=2)).isoformat()}\n"
+                             f"MAIL_FIRST_MESSAGE_2={today.isoformat()}\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = mailer.main([os.path.dirname(self.table.path), "--status", "--env", self.env, "--settings", self.settings])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(code, 0)
+        self.assertIn("день прогрева 3 (неделя 1, жёсткий предел недели 15), на сегодня можно 13", lines[0])
+        self.assertIn(f"первое письмо {(today - timedelta(days=2)).isoformat()} (задана в local.env)", lines[0])
+        self.assertIn("день прогрева 1 (неделя 1, жёсткий предел недели 15), на сегодня можно 7", lines[1])
+        for key in ("MAIL_FIRST_MESSAGE", "MAIL_FIRST_MESSAGE_2"):
+            os.environ.pop(key, None)
+        self.write_env(extra="MAIL_FIRST_MESSAGE_2=завтра\n")
+        with mock.patch.object(mailer, "run") as fake_run:
+            code, text = self.main("--send")
+        self.assertEqual(code, 1)
+        self.assertIn("MAIL_FIRST_MESSAGE_2", text)
+        fake_run.assert_not_called()
 
     def test_status_of_a_data_folder_shows_the_week_cap_of_each_mailbox(self):
         self.write_env()

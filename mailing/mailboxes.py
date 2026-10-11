@@ -7,8 +7,9 @@
 7 писем, в каждый следующий на 3 больше (7, 10, 13, …), но не больше жёсткого предела недели прогрева (дни 1-7: 15,
 дни 8-14: 30, с дня 15: 40; зашит в программу и от настройки на /mail не зависит) и не больше лимита в сутки
 (страница /mail, по умолчанию 40, может быть только ниже предела недели; выше 50 его не поставить).
-Дату можно задать на странице /mail (settings.json); если не задана, это день самого раннего письма ящика в журнале,
-а если писем ещё не было, прогрев начинается сегодня."""
+Дату первого письма можно записать один раз в local.env рядом с ящиками (MAIL_FIRST_MESSAGE, MAIL_FIRST_MESSAGE_2, …,
+формат ГГГГ-ММ-ДД) или задать на странице /mail (settings.json, главнее local.env); если не задана нигде, это день самого
+раннего письма ящика в журнале, а если писем ещё не было, прогрев начинается сегодня."""
 import math
 import os
 from collections import Counter
@@ -28,7 +29,9 @@ WARMUP_WEEK_CAPS = ((7, 15), (14, 30))
 WARMUP_CAP_LATER = 40             # с дня 15 (с третьей недели) и дальше
 SETTINGS_KEY = "mailboxes"        # settings.json: {"mailboxes": {"2": {"first_message": "2026-10-12"}}}
 FIRST_KEY = "first_message"
-SOURCE_SETTING, SOURCE_JOURNAL, SOURCE_NONE = "задана вручную", "по журналу отправки", "ещё не отправляли"
+FIRST_ENV = "MAIL_FIRST_MESSAGE"          # local.env: дата первого письма ящика 1; ящика 2 - MAIL_FIRST_MESSAGE_2 и т. д.
+SOURCE_SETTING, SOURCE_ENV = "задана на странице /mail", "задана в local.env"
+SOURCE_JOURNAL, SOURCE_NONE = "по журналу отправки", "ещё не отправляли"
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,11 @@ def env_names(number: int) -> tuple:
     return f"MAILRU_USER{suffix}", f"MAILRU_APP_PASSWORD{suffix}", f"MAIL_FROM_NAME{suffix}"
 
 
+def first_message_env(number: int) -> str:
+    """Имя переменной local.env с датой первого письма ящика номер number: MAIL_FIRST_MESSAGE, MAIL_FIRST_MESSAGE_2, …"""
+    return FIRST_ENV + env_suffix(number)
+
+
 def load_mailboxes(environ=None) -> list:
     """Ящики из окружения (после load_env_file): в порядке номеров, только те, где вписано хоть что-то.
     Имя отправителя второго и следующих ящиков по умолчанию как у первого."""
@@ -78,11 +86,16 @@ def load_mailboxes(environ=None) -> list:
     return boxes
 
 
-def problems(boxes) -> list:
+def problems(boxes, environ=None) -> list:
     """Что не так с настройкой ящиков (без паролей и адресов получателей): пусто - всё в порядке."""
+    environ = os.environ if environ is None else environ
     found, seen = [], {}
     for box in boxes:
         user_key, password_key, _ = env_names(int(box.id))
+        date_key = first_message_env(int(box.id))
+        if environ.get(date_key, "").strip() and parse_day(environ[date_key]) is None:
+            found.append(f"{box.label}: в local.env {date_key} должна быть дата ГГГГ-ММ-ДД, например 2026-10-10 "
+                         "(или удалите эту строку).")
         if not box.ready:
             found.append(f"{box.label}: впишите оба значения в local.env: {user_key} (полный адрес ящика) и "
                          f"{password_key} («пароль для внешних приложений»).")
@@ -133,13 +146,18 @@ def parse_day(raw) -> Optional[date]:
         return None
 
 
-def first_message_day(folder: str, settings: dict, mailbox_id: str):
-    """(день первого письма ящика, откуда он известен): задан на странице /mail, иначе по журналу, иначе нет."""
+def first_message_day(folder: str, settings: dict, mailbox_id: str, environ=None):
+    """(день первого письма ящика, откуда он известен): задан на странице /mail, иначе в local.env
+    (MAIL_FIRST_MESSAGE, MAIL_FIRST_MESSAGE_2, …), иначе по журналу, иначе нет. Испорченное значение пропускается."""
+    environ = os.environ if environ is None else environ
     boxes = settings.get(SETTINGS_KEY)
     entry = boxes.get(str(mailbox_id)) if isinstance(boxes, dict) else None
     chosen = parse_day(entry.get(FIRST_KEY, "")) if isinstance(entry, dict) else None
     if chosen:
         return chosen, SOURCE_SETTING
+    from_env = parse_day(environ.get(first_message_env(int(mailbox_id)), ""))
+    if from_env:
+        return from_env, SOURCE_ENV
     logged = journal.first_sent_day(folder, mailbox_id)
     return (logged, SOURCE_JOURNAL) if logged else (None, SOURCE_NONE)
 
