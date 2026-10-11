@@ -18,13 +18,12 @@ def check_email(address: str) -> bool:
 
 
 def read_stoplist(path: str) -> frozenset:
-    """Стоп-лист: по строке на адрес или на домен целиком (@example.ru); пустые строки и строки с # пропускаются."""
+    """Стоп-лист: адреса и домены целиком (@example.ru). Можно по одному в строке, можно несколько в строке через запятую,
+    точку с запятой или пробел; пустые строки и всё после # пропускаются."""
     entries = set()
     with open(path, encoding="utf-8-sig") as fh:
         for line in fh:
-            line = line.split("#", 1)[0].strip().lower()
-            if line:
-                entries.add(line)
+            entries.update(part for part in re.split(r"[,;\s]+", line.split("#", 1)[0].lower()) if part)
     return frozenset(entries)
 
 

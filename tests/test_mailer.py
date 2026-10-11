@@ -305,6 +305,13 @@ class StoplistTest(unittest.TestCase):
     def path(self, name):
         return os.path.join(self.dir.name, name)
 
+    def test_several_entries_in_one_line_split_by_comma_semicolon_or_space(self):
+        with open(self.path("stoplist.txt"), "w", encoding="utf-8-sig") as fh:
+            fh.write("One@Yandex.ru,fort4@x.ru, fort5@x.ru ; @reg.ru   # три адреса и домен\ntwo@x.ru\n")
+        stop = cfg.read_stoplist(self.path("stoplist.txt"))
+        self.assertEqual(stop, {"one@yandex.ru", "fort4@x.ru", "fort5@x.ru", "@reg.ru", "two@x.ru"})
+        self.assertTrue(cfg.is_stopped("FORT5@x.ru", stop))
+
     def test_reads_addresses_domains_comments_and_case(self):
         with open(self.path("stoplist.txt"), "w", encoding="utf-8-sig") as fh:
             fh.write("# отписались\nBad@Mail.ru\n\n@registrar.ru  # сервис регистрации\n")
