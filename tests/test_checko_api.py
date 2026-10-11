@@ -385,7 +385,7 @@ class BypassVpnTest(unittest.TestCase):
             return checko_api.adapter_candidates(), calls
 
     def test_not_windows_means_no_such_way_and_no_command_is_run(self):
-        with mock.patch("checko_api.subprocess.run") as run:
+        with mock.patch("checko_api._is_windows", return_value=False), mock.patch("checko_api.subprocess.run") as run:
             self.assertEqual(checko_api.adapter_candidates(), ([], "это не Windows"))
             self.assertIsNone(checko_api.physical_interface_index())
         run.assert_not_called()
@@ -499,16 +499,19 @@ class BypassVpnTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "root.crt")
             open(path, "w").close()
+            # На Windows create_default_context сам зовёт load_verify_locations(cadata=...) для хранилища системы:
+            # считаем только вызовы со своим файлом (cafile=...), чтобы тест не зависел от системы.
+            own = lambda load: [c for c in load.call_args_list if "cafile" in c.kwargs]
             with mock.patch.object(ssl.SSLContext, "load_verify_locations") as load:
                 with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": path}):
                     checko_api.own_ca_context()
-                load.assert_called_once_with(cafile=path)
+                self.assertEqual(own(load), [mock.call(cafile=path)])
                 load.reset_mock()
                 with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": os.path.join(tmp, "нет.crt")}):
                     checko_api.own_ca_context()                # файла нет - обычная проверка
                 with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": ""}):
                     checko_api.own_ca_context()
-                load.assert_not_called()
+                self.assertEqual(own(load), [])
 
     def test_the_session_exists_only_when_there_is_an_adapter(self):
         with mock.patch("checko_api.physical_interface_index", return_value=None):
