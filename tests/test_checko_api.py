@@ -5,6 +5,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -188,7 +189,7 @@ class TransportFallbackTest(unittest.TestCase):
     SSL = requests.exceptions.SSLError("Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol'))")
 
     def sessions(self, **by_mode):
-        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "bypass", "tls12", "curl")}
+        made = {mode: by_mode.get(mode, FakeSession(error=self.SSL)) for mode in ("no-proxy", "bypass", "bypass-os", "tls12", "curl")}
         patcher = mock.patch("checko_api.new_session", side_effect=lambda mode="default": made[mode] if mode in made else FakeSession(error=self.SSL))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -226,6 +227,13 @@ class TransportFallbackTest(unittest.TestCase):
         self.assertTrue(api.company("1"))
         self.assertEqual(api.mode, "bypass")
         self.assertEqual((len(made["no-proxy"].calls), made["tls12"].calls, made["curl"].calls), (1, [], []))
+
+    def test_windows_own_certificate_check_comes_right_after_the_plain_bypass(self):
+        made = self.sessions(**{"bypass-os": FakeSession(FakeResponse(payload()))})
+        api = CheckoApi(KEY)
+        self.assertTrue(api.company("1"))
+        self.assertEqual(api.mode, "bypass-os")
+        self.assertEqual((len(made["bypass"].calls), made["tls12"].calls, made["curl"].calls), (1, [], []))
 
     def test_a_computer_without_curl_just_skips_that_way(self):
         made = self.sessions(tls12=FakeSession(FakeResponse(payload())))
@@ -442,6 +450,65 @@ class BypassVpnTest(unittest.TestCase):
         modem = dict(self.ETHERNET, Name="Ethernet 3", Description="Remote NDIS based Internet Sharing Device", Hardware=False)
         self.assertEqual(checko_api.pick_adapter([self.TUNNEL, modem])["ifIndex"], 12)
         self.assertEqual(checko_api.pick_adapter([modem, self.ETHERNET])["ifIndex"], 12)      # настоящая карта всё же главнее
+
+    def test_cert_errors_are_explained_in_plain_words_with_the_original_text(self):
+        def error(message):
+            exc = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] " + message)
+            exc.verify_message = message
+            return exc
+
+        text = checko_api.describe_cert_error(error("unable to get local issuer certificate"))
+        self.assertIn("неполную цепочку", text)
+        self.assertIn("[unable to get local issuer certificate]", text)
+        self.assertIn("самоподписанный", checko_api.describe_cert_error(error("self-signed certificate")))
+        self.assertIn("самоподписанный", checko_api.describe_cert_error(error("self signed certificate in certificate chain")))
+        self.assertIn("истёк", checko_api.describe_cert_error(error("certificate has expired")))
+        self.assertIn("другое имя", checko_api.describe_cert_error(error("Hostname mismatch, certificate is not valid for 'x'")))
+        self.assertEqual(checko_api.describe_cert_error(error("что-то новое")), "что-то новое")
+
+    def test_a_refused_certificate_is_reported_as_a_certificate_problem_not_a_dropped_connection(self):
+        class Refusing:
+            def get(self, *args, **kwargs):
+                raise AssertionError("не должен вызываться: проверяем _BoundSession ниже")
+
+        exc = ssl.SSLCertVerificationError(1, "x")
+        exc.verify_message = "unable to get local issuer certificate"
+        with mock.patch("checko_api.open_bound_socket", side_effect=exc):
+            with self.assertRaises(requests.exceptions.ConnectionError) as ctx:
+                checko_api._BoundSession(12, ssl.create_default_context()).get("https://api.checko.ru/v2/company")
+        self.assertIn("сертификат не принят", str(ctx.exception))
+        self.assertIn("неполную цепочку", str(ctx.exception))
+
+    def test_windows_certificate_check_needs_truststore_and_an_adapter(self):
+        with mock.patch("checko_api.physical_interface_index", return_value=12):
+            with mock.patch("checko_api.os_trust_context", return_value=None):
+                self.assertIsNone(checko_api.new_session("bypass-os"))
+            marker = ssl.create_default_context()
+            with mock.patch("checko_api.os_trust_context", return_value=marker):
+                session = checko_api.new_session("bypass-os")
+        self.assertIs(session.context, marker)
+        with mock.patch("checko_api.physical_interface_index", return_value=None):
+            self.assertIsNone(checko_api.new_session("bypass-os"))
+
+    def test_os_trust_context_uses_truststore(self):
+        context = checko_api.os_trust_context()
+        self.assertIsNotNone(context)                       # пакет truststore есть в requirements.txt
+        self.assertTrue(context.check_hostname)
+
+    def test_an_own_root_certificate_can_be_added_for_the_bypass_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "root.crt")
+            open(path, "w").close()
+            with mock.patch.object(ssl.SSLContext, "load_verify_locations") as load:
+                with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": path}):
+                    checko_api.own_ca_context()
+                load.assert_called_once_with(cafile=path)
+                load.reset_mock()
+                with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": os.path.join(tmp, "нет.crt")}):
+                    checko_api.own_ca_context()                # файла нет - обычная проверка
+                with mock.patch.dict(os.environ, {"CHECKO_CA_FILE": ""}):
+                    checko_api.own_ca_context()
+                load.assert_not_called()
 
     def test_the_session_exists_only_when_there_is_an_adapter(self):
         with mock.patch("checko_api.physical_interface_index", return_value=None):

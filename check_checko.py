@@ -6,9 +6,12 @@
 один настоящий запрос (это 1 из 100 бесплатных запросов в сутки), чтобы проверить сам ключ.
 """
 import errno
+import os
+import re
 import socket
 import ssl
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -21,11 +24,17 @@ from mailing import config
 HOST, PORT = "api.checko.ru", 443
 PROBE_KEY = "check-checko-probe"         # заведомо неверный ключ: для проверки соединения хватает любого ответа
 SAMPLE_INN = "7707083893"                # известная организация для одного настоящего запроса с вашим ключом
-MODES = ("default", "no-proxy", "bypass", "tls12", "curl")
+MODES = ("default", "no-proxy", "bypass", "bypass-os", "tls12", "curl")
 MODE_NAMES = {"default": "как в программе", "no-proxy": "без прокси", "bypass": "в обход VPN, через сетевую карту",
-              "tls12": "с TLS 1.2", "curl": "через curl, шифрование Windows"}
+              "bypass-os": "в обход VPN, сертификат проверяет Windows", "tls12": "с TLS 1.2",
+              "curl": "через curl, шифрование Windows"}
 NO_WAY = {"bypass": "настоящая сетевая карта не найдена (или это не Windows)",
+          "bypass-os": "нужны сетевая карта и пакет truststore (pip install -r requirements.txt)",
           "curl": "программы curl на этом компьютере нет"}
+RUSSIAN_CA = re.compile(r"russian trusted|минцифр|российск", re.IGNORECASE)
+ANTIVIRUS_CA = re.compile(r"kaspersky|eset|avast|\bavg\b|dr\.?web|bitdefender|fortinet|zscaler|mcafee|norton|sophos|"
+                          r"trend micro|panda|comodo|cisco umbrella|securly", re.IGNORECASE)
+RUSSIAN_ROOT_URL = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
 CONTROL_SITES = (("checko.ru", "https://checko.ru/"), ("ya.ru", "https://ya.ru/"))
 DOH_URL = "https://dns.google/resolve"   # публичный DNS поверх HTTPS: чтобы сверить адрес, который отдаёт ваш DNS
 
@@ -40,6 +49,8 @@ class Report:
     tls: dict = field(default_factory=dict)          # "default" / "tls12" -> (ok, текст)
     control: dict = field(default_factory=dict)      # сайт -> (ok, текст): обычные сайты из Python
     api: dict = field(default_factory=dict)          # режим -> (ok, текст); ok None - способа нет на этом компьютере
+    adapters: dict = field(default_factory=lambda: {"candidates": [], "error": "", "chosen": None})
+    cert: dict = None                                # сертификат, присланный через сетевую карту (см. probe_certificate)
     key: tuple = None                                # (ok, текст) или None, если ключа нет
 
 
@@ -158,6 +169,84 @@ def exclusion_hint() -> str:
             + "; ".join(paths) + ". Или исключите адреса api.checko.ru и checko.ru.")
 
 
+def describe_name(name) -> str:
+    return ", ".join(f"{key}={value}" for part in name for key, value in part)
+
+
+def probe_certificate(card) -> dict:
+    """Сертификат, который присылает api.checko.ru при соединении через сетевую карту (в обход VPN): проверка Python и то,
+    что в сертификате написано (для чтения проверка выключена, ключ и данные при этом не передаются)."""
+    result = {"verified": None, "verify_error": "", "error": "", "subject": "", "issuer": "", "valid": ""}
+    if not card:
+        result["error"] = "нет подходящей сетевой карты"
+        return result
+    index = card["ifIndex"]
+    try:
+        sock = checko_api.open_bound_socket(HOST, PORT, index, 15)
+        with ssl.create_default_context().wrap_socket(sock, server_hostname=HOST):
+            result["verified"] = True
+    except ssl.SSLCertVerificationError as exc:
+        result["verified"], result["verify_error"] = False, checko_api.describe_cert_error(exc)
+    except OSError as exc:
+        result["error"] = describe_tls_error(exc)
+        return result
+    context = ssl.create_default_context()
+    context.check_hostname, context.verify_mode = False, ssl.CERT_NONE        # только чтение сертификата
+    try:
+        sock = checko_api.open_bound_socket(HOST, PORT, index, 15)
+        with context.wrap_socket(sock, server_hostname=HOST) as tls:
+            der = tls.getpeercert(binary_form=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "server.pem")
+            with open(path, "w") as fh:
+                fh.write(ssl.DER_cert_to_PEM_cert(der))
+            info = ssl._ssl._test_decode_cert(path)       # служебная функция: в новых Python может исчезнуть
+        result["subject"] = describe_name(info.get("subject", ()))
+        result["issuer"] = describe_name(info.get("issuer", ()))
+        result["valid"] = f"{info.get('notBefore')} - {info.get('notAfter')}"
+    except Exception as exc:
+        result["error"] = result["error"] or f"сертификат прочитать не удалось ({type(exc).__name__})"
+    return result
+
+
+def cert_lines(cert) -> list:
+    if not cert:
+        return []
+    lines = ["7. Сертификат, который присылает Checko через сетевую карту (в обход VPN):"]
+    if cert["error"] and not cert["issuer"]:
+        return lines + ["   не получен: " + cert["error"]]
+    if cert["issuer"]:
+        lines += ["   кому выдан : " + cert["subject"], "   кем выдан  : " + cert["issuer"],
+                  "   действует  : " + cert["valid"]]
+    lines.append("   проверка Python: " + ("принят" if cert["verified"] else "ОТКАЗ - " + cert["verify_error"]))
+    return lines
+
+
+def cert_advice(cert) -> list:
+    """Что делать, если сертификат не принят: по тому, кем он выдан."""
+    if not cert or cert["verified"] is not False:
+        return []
+    issuer = cert.get("issuer", "")
+    if RUSSIAN_CA.search(issuer):
+        return ["Сертификат Checko выдан российским удостоверяющим центром (Минцифры): Windows и Python по умолчанию ему не "
+                f"доверяют. Скачайте корневой сертификат {RUSSIAN_ROOT_URL}, положите файл в любую папку и впишите в "
+                "local.env строку CHECKO_CA_FILE=полный\\путь\\к\\russian_trusted_root_ca_pem.crt (для запроса в обход "
+                "VPN этого достаточно; если сервер не присылает промежуточный сертификат, понадобится и "
+                "russian_trusted_sub_ca_pem.crt, его можно дописать в тот же файл)."]
+    if ANTIVIRUS_CA.search(issuer):
+        return ["Сертификат подменяет антивирус или программа защиты (" + issuer + "): отключите в ней проверку "
+                "защищённых соединений (HTTPS) или добавьте api.checko.ru в исключения."]
+    subject, text = cert.get("subject", ""), cert.get("verify_error", "")
+    if issuer and issuer == subject:
+        return ["Сертификат самоподписанный: так выглядит подмена соединения роутером, провайдером или защитной "
+                "программой. Попробуйте другую сеть (раздача с телефона)."]
+    if "неполную цепочку" in text:
+        return ["Сервер присылает неполную цепочку сертификатов: Windows и браузеры докачивают недостающее сами, Python "
+                "нет. Установите пакет truststore (pip install -r requirements.txt) и запустите проверку снова: "
+                "программа тогда проверит сертификат средствами Windows."]
+    return []
+
+
 def probe_key(key: str) -> tuple:
     """Один настоящий запрос с вашим ключом (программа сама выберет рабочий путь): принят ли он."""
     api = checko_api.CheckoApi(key)
@@ -175,6 +264,7 @@ def probe_key(key: str) -> tuple:
 def collect(key: str = "", probes=None) -> Report:
     p = probes or {}
     report = Report(proxies=(p.get("proxies") or probe_proxies)())
+    report.adapters = (p.get("adapter") or probe_adapter)()
     report.dns = (p.get("dns") or probe_dns)()
     if report.dns[0]:
         report.dns_ips = tuple(ip.strip() for ip in report.dns[1].split(","))
@@ -187,6 +277,8 @@ def collect(key: str = "", probes=None) -> Report:
         report.control[name] = (p.get("control") or probe_control)(url)
     for mode in MODES:
         report.api[mode] = (p.get("api") or probe_api)(mode)
+    if report.adapters["chosen"] and report.api.get("bypass", (None, ""))[0] is not True:
+        report.cert = (p.get("cert") or probe_certificate)(report.adapters["chosen"])
     if key and any(ok is True for ok, _ in report.api.values()):
         report.key = (p.get("key") or probe_key)(key)
     return report
@@ -214,6 +306,11 @@ def verdict(report: Report) -> list:
         lines.append("Checko закрыт для адреса вашего VPN, но открыт напрямую, через настоящую сетевую карту. Программа "
                      "сама отправляет запросы к Checko в обход VPN: выключать VPN не нужно. Остальной интернет у вас "
                      "по-прежнему идёт через VPN.")
+    elif api["bypass-os"]:
+        lines.append("Checko закрыт для адреса вашего VPN, но открыт напрямую, и Windows принимает его сертификат, а Python "
+                     "сам не может его проверить (так бывает, когда сервер присылает неполную цепочку сертификатов). "
+                     "Программа сама отправляет запросы к Checko в обход VPN и проверяет сертификат средствами Windows: "
+                     "выключать VPN не нужно, проверка сертификата при этом не отключается.")
     elif api["tls12"]:
         lines.append("Checko отвечает только при шифровании TLS 1.2: новое рукопожатие что-то обрывает по дороге "
                      "(антивирус, прокси, провайдер). Программа сама переключается на TLS 1.2.")
@@ -244,6 +341,7 @@ def verdict(report: Report) -> list:
                      "в сети. Если у VPN включена блокировка трафика вне VPN («kill switch»), она не даёт обойти его: "
                      "выключите её или добавьте программу в исключения VPN (см. ниже). Если и это не поможет, напишите "
                      "в поддержку Checko, что запросы к api.checko.ru с вашего адреса обрываются при шифровании.")
+    lines.extend(cert_advice(report.cert))
     if dns_mismatch(report):
         lines.append(f"Ваш DNS отдаёт для api.checko.ru адрес {', '.join(report.dns_ips)}, а публичный DNS - "
                      f"{report.public_dns[1]}: адрес, вероятно, подменён у провайдера или в настройках. Поставьте в "
@@ -284,7 +382,9 @@ def main(argv=None, out=print) -> int:
     for mode in MODES:
         ok, text = report.api[mode]
         out(f"5. Запрос к API ({MODE_NAMES[mode]}): {mark(ok)} - {text}")
-    for line in adapter_lines(probe_adapter()):
+    for line in adapter_lines(report.adapters):
+        out(line)
+    for line in cert_lines(report.cert):
         out(line)
     out("")
     for line in verdict(report):

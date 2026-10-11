@@ -215,6 +215,7 @@ IP_UNICAST_IF = 31          # параметр сокета Windows: слать 
 
 # Все карты со статусом Up и маршрутом по умолчанию: имя, описание, метрика, шлюз, настоящая ли (не виртуальная) карта.
 _ADAPTER_SCRIPT = (
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"      # русские имена карт: иначе приходит кодовая страница консоли
     "$ErrorActionPreference='Stop';"
     "$up=@(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' });"
     "$routes=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0');"
@@ -282,29 +283,77 @@ def physical_interface_index() -> Optional[int]:
     return chosen["ifIndex"] if chosen else None
 
 
+def open_bound_socket(host: str, port: int, if_index: int, timeout: float, bind: bool = True) -> socket.socket:
+    """TCP-соединение через указанную сетевую карту (только IPv4): на Windows IP_UNICAST_IF уводит его мимо туннеля VPN,
+    у которого маршрут по умолчанию выше. Номер карты для IPv4 задаётся в сетевом порядке байтов."""
+    errors = []
+    for family, kind, proto, _, address in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        sock = socket.socket(family, kind, proto)
+        try:
+            if bind:
+                sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", if_index))
+            sock.settimeout(timeout)
+            sock.connect(address)
+            return sock
+        except OSError as exc:
+            sock.close()
+            errors.append(exc)
+    raise errors[-1] if errors else OSError("адрес не найден")
+
+
+_CERT_REASONS = (
+    (("unable to get local issuer certificate", "unable to verify the first certificate"),
+     "сервер прислал неполную цепочку сертификатов или центр сертификации неизвестен этому компьютеру"),
+    (("self signed certificate", "self-signed certificate"),
+     "сертификат самоподписанный: так выглядит подмена соединения (антивирус, провайдер, роутер)"),
+    (("certificate has expired",), "срок сертификата истёк (или неверные дата и время на компьютере)"),
+    (("hostname mismatch", "doesn't match"), "сертификат выдан на другое имя сайта: так выглядит подмена соединения"),
+)
+
+
+def describe_cert_error(exc: Exception) -> str:
+    """Почему сертификат не принят, простыми словами и с исходным текстом."""
+    message = getattr(exc, "verify_message", "") or str(exc)
+    for needles, text in _CERT_REASONS:
+        if any(needle in message.lower() for needle in needles):
+            return f"{text} [{message}]"
+    return message
+
+
+def os_trust_context() -> Optional[ssl.SSLContext]:
+    """Контекст, который проверяет сертификат средствами операционной системы (как браузер: Windows сама докачивает
+    недостающие промежуточные сертификаты). Нужен пакет truststore; нет его - None."""
+    try:
+        import truststore
+    except ImportError:
+        return None
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def own_ca_context() -> ssl.SSLContext:
+    """Обычная проверка сертификата; если в local.env задан CHECKO_CA_FILE (файл PEM с корневым сертификатом), его
+    доверенный центр добавляется к обычным."""
+    context = ssl.create_default_context()
+    path = os.environ.get("CHECKO_CA_FILE", "").strip()
+    if path and os.path.exists(path):
+        context.load_verify_locations(cafile=path)
+    return context
+
+
 class _BoundHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPS-соединение, привязанное к сетевой карте: на Windows IP_UNICAST_IF уводит его мимо туннеля VPN, у которого
-    маршрут по умолчанию выше. Только IPv4 (параметр для IPv4 задаётся в сетевом порядке байтов)."""
+    """HTTPS-соединение через указанную сетевую карту (см. open_bound_socket)."""
 
     def __init__(self, host, port, if_index, timeout, context, bind=True):
         super().__init__(host, port, timeout=timeout, context=context)
         self.if_index, self._bind = if_index, bind
 
     def connect(self):
-        errors = []
-        for family, kind, proto, _, address in socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM):
-            sock = socket.socket(family, kind, proto)
-            try:
-                if self._bind:
-                    sock.setsockopt(socket.IPPROTO_IP, IP_UNICAST_IF, struct.pack("!I", self.if_index))
-                sock.settimeout(self.timeout)
-                sock.connect(address)
-                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
-                return
-            except OSError as exc:
-                sock.close()
-                errors.append(exc)
-        raise errors[-1] if errors else OSError("адрес не найден")
+        sock = open_bound_socket(self.host, self.port, self.if_index, self.timeout, self._bind)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except OSError:
+            sock.close()
+            raise
 
 
 class _BoundSession:
@@ -312,7 +361,7 @@ class _BoundSession:
 
     def __init__(self, if_index: int, context: Optional[ssl.SSLContext] = None, bind: bool = True):
         self.if_index, self.bind = if_index, bind
-        self.context = context or ssl.create_default_context()          # проверка сертификата включена
+        self.context = context if context is not None else own_ca_context()      # проверка сертификата включена
 
     def get(self, url, params=None, timeout=20.0):
         parts = urllib.parse.urlsplit(url)
@@ -323,6 +372,9 @@ class _BoundSession:
                          headers={"Accept": "application/json", "User-Agent": "coldoutreach", "Connection": "close"})
             response = conn.getresponse()
             return _PlainResponse(response.status, response.read().decode("utf-8", errors="replace"))
+        except ssl.SSLCertVerificationError as exc:
+            raise requests.exceptions.ConnectionError(
+                f"в обход VPN: сертификат не принят: {describe_cert_error(exc)}"[:260]) from None
         except (OSError, http.client.HTTPException) as exc:             # включая обрыв шифрования
             raise requests.exceptions.ConnectionError(f"в обход VPN: {type(exc).__name__}: {exc}"[:150]) from None
         finally:
@@ -330,15 +382,18 @@ class _BoundSession:
 
 
 # Если обычное соединение обрывается, пробуем без системных настроек прокси, потом в обход VPN (напрямую через сетевую
-# карту), потом с TLS 1.2, потом через системный curl. Что сработало, то остаётся до конца работы программы.
-FALLBACK_MODES = ("no-proxy", "bypass", "tls12", "curl")
+# карту; второй раз - с проверкой сертификата средствами Windows), потом с TLS 1.2, потом через системный curl.
+# Что сработало, то остаётся до конца работы программы.
+FALLBACK_MODES = ("no-proxy", "bypass", "bypass-os", "tls12", "curl")
 
 
 def new_session(mode: str = "default"):
-    """Сеанс для запросов. Режимы curl и bypass возвращают None, если curl или подходящей сетевой карты нет."""
-    if mode == "bypass":
+    """Сеанс для запросов. Режимы curl, bypass и bypass-os возвращают None, если нет curl, подходящей сетевой карты
+    или (для bypass-os) пакета truststore."""
+    if mode in ("bypass", "bypass-os"):
         index = physical_interface_index()
-        return _BoundSession(index) if index else None
+        context = os_trust_context() if mode == "bypass-os" else own_ca_context()
+        return _BoundSession(index, context) if index and context is not None else None
     if mode == "curl":
         path = find_curl()
         return _CurlSession(path) if path else None
