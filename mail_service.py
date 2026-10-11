@@ -14,7 +14,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from mailing import config as mailcfg, smtp
+from mailing import config as mailcfg, mailboxes as boxes, smtp
 from mailing import table as lettertable
 from letter_template import DEFAULT_OFFER, render_letter
 
@@ -40,22 +40,47 @@ class MailError(Exception):
 class MailService:
     def __init__(self, user: str = "", password: str = "", from_name: str = "", example=None,
                  max_per_hour: int = 10, sender_factory=None, clock=time.monotonic,
-                 port: int = smtp.SMTP_PORT):
+                 port: int = smtp.SMTP_PORT, mailboxes=None):
+        """mailboxes - все подключённые ящики (mailing.mailboxes.load_mailboxes): с каждого можно отправить пробное
+        письмо. Не задан - один ящик из user и password, как раньше."""
         self.user = (user or "").strip()
         self._password = password or ""
         self.from_name = from_name
         self.example = example or {}
         self.max_per_hour = max_per_hour
         self.port = port
-        self._factory = sender_factory or (lambda: smtp.MailruSender(
-            self.user, self._password, port=port, timeout=CONNECT_TIMEOUT))
+        self.mailboxes = ([boxes.Mailbox("1", self.user, self._password, from_name)] if mailboxes is None
+                          else list(mailboxes))
+        first = next((box for box in self.mailboxes if box.ready), None)
+        if mailboxes is not None and first is not None:
+            self.user, self._password = first.user, first.password
+        self._custom_factory = sender_factory             # подставной отправитель для тестов, один на все ящики
         self._clock = clock
         self._busy = threading.Lock()
         self._sent = deque()                  # моменты удачных отправок за последний час
 
+    def ready_mailboxes(self) -> list:
+        return [box for box in self.mailboxes if box.ready]
+
     @property
     def configured(self) -> bool:
-        return mailcfg.check_email(self.user) and bool(self._password)
+        return bool(self.ready_mailboxes())
+
+    def _pick(self, mailbox: str = ""):
+        """Ящик, с которого уйдёт пробное письмо: названный номером или первый подключённый."""
+        ready = self.ready_mailboxes()
+        if not mailbox:
+            return ready[0]
+        for box in ready:
+            if box.id == str(mailbox).strip():
+                return box
+        raise MailError(400, "Нет такого подключённого ящика: " + str(mailbox)[:20] + ". Есть: "
+                        + ", ".join(box.id for box in ready) + ".")
+
+    def _sender_for(self, box):
+        if self._custom_factory:
+            return self._custom_factory()
+        return smtp.MailruSender(box.user, box.password, port=self.port, timeout=CONNECT_TIMEOUT)
 
     def defaults(self) -> dict:
         """Готовый пример для формы. Адрес получателя по умолчанию - сам ящик отправителя:
@@ -69,6 +94,7 @@ class MailService:
         }
         subject, body = render_letter(**fields)
         return {"configured": self.configured, "from": self.user,
+                "mailboxes": [{"id": box.id, "address": box.user} for box in self.ready_mailboxes()],
                 "to": self.example.get("to") or self.user,
                 "limit_per_hour": self.max_per_hour, "subject": subject, "body": body, **fields}
 
@@ -81,7 +107,7 @@ class MailService:
             raise MailError(429, f"Лимит страницы: не больше {self.max_per_hour} писем в час. "
                                  f"Повторите примерно через {minutes} мин.")
 
-    def send(self, to: str, subject: str, body: str) -> dict:
+    def send(self, to: str, subject: str, body: str, mailbox: str = "") -> dict:
         if not self.configured:
             raise MailError(503, "Отправка не настроена: на сервере нужны переменные окружения "
                                  "MAILRU_USER (адрес ящика) и MAILRU_APP_PASSWORD (пароль для внешних приложений).")
@@ -92,16 +118,18 @@ class MailService:
             raise MailError(400, f"Тема: одна строка, от 1 до {lettertable.MAX_SUBJECT} знаков.")
         if not body or len(body) > lettertable.MAX_BODY:
             raise MailError(400, f"Текст письма: от 1 до {lettertable.MAX_BODY} знаков.")
+        box = self._pick(mailbox)
         if not self._busy.acquire(blocking=False):
             raise MailError(409, "Предыдущее письмо ещё отправляется.")
         try:
             self._check_quota()
-            message = smtp.build_message(lettertable.Letter(to, subject, body), self.user, self.from_name)
-            sender = self._factory()
+            message = smtp.build_message(lettertable.Letter(to, subject, body), box.user, box.from_name or self.from_name)
+            sender = self._sender_for(box)
+            which = f" ({box.label})" if len(self.ready_mailboxes()) > 1 else ""
             try:
                 sender.send(message)
             except smtplib.SMTPAuthenticationError as exc:
-                raise MailError(502, f"mail.ru не принял логин или пароль ({smtp.reply_text(exc)}). "
+                raise MailError(502, f"mail.ru не принял логин или пароль{which} ({smtp.reply_text(exc)}). "
                                      "Нужен «пароль для внешних приложений», а не обычный пароль от ящика; "
                                      "MAILRU_USER - полный адрес ящика.") from exc
             except smtplib.SMTPRecipientsRefused as exc:
@@ -126,6 +154,6 @@ class MailService:
         finally:
             self._busy.release()
         moment = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M:%S")
-        return {"ok": True, "to": to, "from": self.user, "message_id": message["Message-ID"],
+        return {"ok": True, "to": to, "from": box.user, "message_id": message["Message-ID"],
                 "message": f"Сервер mail.ru принял письмо в {moment} (МСК). Проверьте входящие у "
                            f"получателя и папку «Спам»: «принято» ещё не значит «доставлено во входящие»."}

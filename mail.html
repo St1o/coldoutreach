@@ -62,6 +62,15 @@
   #limit-status { margin: 10px 0 0; color: var(--muted); min-height: 1.5em; }
   #limit-status.ok { color: var(--ok); }
   #limit-status.error { color: var(--error); }
+  .inline input[type=date] { max-width: 200px; }
+  select { width: 100%; padding: 12px 14px; font: inherit; color: var(--text); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 8px; }
+  .mbox { border-top: 1px solid var(--line); padding: 14px 0 4px; }
+  .mbox:first-child { border-top: 0; padding-top: 0; }
+  .mbox p { margin: 0 0 8px; }
+  .mbox .state { font-size: .9rem; color: var(--muted); }
+  .mbox .state.ok { color: var(--ok); }
+  .mbox .state.error { color: var(--error); }
   @media (max-width: 480px) { .row { flex-direction: column; gap: 0; } }
 </style>
 </head>
@@ -85,7 +94,8 @@
   <form id="letter" hidden autocomplete="off">
     <div id="not-configured" class="banner" hidden>
       Отправка не настроена. На сервере (Render → Environment) нужны <b>MAILRU_USER</b> (полный адрес ящика)
-      и <b>MAILRU_APP_PASSWORD</b> («пароль для внешних приложений», не обычный пароль от ящика).
+      и <b>MAILRU_APP_PASSWORD</b> («пароль для внешних приложений», не обычный пароль от ящика). Второй ящик:
+      <b>MAILRU_USER_2</b> и <b>MAILRU_APP_PASSWORD_2</b> (и так далее: _3, _4, _5).
     </div>
 
     <section class="card">
@@ -118,6 +128,10 @@
       <h2>Письмо</h2>
       <p class="meta">Отправитель: <b id="from"></b>. Письмо собирается по шаблону из полей выше; если вы поправите
         тему или текст вручную, поля выше перестанут его менять (кнопка «Собрать заново» вернёт шаблон).</p>
+      <div class="field" id="from-box-field" hidden>
+        <label for="from-box">С какого ящика отправить пробное письмо <span class="hint">так проверяют, что пароль нового ящика подходит</span></label>
+        <select id="from-box"></select>
+      </div>
       <div class="field">
         <label for="to">Кому</label>
         <input id="to" type="email" required>
@@ -145,10 +159,21 @@
         <button id="save-limit" type="button">Сохранить</button>
       </div>
     </div>
-    <p class="meta">Новый ящик «прогревают»: начните с малого (10-15 писем в сутки) и поднимайте понемногу; правила
-      рассылки советуют 30-50. Лимит относится к одному почтовому ящику, сейчас подключён один. Программа отправки
-      читает это значение при каждом запуске: уже идущая отправка доработает со старым.</p>
+    <p class="meta">Это потолок для каждого ящика: письма за последние 24 часа. Новый ящик «прогревают», поэтому первые
+      дни ему разрешено меньше (см. ниже: 7 писем в первый день, потом на 3 больше каждый день), и он дорастает до этого
+      потолка. Правила рассылки советуют 30-50 в сутки. Программа отправки читает значение при каждом запуске: уже идущая
+      отправка доработает со старым.</p>
     <p id="limit-status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="mailboxes" class="card" hidden>
+    <h2>Ящики и прогрев</h2>
+    <p class="meta">Прогрев: в день первого письма с ящика можно отправить 7 писем, в каждый следующий день на 3 больше
+      (7, 10, 13, …) до потолка выше. Письма с ящиков идут по очереди, между любыми двумя письмами пауза 30–75 секунд.
+      Дата первого письма берётся по журналу отправки; если ящик уже работал раньше (или вы хотите начать с другого дня),
+      впишите дату здесь. Пустая дата: по журналу, а если с ящика ещё ничего не уходило, день 1 наступит с первого письма.
+      Ящики подключают в local.env: MAILRU_USER / MAILRU_APP_PASSWORD (первый), MAILRU_USER_2 / MAILRU_APP_PASSWORD_2 (второй).</p>
+    <div id="mailboxes-list"></div>
   </section>
 </main>
 
@@ -232,12 +257,82 @@ async function saveLimit() {
   $('save-limit').disabled = true;
   try {
     const data = await api('/api/mail/settings', { daily_limit: $('daily').value });
-    showLimit(data, 'Сохранено: ' + data.daily_limit + ' писем в сутки с одного ящика. Действует со следующего запуска отправки.', 'ok');
+    showLimit(data, 'Сохранено: ' + data.daily_limit + ' писем в сутки с одного ящика (потолок). Действует со следующего запуска отправки.', 'ok');
   } catch (error) {
     $('limit-status').textContent = 'Не сохранено: ' + error.message;
     $('limit-status').className = 'error';
   }
   $('save-limit').disabled = false;
+}
+
+function mailboxRow(box) {
+  const row = document.createElement('div');
+  row.className = 'mbox';
+  const title = document.createElement('p');
+  title.textContent = 'Ящик ' + box.id + ' (' + box.address + ')';
+  title.style.fontWeight = '600';
+  const state = document.createElement('p');
+  state.className = 'state';
+  const describe = () => box.text + '. ' + (box.first_message
+    ? 'Первое письмо: ' + box.first_message + ' (' + box.source + ').' : 'С ящика ещё ничего не отправляли.');
+  state.textContent = describe();
+  const inline = document.createElement('div');
+  inline.className = 'inline';
+  const date = document.createElement('input');
+  date.type = 'date';
+  date.value = box.first_message;
+  date.setAttribute('aria-label', 'Дата первого письма, ящик ' + box.id);
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.textContent = 'Сохранить дату';
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'secondary';
+  clear.textContent = 'По журналу';
+  const store = async (value, doneText) => {
+    save.disabled = clear.disabled = true;
+    try {
+      renderMailboxes((await api('/api/mail/mailboxes', { id: box.id, first_message: value })).mailboxes);
+    } catch (error) {
+      state.textContent = 'Не сохранено: ' + error.message;
+      state.className = 'state error';
+      save.disabled = clear.disabled = false;
+    }
+  };
+  save.addEventListener('click', () => store(date.value));
+  clear.addEventListener('click', () => store(''));
+  inline.append(date, save, clear);
+  const label = document.createElement('label');
+  label.textContent = 'Дата первого письма';
+  label.style.margin = '8px 0 6px';
+  row.append(title, state, label, inline);
+  return row;
+}
+
+function renderMailboxes(boxes) {
+  const list = $('mailboxes-list');
+  list.replaceChildren(...boxes.map(mailboxRow));
+  $('mailboxes').hidden = !boxes.length;
+}
+
+async function loadMailboxes() {
+  try {
+    renderMailboxes((await api('/api/mail/mailboxes')).mailboxes);
+  } catch (error) {
+    $('mailboxes').hidden = true;                  // сайт на хостинге: журналов нет, прогрева не видно
+  }
+}
+
+function fillSenders(boxes) {
+  const select = $('from-box');
+  select.replaceChildren(...boxes.map((box) => new Option('Ящик ' + box.id + ' (' + box.address + ')', box.id)));
+  $('from-box-field').hidden = boxes.length < 2;
+  const show = () => {
+    const chosen = boxes.find((box) => box.id === select.value);
+    if (chosen) $('from').textContent = chosen.address;
+  };
+  select.onchange = show;
+  show();
 }
 
 async function enter(auto) {
@@ -246,6 +341,7 @@ async function enter(auto) {
     const d = await api('/api/mail/defaults');
     FIELDS.concat(['to', 'subject', 'body']).forEach((name) => { $(name).value = d[name]; });
     $('from').textContent = d.from || 'не задан';
+    fillSenders(d.mailboxes || []);
     $('not-configured').hidden = d.configured;
     configured = d.configured;
     $('send').disabled = !configured;
@@ -253,6 +349,7 @@ async function enter(auto) {
     $('letter').hidden = false;
     rememberPassword($('remember').checked);
     loadLimit();
+    loadMailboxes();
   } catch (error) {
     if (auto) { rememberPassword(false); $('token').value = ''; }     // старый пароль не подошёл
     else $('login-status').textContent = error.message;
@@ -276,7 +373,8 @@ $('letter').addEventListener('submit', async (event) => {
   $('send').disabled = true;
   setStatus('Отправляем…');
   try {
-    const result = await api('/api/mail/send', { to: $('to').value, subject: $('subject').value, body: $('body').value });
+    const result = await api('/api/mail/send', { to: $('to').value, subject: $('subject').value, body: $('body').value,
+                                                 mailbox: $('from-box').value || '' });
     setStatus('Отправлено на ' + result.to + ' с ' + result.from + '.\n' + result.message
               + '\nMessage-ID: ' + result.message_id, 'ok');
   } catch (error) {

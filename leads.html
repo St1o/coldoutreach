@@ -87,6 +87,8 @@
   dialog::backdrop { background: rgba(0, 0, 0, .5); }
   .actions { margin-top: 16px; }
   #send .row { margin-top: 14px; }
+  ul.boxes { list-style: none; margin: 4px 0 14px; padding: 0; font-size: .85rem; color: var(--muted); }
+  ul.boxes li { padding: 3px 0; }
   @media (max-width: 480px) { .row { flex-direction: column; gap: 0; } }
 </style>
 </head>
@@ -143,13 +145,22 @@
 
     <section id="send" class="card" hidden>
       <h2>Отправка писем</h2>
-      <p class="note">Письма первого этапа уходят из таблицы выше: сначала вы увидите, что будет отправлено, и подтвердите. Отправка идёт в фоне с паузой между письмами; лимит в сутки задаётся на странице <a href="/mail">/mail</a>. Те, кому письмо уже ушло, в таблице залиты жёлтым (до колонки последнего ушедшего письма: первое письмо, дожим, закрывающее) и повторно первое письмо не получают.</p>
+      <p class="note">Письма первого этапа уходят из таблицы выше: сначала вы увидите, что будет отправлено, и подтвердите. Отправка идёт в фоне: письма уходят по очереди с подключённых ящиков, между любыми двумя письмами пауза 30–75 секунд. У каждого ящика своя квота на сегодня: новый ящик «прогревается» (7 писем в первый день, потом на 3 больше каждый день), а лимит в сутки и дату первого письма каждого ящика задают на странице <a href="/mail">/mail</a>. Те, кому письмо уже ушло, в таблице залиты жёлтым (до колонки последнего ушедшего письма: первое письмо, дожим, закрывающее) и повторно первое письмо не получают.</p>
       <div class="row">
         <div class="field">
-          <label for="send-count">Сколько писем отправить <span class="hint">для нового ящика 10–15 в сутки</span></label>
+          <label for="send-count">Сколько писем отправить <span class="hint">лишнее сверх квот не уйдёт, остаток уйдёт завтра</span></label>
           <input id="send-count" type="number" min="1" max="200" value="10">
         </div>
+        <div class="field">
+          <label for="send-mailboxes">Со скольки почт отправить <span class="hint" id="send-mailboxes-hint">по умолчанию со всех подключённых</span></label>
+          <input id="send-mailboxes" type="number" min="1" max="1" value="1">
+        </div>
       </div>
+      <div class="field" id="send-only-field" hidden>
+        <label for="send-only">Или только с одной почты <span class="hint">тогда число почт выше не учитывается</span></label>
+        <select id="send-only"><option value="">нет, по числу почт выше</option></select>
+      </div>
+      <ul id="send-boxes" class="boxes" aria-label="Ящики и их квота на сегодня"></ul>
       <label class="check"><input id="unwritten" type="checkbox" autocomplete="off"> Компаниям из групп, для которых агенты ещё не написали свой текст, отправить запасной вариант письма</label>
       <p><button id="send-btn" type="button">Отправить</button></p>
       <p id="send-status" class="status" role="status" aria-live="polite"></p>
@@ -162,6 +173,7 @@
   <h2 id="confirm-title">Отправить письма?</h2>
   <pre id="confirm-summary"></pre>
   <p class="note" id="confirm-limit" hidden></p>
+  <ul id="confirm-boxes" class="boxes" aria-label="С какого ящика сколько писем уйдёт сегодня"></ul>
   <p class="note">Пример письма (адрес и ФИО в письмо не подставляются):</p>
   <select id="confirm-group" aria-label="Группа для примера"></select>
   <pre id="confirm-example"></pre>
@@ -178,6 +190,8 @@ let password = '';
 let timer = null;
 let sendEnabled = false;
 let sendState = null;
+let mailboxesTouched = false;      // число почт правили руками: по умолчанию оно равно числу подключённых ящиков
+let boxesSignature = '';
 let pending = null;                      // что показали в окне подтверждения: отправляем ровно это
 let shownDate = '';                      // за какую дату показана таблица
 let watchUntil = 0;                      // до этого момента опрашиваем сервер, даже если отправка ещё не «взяла замок»
@@ -341,11 +355,37 @@ function renderSend(data, state) {
   $('send').hidden = !(sendEnabled && rows);
   const running = !!(state && state.running);
   $('send-btn').disabled = running || data.state === 'running';
+  if (state && state.mailboxes) showMailboxes(state.mailboxes);       // нет ответа о статусе: оставляем показанное
   const lines = (state && state.lines) || [];
   $('send-lines').textContent = lines.join('\n');
   $('send-lines').hidden = !lines.length;
   if (running) setSendStatus('Идёт отправка в фоне. Страницу можно закрыть: отправка продолжится.', 'ok');
   else if ($('send-status').textContent.startsWith('Идёт отправка')) setSendStatus('Отправка закончилась.', 'ok');
+}
+
+// Ящики: сколько подключено, число для поля «со скольки почт» (по умолчанию все), выбор одной почты и квота каждой на сегодня
+function showMailboxes(boxes) {
+  const count = $('send-mailboxes');
+  const most = Math.max(1, boxes.length);
+  count.max = String(most);
+  if (!mailboxesTouched || Number(count.value) > most) count.value = String(most);
+  const signature = boxes.map((box) => box.id).join(',');
+  if (signature !== boxesSignature) {                 // выбор в списке не сбрасываем при каждом опросе
+    boxesSignature = signature;
+    const select = $('send-only');
+    select.replaceChildren(new Option('нет, по числу почт выше', ''));
+    boxes.forEach((box) => select.append(new Option('Только ящик ' + box.id + ' (' + box.address + ')', box.id)));
+  }
+  $('send-only-field').hidden = boxes.length < 2;
+  $('send-mailboxes-hint').textContent = boxes.length > 1 ? 'по умолчанию со всех подключённых: ' + boxes.length
+    : boxes.length === 1 ? 'подключён один ящик; второй вписывают в local.env'
+    : 'ящик не подключён: см. local.env';
+  fillBoxList($('send-boxes'), boxes.map((box) => 'Ящик ' + box.id + ' (' + box.address + '): ' + box.text + '.'));
+}
+
+function fillBoxList(list, lines) {
+  list.replaceChildren();
+  lines.forEach((line) => { const item = document.createElement('li'); item.textContent = line; list.append(item); });
 }
 
 async function poll() {
@@ -508,13 +548,16 @@ function fillConfirm(info) {
   $('confirm-title').textContent = 'Отправить ' + info.letters + ' ' + plural(info.letters) + '?';
   $('confirm-summary').textContent = info.summary.join('\n');
   const limit = $('confirm-limit');
-  if (info.daily_limit && info.room !== null && info.room < info.letters) {
-    limit.textContent = 'За последние 24 часа уже отправлено ' + info.sent_24h + ' из ' + info.daily_limit
-      + ': сегодня уйдёт не больше ' + info.room + ', остальное отправьте завтра этой же кнопкой.';
+  const boxes = info.mailboxes || [];
+  if (info.today < info.letters) {
+    limit.textContent = 'Сегодня уйдёт ' + info.today + ' из ' + info.letters + ': у ящиков на сегодня больше нет квоты '
+      + '(лимит в сутки и прогрев новых ящиков). Остальные ' + (info.letters - info.today) + ' отправьте в следующие дни этой же кнопкой.';
     limit.hidden = false;
   } else {
     limit.hidden = true;
   }
+  fillBoxList($('confirm-boxes'), boxes.map((box) => 'Ящик ' + box.id + ' (' + box.address + '): сегодня уйдёт '
+    + box.planned + '. ' + box.text + '.'));
   const select = $('confirm-group');
   select.replaceChildren();
   info.examples.forEach((example, index) => {
@@ -546,6 +589,9 @@ $('send-btn').addEventListener('click', async () => {
   setSendStatus('Проверяем письма…');
   try {
     const request = { count, include_unwritten: $('unwritten').checked, date: viewDate() };   // письма из таблицы выбранной даты
+    const only = $('send-only').value;
+    if (only) request.only_mailbox = only;                                // только с одной почты
+    else if ($('send-mailboxes').value) request.mailbox_count = Number($('send-mailboxes').value);
     const info = await (await api('/api/send/prepare', {
       method: 'POST', headers: jsonHeaders(), body: JSON.stringify(request) })).json();
     if (!info.letters) {
@@ -562,6 +608,8 @@ $('send-btn').addEventListener('click', async () => {
     $('send-btn').disabled = false;
   }
 });
+
+$('send-mailboxes').addEventListener('input', () => { mailboxesTouched = true; });
 
 $('confirm-no').addEventListener('click', () => { pending = null; $('confirm').close(); });
 

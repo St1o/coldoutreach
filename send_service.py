@@ -8,14 +8,16 @@ mailer.py отправляет (пауза между письмами, днев
 """
 import contextlib
 import io
+import math
 import os
 import re
+from datetime import datetime, timezone
 
 import compose
 import mailer
-from mailing import config as mailcfg, journal
+from mailing import config as mailcfg, journal, mailboxes as boxes
 from mailing.lock import lock_holder
-from mailing.table import LettersError
+from mailing.table import Letter, LettersError
 
 MIN_COUNT, MAX_COUNT = 1, mailcfg.DAILY_LIMIT_MAX
 LETTERS_NAME = "letters_1.csv"
@@ -46,7 +48,8 @@ class SendService:
 
     @staticmethod
     def mail_ready() -> bool:
-        return mailcfg.check_email(os.environ.get("MAILRU_USER", "")) and bool(os.environ.get("MAILRU_APP_PASSWORD"))
+        """Хотя бы один ящик подключён полностью (адрес и пароль для внешних приложений)."""
+        return any(box.ready for box in boxes.load_mailboxes())
 
     def _daily(self):
         try:
@@ -66,16 +69,45 @@ class SendService:
     def _check_ready(self, leads_path: str) -> None:
         if not leads_path or os.path.dirname(os.path.abspath(leads_path)) != self.data_dir:
             raise SendError(400, "Таблицы пока нет: сначала выгрузите компании.")
-        if not self.mail_ready():
+        configured = boxes.load_mailboxes()
+        if not any(box.ready for box in configured):
             raise SendError(400, "Ящик не настроен: впишите MAILRU_USER и MAILRU_APP_PASSWORD в local.env.")
+        issues = boxes.problems(configured)
+        if issues:
+            raise SendError(400, " ".join(issues))
         holder = lock_holder(self.data_dir)
         if holder:
             raise SendError(409, f"Отправка уже идёт (процесс {holder}). Дождитесь окончания.")
 
-    def prepare(self, leads_path: str, count, include_unwritten: bool = False) -> dict:
-        """Собирает письма (файл letters_1.csv) и рассказывает, что уйдёт: числа, группы, по примеру письма на группу."""
+    def mailbox_infos(self, selected=None, now=None) -> list:
+        """Подключённые ящики и что каждый может отправить сегодня: для страниц /leads и /mail. Паролей нет."""
+        now = now or datetime.now(timezone.utc)
+        settings, ceiling = mailcfg.load_settings(self.settings_path), self._daily()
+        chosen = None if selected is None else {box.id for box in selected}
+        infos = []
+        for box in boxes.load_mailboxes():
+            if not box.ready:
+                continue
+            state = boxes.mailbox_state(self.data_dir, box.id, settings, ceiling, now)
+            infos.append({"id": box.id, "label": box.label, "address": box.user, "first_message": state["first_message"] or "",
+                          "source": state["source"], "day": state["day"], "quota": state["quota"],
+                          "sent_today": state["sent_today"], "sent_24h": state["sent_24h"], "ceiling": ceiling,
+                          "room": None if state["room"] == math.inf else state["room"], "text": boxes.describe_state(state),
+                          "selected": chosen is None or box.id in chosen})
+        return infos
+
+    def _select(self, mailbox_count, only_mailbox):
+        try:
+            return boxes.select(boxes.load_mailboxes(), mailbox_count, only_mailbox or None)
+        except ValueError as exc:
+            raise SendError(400, str(exc)) from exc
+
+    def prepare(self, leads_path: str, count, include_unwritten: bool = False, mailbox_count=None, only_mailbox: str = "") -> dict:
+        """Собирает письма (файл letters_1.csv) и рассказывает, что уйдёт: числа, группы, по примеру письма на группу,
+        и с каких ящиков сколько писем уйдёт сегодня (прогрев: у нового ящика на сегодня только его квота)."""
         number = self._check_count(count)
         self._check_ready(leads_path)
+        selected = self._select(mailbox_count, only_mailbox)
         lines = []
         argv = [leads_path, "--limit", str(number), "--preview"] + (["--include-unwritten"] if include_unwritten else [])
         code = self._compose(argv, log=lines.append)
@@ -94,29 +126,51 @@ class SendService:
                 summary.append(line.strip().replace(_CLI_HINT, _PAGE_HINT))
         used = journal.sent_last_24h(self.data_dir)
         daily = self._daily()
+        infos = [info for info in self.mailbox_infos(selected) if info["selected"]]
+        rooms = {info["id"]: math.inf if info["room"] is None else info["room"] for info in infos}
+        plan, _ = boxes.assign([Letter(f"{n}@x", "", "") for n in range(letters)], rooms)       # кому сколько уйдёт сегодня
+        planned = {info["id"]: sum(1 for _, own in plan if own == info["id"]) for info in infos}
+        for info in infos:
+            info["planned"] = planned[info["id"]]
+        room = None if any(value == math.inf for value in rooms.values()) else sum(rooms.values())
         return {"letters": letters, "summary": summary, "examples": examples, "daily_limit": daily,
-                "sent_24h": used, "room": max(0, daily - used) if daily else None}
+                "sent_24h": used, "room": room, "today": len(plan), "mailboxes": infos}
 
-    def start(self, leads_path: str, count, include_unwritten: bool = False, expected=None) -> dict:
+    def start(self, leads_path: str, count, include_unwritten: bool = False, expected=None, mailbox_count=None,
+              only_mailbox: str = "") -> dict:
         """Собирает письма заново и запускает отправку в фоне. expected - сколько писем показали пользователю:
         если таблица за это время изменилась, отправка не начинается."""
-        info = self.prepare(leads_path, count, include_unwritten)
+        info = self.prepare(leads_path, count, include_unwritten, mailbox_count, only_mailbox)
         if info["letters"] == 0:
             raise SendError(400, "Писем для отправки нет: " + "; ".join(info["summary"]))
         if expected is not None and info["letters"] != expected:
             raise SendError(409, f"Пока вы смотрели, набор писем изменился: теперь их {info['letters']}, а не {expected}. "
                                  "Нажмите «Отправить» ещё раз и проверьте.")
+        if info["today"] == 0:
+            raise SendError(400, "Сегодня отправлять нечего: квота всех выбранных ящиков на сегодня исчерпана ("
+                                 + "; ".join(f"{box['label']}: {box['text']}" for box in info["mailboxes"])
+                                 + "). Нажмите «Отправить» завтра.")
+        argv = [self.letters_path, "--send", "--background", "--limit", str(info["letters"])]
+        if mailbox_count is not None:
+            argv += ["--mailboxes", str(int(mailbox_count))]
+        if only_mailbox:
+            argv += ["--mailbox", str(only_mailbox)]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = self._mailer([self.letters_path, "--send", "--background", "--limit", str(info["letters"])])
+            code = self._mailer(argv)
         if code != 0:
             raise SendError(400, out.getvalue().strip() or "Отправку запустить не удалось.")
-        return {"started": True, "letters": info["letters"], "daily_limit": info["daily_limit"],
-                "message": f"Отправка запущена в фоне: писем {info['letters']}, между письмами пауза 30 с. "
-                           "Страницу можно закрыть: отправка идёт сама, а дневной лимит и журнал не дадут отправить лишнего."}
+        split = ", ".join(f"{box['label']} - {box['planned']}" for box in info["mailboxes"] if box["planned"])
+        later = f" Остальные {info['letters'] - info['today']} уйдут в следующие дни той же кнопкой." \
+            if info["today"] < info["letters"] else ""
+        return {"started": True, "letters": info["letters"], "today": info["today"], "daily_limit": info["daily_limit"],
+                "mailboxes": info["mailboxes"],
+                "message": f"Отправка запущена в фоне: сегодня уйдёт {info['today']} из {info['letters']} ({split}), письма идут "
+                           f"по очереди с паузой 30-75 с.{later} Страницу можно закрыть: отправка идёт сама, а дневной "
+                           "лимит, прогрев ящиков и журнал не дадут отправить лишнего."}
 
     def status(self) -> dict:
-        """Идёт ли отправка и сводка по журналу (без адресов)."""
+        """Идёт ли отправка и сводка по журналу (без адресов) и по ящикам."""
         running = bool(lock_holder(self.data_dir))
         lines = []
         if os.path.exists(self.letters_path):
@@ -124,4 +178,4 @@ class SendService:
                 lines = mailer.status_lines(self.letters_path, self._daily())
             except LettersError:
                 lines = []
-        return {"running": running, "lines": lines, "ready": self.mail_ready()}
+        return {"running": running, "lines": lines, "ready": self.mail_ready(), "mailboxes": self.mailbox_infos()}

@@ -2,9 +2,11 @@
 import json
 import os
 import re
+from datetime import timedelta, timezone
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # корень проекта, рядом с mailer.py
+MSK = timezone(timedelta(hours=3))                                        # «сутки» прогрева считаем по Москве, как и в mail_service
 ENV_FILE = os.path.join(ROOT, "local.env")
 SETTINGS_FILE = os.path.join(ROOT, "settings.json")                       # пишет страница /mail
 DEFAULT_DAILY_LIMIT = 40

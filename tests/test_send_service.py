@@ -6,7 +6,7 @@ from unittest import mock
 
 import compose
 import send_service
-from mailing import journal
+from mailing import config as cfg, journal
 from mailing.table import read_letters
 from send_service import SendError, SendService
 from tests.test_compose import HEADER, LETTERS, LINK, SEGMENT, SIGNATURE, lead
@@ -49,7 +49,8 @@ class ServiceCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.mailer = FakeMailer()
-        self.service = SendService(self.data, settings_path=os.path.join(self.tmp.name, "none.json"),
+        self.settings = os.path.join(self.tmp.name, "none.json")
+        self.service = SendService(self.data, settings_path=self.settings,
                                    compose_main=self.compose, mailer_main=self.mailer)
 
     def compose(self, argv, log=print):
@@ -96,8 +97,16 @@ class PrepareTest(ServiceCase):
     def test_daily_room_counts_what_was_sent_in_the_last_day(self):
         journal.save_state(os.path.join(self.data, "letters_1.sent.json"),
                            {"old@x.ru": journal.make_entry(journal.SENT, "Тема", {})})
+        cfg.save_settings({"mailboxes": {"1": {"first_message": "2026-01-01"}}}, self.settings)   # ящик давно прогрет
         info = self.service.prepare(self.leads, 10)
         self.assertEqual((info["daily_limit"], info["sent_24h"], info["room"]), (40, 1, 39))
+
+    def test_a_new_mailbox_has_only_its_first_day_quota_today(self):
+        journal.save_state(os.path.join(self.data, "letters_1.sent.json"),
+                           {"old@x.ru": journal.make_entry(journal.SENT, "Тема", {}, mailbox="1")})
+        info = self.service.prepare(self.leads, 10)                 # первый день прогрева: 7, одно письмо уже ушло
+        self.assertEqual((info["sent_24h"], info["room"]), (1, 6))
+        self.assertEqual(info["today"], 3)
 
     def test_count_must_be_a_sensible_number(self):
         for bad in (0, -1, 201, "много", None, 2.5 + 0j):
@@ -169,6 +178,96 @@ class StatusTest(ServiceCase):
     def test_running_follows_the_folder_lock(self):
         with mock.patch.object(send_service, "lock_holder", return_value=99):
             self.assertTrue(self.service.status()["running"])
+
+
+SECOND = {"MAILRU_USER_2": "second@mail.ru", "MAILRU_APP_PASSWORD_2": "second-secret-pw"}
+
+
+class TwoMailboxesTest(ServiceCase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, SECOND)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fill_today(self, mailbox, count):
+        path = os.path.join(self.data, "letters_9.sent.json")
+        entries = journal.load_state(path)
+        entries.update({f"s{i}-{mailbox}@y.ru": journal.make_entry(journal.SENT, "Т", {}, mailbox=mailbox)
+                        for i in range(count)})
+        journal.save_state(path, entries)
+
+    def test_both_mailboxes_are_offered_and_share_the_batch_in_turn(self):
+        info = self.service.prepare(self.leads, 10)
+        self.assertEqual([(box["id"], box["day"], box["quota"], box["planned"]) for box in info["mailboxes"]],
+                         [("1", 1, 7, 2), ("2", 1, 7, 1)])
+        self.assertEqual((info["letters"], info["today"], info["room"]), (3, 3, 14))
+
+    def test_the_count_field_chooses_how_many_mailboxes_send(self):
+        info = self.service.prepare(self.leads, 10, mailbox_count=1)
+        self.assertEqual([box["id"] for box in info["mailboxes"]], ["1"])
+        self.assertEqual(info["mailboxes"][0]["planned"], 3)
+        self.assertEqual(len(self.service.prepare(self.leads, 10, mailbox_count=2)["mailboxes"]), 2)
+
+    def test_one_particular_mailbox_can_be_chosen(self):
+        info = self.service.prepare(self.leads, 10, only_mailbox="2")
+        self.assertEqual([box["id"] for box in info["mailboxes"]], ["2"])
+        self.assertEqual(info["mailboxes"][0]["planned"], 3)
+
+    def test_a_wrong_choice_is_a_plain_400(self):
+        for kwargs in ({"mailbox_count": 0}, {"only_mailbox": "5"}, {"mailbox_count": 1, "only_mailbox": "2"}):
+            with self.assertRaises(SendError, msg=kwargs) as caught:
+                self.service.prepare(self.leads, 10, **kwargs)
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_only_what_the_quota_allows_goes_today_and_the_rest_is_said_so(self):
+        self.fill_today("1", 6)
+        self.fill_today("2", 5)                                    # осталось 1 и 2 письма
+        info = self.service.prepare(self.leads, 10)
+        self.assertEqual((info["letters"], info["today"], info["room"]), (3, 3, 3))
+        self.write_leads([lead(f"p{i}@x.ru", "47.11") for i in range(5)])
+        info = self.service.prepare(self.leads, 10)
+        self.assertEqual((info["letters"], info["today"]), (5, 3))
+        self.assertEqual(sorted(box["planned"] for box in info["mailboxes"]), [1, 2])
+        started = self.service.start(self.leads, 10)
+        self.assertIn("сегодня уйдёт 3 из 5", started["message"])
+        self.assertIn("Остальные 2 уйдут в следующие дни", started["message"])
+
+    def test_nothing_starts_when_every_selected_quota_is_used_up(self):
+        self.fill_today("1", 7)
+        self.fill_today("2", 7)
+        with self.assertRaises(SendError) as caught:
+            self.service.start(self.leads, 3)
+        self.assertIn("квота всех выбранных ящиков", caught.exception.message)
+        self.assertEqual(self.mailer.calls, [])
+
+    def test_start_hands_the_choice_to_the_sender_only_when_it_was_made(self):
+        self.service.start(self.leads, 3)
+        self.assertEqual(self.mailer.calls[-1], [self.letters_file, "--send", "--background", "--limit", "3"])
+        self.service.start(self.leads, 3, mailbox_count=2)
+        self.assertEqual(self.mailer.calls[-1][-2:], ["--mailboxes", "2"])
+        self.service.start(self.leads, 3, only_mailbox="2")
+        self.assertEqual(self.mailer.calls[-1][-2:], ["--mailbox", "2"])
+
+    def test_a_half_filled_mailbox_is_explained_and_nothing_starts(self):
+        with mock.patch.dict(os.environ, {"MAILRU_APP_PASSWORD_2": ""}):
+            with self.assertRaises(SendError) as caught:
+                self.service.prepare(self.leads, 5)
+        self.assertIn("MAILRU_APP_PASSWORD_2", caught.exception.message)
+
+    def test_status_lists_the_mailboxes_and_never_a_password(self):
+        state = self.service.status()
+        self.assertEqual([(box["id"], box["address"], box["room"]) for box in state["mailboxes"]],
+                         [("1", "sender@mail.ru", 7), ("2", "second@mail.ru", 7)])
+        text = json.dumps(self.service.prepare(self.leads, 10), ensure_ascii=False) + json.dumps(state, ensure_ascii=False)
+        for secret in ("second-secret-pw", "@x.ru", "СЕКРЕТНАЯ"):
+            self.assertNotIn(secret, text)
+
+    def test_the_date_of_the_first_letter_is_part_of_the_picture(self):
+        cfg.save_settings({"mailboxes": {"2": {"first_message": "2026-01-01"}}}, self.settings)
+        box = self.service.mailbox_infos()[1]
+        self.assertEqual((box["first_message"], box["source"]), ("2026-01-01", "задана вручную"))
+        self.assertEqual(box["room"], 40)                          # давно прогрет: действует только лимит в сутки
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ from egrul_inn_search import (
 from leads_job import JobRunning, LeadsJob
 from send_service import SendError, SendService
 from letter_template import render_letter
-from mailing import config as mailcfg
+from mailing import config as mailcfg, mailboxes as mailboxes_mod
 from mail_service import MailError, MailService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -246,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
             self._mail_defaults()
         elif url.path == "/api/mail/settings":
             self._mail_settings()
+        elif url.path == "/api/mail/mailboxes":
+            self._mail_mailboxes()
         elif url.path == "/api/leads/session":
             self._leads_session()
         elif url.path in ("/api/leads/status", "/api/leads/download", "/api/send/status"):
@@ -374,6 +376,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._error(500, "В MAIL_DAILY_LIMIT (файл local.env) не число: исправьте или задайте лимит здесь.")
 
+    def _mailboxes_payload(self):
+        return {"mailboxes": self.server.send_service.mailbox_infos()}
+
+    def _mail_mailboxes(self):
+        """Подключённые ящики, день прогрева и квота каждого на сегодня (страница /mail). Только при папке данных."""
+        if self._mail_enabled() is None or not self._leads_authorized(self.server.leads_job):
+            return
+        if self.server.send_service is None:
+            self._error(404, "Ящики и прогрев видны только на сайте, запущенном у вас на компьютере (run_local.py).")
+            return
+        self._json(200, self._mailboxes_payload())
+
     def _mail_post(self, path):
         service = self._mail_enabled()
         if service is None or not self._leads_authorized(self.server.leads_job):
@@ -407,8 +421,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, self._limit_payload())
             return
+        if path == "/api/mail/mailboxes":
+            if self.server.send_service is None:
+                self._error(404, "Ящики и прогрев видны только на сайте, запущенном у вас на компьютере (run_local.py).")
+                return
+            known = {info["id"] for info in self.server.send_service.mailbox_infos()}
+            if body.get("id", "") not in known:
+                self._error(400, "Нет такого подключённого ящика.")
+                return
+            try:
+                mailboxes_mod.set_first_message(self.server.settings_path, body["id"], body.get("first_message", ""))
+            except ValueError as exc:
+                self._error(400, str(exc))
+                return
+            except OSError as exc:
+                self._error(500, f"Не удалось сохранить дату: {exc.strerror or exc}")
+                return
+            self._json(200, self._mailboxes_payload())
+            return
         try:
-            self._json(200, service.send(body.get("to", ""), body.get("subject", ""), body.get("body", "")))
+            self._json(200, service.send(body.get("to", ""), body.get("subject", ""), body.get("body", ""),
+                                         body.get("mailbox", "")))
         except MailError as exc:
             self._error(exc.status, exc.message)
 
@@ -432,12 +465,18 @@ class Handler(BaseHTTPRequestHandler):
             expected = body.get("expected")
             if expected is not None and not isinstance(expected, int):
                 raise ValueError
+            mailbox_count = body.get("mailbox_count")             # со скольки почт отправлять (пусто - со всех)
+            if mailbox_count is not None and (not isinstance(mailbox_count, int) or isinstance(mailbox_count, bool)):
+                raise ValueError
+            only_mailbox = body.get("only_mailbox") or ""          # или только с одной почты: её номер
+            if not isinstance(only_mailbox, str):
+                raise ValueError
             raw_day = body.get("date") or ""
             if not isinstance(raw_day, str):
                 raise ValueError
             day = date.fromisoformat(raw_day.strip()) if raw_day.strip() else None     # письма из таблицы этой даты
         except (ValueError, UnicodeDecodeError):
-            self._error(400, "Некорректный запрос: нужен JSON с числом писем и датой ГГГГ-ММ-ДД.")
+            self._error(400, "Некорректный запрос: нужен JSON с числом писем, числом или номером почты и датой ГГГГ-ММ-ДД.")
             return
         leads_path = job.output_path(day)
         if not leads_path:
@@ -445,15 +484,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             if path == "/api/send/prepare":
-                self._json(200, service.prepare(leads_path, body.get("count"), include_unwritten))
+                self._json(200, service.prepare(leads_path, body.get("count"), include_unwritten, mailbox_count, only_mailbox))
             else:
-                self._json(202, service.start(leads_path, body.get("count"), include_unwritten, expected))
+                self._json(202, service.start(leads_path, body.get("count"), include_unwritten, expected,
+                                              mailbox_count, only_mailbox))
         except SendError as exc:
             self._error(exc.status, exc.message)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path in ("/api/mail/preview", "/api/mail/send", "/api/mail/settings"):
+        if path in ("/api/mail/preview", "/api/mail/send", "/api/mail/settings", "/api/mail/mailboxes"):
             self._mail_post(path)
             return
         if path in ("/api/send/prepare", "/api/send/start"):
@@ -538,6 +578,8 @@ def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted
     server.send_service = send_service
     server.auto_login = auto_login
     server.settings_path = settings_path or mailcfg.SETTINGS_FILE
+    if send_service is not None and not getattr(send_service, "settings_path", "x"):
+        send_service.settings_path = server.settings_path           # лимит и даты ящиков из одного файла
     return server
 
 
@@ -561,7 +603,8 @@ def main(argv=None):
     leads_job = LeadsJob(env("LEADS_TOKEN", ""), out_dir=data_dir or None, api_key=env("CHECKO_API_KEY", ""))
     mail_service = MailService(
         env("MAILRU_USER", ""), env("MAILRU_APP_PASSWORD", ""), env("MAIL_FROM_NAME", ""),
-        example={"to": env("MAIL_EXAMPLE_TO", ""), "director": env("MAIL_EXAMPLE_DIRECTOR", "")})
+        example={"to": env("MAIL_EXAMPLE_TO", ""), "director": env("MAIL_EXAMPLE_DIRECTOR", "")},
+        mailboxes=mailboxes_mod.load_mailboxes())           # первый ящик и дополнительные MAILRU_USER_2, ...
     send_service = SendService(data_dir) if data_dir else None
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
                          RateLimiter(args.rate_limit), args.trusted_proxies, leads_job, mail_service,
@@ -576,7 +619,8 @@ def main(argv=None):
         print(f"Кнопка «Отправить» на /leads включена. Папка данных: {data_dir}")
     if leads_job.enabled:
         print("Страница /mail включена (тот же пароль)."
-              + ("" if mail_service.configured else " Отправка не настроена: нужны MAILRU_USER и MAILRU_APP_PASSWORD."))
+              + ("" if mail_service.configured else " Отправка не настроена: нужны MAILRU_USER и MAILRU_APP_PASSWORD.")
+              + (f" Подключено ящиков: {len(mail_service.ready_mailboxes())}." if mail_service.configured else ""))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

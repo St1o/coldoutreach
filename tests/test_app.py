@@ -283,8 +283,8 @@ import openpyxl
 
 import leads
 from leads_job import LeadsJob
-from mailing import journal
-from send_service import SendError
+from mailing import journal, mailboxes as mailboxes_mod
+from send_service import SendError, SendService
 
 TOKEN = "correct-horse-battery"
 
@@ -613,15 +613,17 @@ class FakeSendService:
     def __init__(self, error=None):
         self.calls, self.error = [], error
 
-    def prepare(self, leads_path, count, include_unwritten=False):
-        self.calls.append(("prepare", os.path.basename(leads_path), count, include_unwritten))
+    def prepare(self, leads_path, count, include_unwritten=False, mailbox_count=None, only_mailbox=""):
+        self.calls.append(("prepare", os.path.basename(leads_path), count, include_unwritten)
+                          + ((mailbox_count, only_mailbox) if mailbox_count is not None or only_mailbox else ()))
         if self.error:
             raise self.error
         return {"letters": 3, "summary": ["Собрано писем: 3."], "examples": [], "daily_limit": 40,
-                "sent_24h": 0, "room": 40}
+                "sent_24h": 0, "room": 40, "today": 3, "mailboxes": []}
 
-    def start(self, leads_path, count, include_unwritten=False, expected=None):
-        self.calls.append(("start", os.path.basename(leads_path), count, include_unwritten, expected))
+    def start(self, leads_path, count, include_unwritten=False, expected=None, mailbox_count=None, only_mailbox=""):
+        self.calls.append(("start", os.path.basename(leads_path), count, include_unwritten, expected)
+                          + ((mailbox_count, only_mailbox) if mailbox_count is not None or only_mailbox else ()))
         if self.error:
             raise self.error
         return {"started": True, "letters": 3, "daily_limit": 40, "message": "Отправка запущена."}
@@ -720,6 +722,26 @@ class SendWebTest(LeadsCase):
         self.assertIn("Таблицы пока нет", json.loads(body)["error"])
         self.assertEqual(len(service.calls), 2)
 
+    def test_the_number_of_mailboxes_or_one_particular_mailbox_reaches_the_service(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        self.assertEqual(self.request("/api/send/prepare", "POST", {"count": 7, "mailbox_count": 2})[0], 200)
+        self.assertEqual(self.request("/api/send/start", "POST", {"count": 7, "mailbox_count": 1, "expected": 3})[0], 202)
+        self.assertEqual(self.request("/api/send/start", "POST", {"count": 7, "only_mailbox": "2"})[0], 202)
+        self.assertEqual(service.calls, [("prepare", "leads_2026-10-09.csv", 7, False, 2, ""),
+                                         ("start", "leads_2026-10-09.csv", 7, False, 3, 1, ""),
+                                         ("start", "leads_2026-10-09.csv", 7, False, None, None, "2")])
+
+    def test_wrong_mailbox_fields_are_rejected_before_the_service_hears_of_them(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        for extra in ({"mailbox_count": "два"}, {"mailbox_count": True}, {"mailbox_count": 1.5}, {"only_mailbox": 2},
+                      {"only_mailbox": ["2"]}):
+            self.assertEqual(self.request("/api/send/start", "POST", {"count": 3, **extra})[0], 400, extra)
+        self.assertEqual(service.calls, [])
+
     def test_a_wrong_date_in_the_send_request_is_rejected(self):
         service = FakeSendService()
         job = self.start(send_service=service)
@@ -770,6 +792,90 @@ class FakeMailSender:
 
     def close(self):
         pass
+
+
+class MailboxesWebTest(unittest.TestCase):
+    """Страница /mail: подключённые ящики, дата первого письма каждого и пробное письмо с нужного ящика."""
+
+    def start(self, with_data=True, token=TOKEN):
+        patcher = mock.patch.dict(os.environ, {
+            "MAILRU_USER": "one@mail.ru", "MAILRU_APP_PASSWORD": "pw-one-secret",
+            "MAILRU_USER_2": "two@mail.ru", "MAILRU_APP_PASSWORD_2": "pw-two-secret"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.settings_path = os.path.join(tmp.name, "settings.json")
+        self.outbox = []
+        mail = MailService(mailboxes=mailboxes_mod.load_mailboxes(), sender_factory=lambda: FakeMailSender(self.outbox))
+        send = SendService(os.path.join(tmp.name, "data"), self.settings_path) if with_data else None
+        server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
+                             leads_job=LeadsJob(token), mail_service=mail, settings_path=self.settings_path,
+                             send_service=send)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(AppTest.stop, server)
+        self.base = f"http://127.0.0.1:{server.server_port}"
+
+    request = LeadsWebTest.request
+
+    def test_needs_the_password_and_the_data_folder(self):
+        self.start()
+        self.assertEqual(self.request("/api/mail/mailboxes", token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/mailboxes", "POST", {"id": "2"}, token=None)[0], 401)
+        self.start(token="short")
+        self.assertEqual(self.request("/api/mail/mailboxes", token="short")[0], 404)
+        self.start(with_data=False)                                  # сайт на хостинге: журналов нет, прогрева не видно
+        self.assertEqual(self.request("/api/mail/mailboxes")[0], 404)
+        self.assertEqual(self.request("/api/mail/mailboxes", "POST", {"id": "2", "first_message": "2026-10-12"})[0], 404)
+
+    def test_lists_both_mailboxes_with_their_first_day_and_never_a_password(self):
+        self.start()
+        status, _, body = self.request("/api/mail/mailboxes")
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual([(box["id"], box["address"], box["day"], box["quota"], box["room"]) for box in data["mailboxes"]],
+                         [("1", "one@mail.ru", 1, 7, 7), ("2", "two@mail.ru", 1, 7, 7)])
+        for secret in ("pw-one-secret", "pw-two-secret"):
+            self.assertNotIn(secret, body.decode("utf-8"))
+
+    def test_the_date_of_the_first_letter_is_saved_and_changes_the_quota(self):
+        self.start()
+        today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).date()
+        started = (today - datetime.timedelta(days=2)).isoformat()                   # третий день: 13 писем
+        status, _, body = self.request("/api/mail/mailboxes", "POST", {"id": "2", "first_message": started})
+        box = json.loads(body)["mailboxes"][1]
+        self.assertEqual((status, box["first_message"], box["day"], box["quota"]), (200, started, 3, 13))
+        self.assertEqual(json.loads(self.request("/api/mail/mailboxes")[2])["mailboxes"][0]["day"], 1)    # ящик 1 не тронут
+        self.assertEqual(cfg.load_settings(self.settings_path)["mailboxes"]["2"]["first_message"], started)
+        box = json.loads(self.request("/api/mail/mailboxes", "POST", {"id": "2", "first_message": ""})[2])["mailboxes"][1]
+        self.assertEqual((box["first_message"], box["day"]), ("", 1))               # пусто: дата берётся по журналу
+
+    def test_bad_requests_change_nothing(self):
+        self.start()
+        for body in ({"id": "7", "first_message": "2026-10-12"}, {"id": "2", "first_message": "завтра"},
+                     {"first_message": "2026-10-12"}, {"id": 2, "first_message": "2026-10-12"}):
+            self.assertEqual(self.request("/api/mail/mailboxes", "POST", body)[0], 400, body)
+        self.assertFalse(os.path.exists(self.settings_path))
+
+    def test_the_test_letter_goes_from_the_chosen_mailbox(self):
+        self.start()
+        defaults = json.loads(self.request("/api/mail/defaults")[2])
+        self.assertEqual([box["id"] for box in defaults["mailboxes"]], ["1", "2"])
+        letter = {"to": "a@b.ru", "subject": "Т", "body": "Х"}
+        status, _, body = self.request("/api/mail/send", "POST", dict(letter, mailbox="2"))
+        self.assertEqual((status, json.loads(body)["from"]), (200, "two@mail.ru"))
+        self.assertIn("two@mail.ru", self.outbox[-1]["From"])
+        self.assertEqual(json.loads(self.request("/api/mail/send", "POST", letter)[2])["from"], "one@mail.ru")
+        status, _, body = self.request("/api/mail/send", "POST", dict(letter, mailbox="9"))
+        self.assertEqual(status, 400)
+        self.assertIn("Нет такого", json.loads(body)["error"])
+
+    def test_the_page_has_the_mailbox_block_and_no_addresses(self):
+        self.start()
+        text = self.request("/mail", token=None)[2].decode("utf-8")
+        self.assertIn("Ящики и прогрев", text)
+        self.assertIn("Дата первого письма", text)
+        self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))
 
 
 class MailWebTest(unittest.TestCase):
