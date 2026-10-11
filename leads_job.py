@@ -30,6 +30,7 @@ STATE_LABELS = {
         "«SSL» или «прокси» - дело в интернете, VPN, прокси или антивирусе: запустите check_checko.py (правой кнопкой -> "
         "Run) и пришлите, что он напишет. Если «HTTP 401» или «403» - проверьте ключ CHECKO_API_KEY в local.env."),
 }
+EMAIL_AT = leads.WEB_HEADER.index("Почта")
 API_PAUSE = 0.05            # секунд между запросами к API Checko: не больше 20 в секунду при лимите API 32
 
 
@@ -55,9 +56,12 @@ class LeadsJob:
         self._out: Optional[str] = None
         self._restore_last_output()
 
+    def _path_for(self, day: date) -> str:
+        return os.path.join(self._out_dir, f"leads_{day.isoformat()}.csv")
+
     def _restore_last_output(self) -> None:
-        """После перезапуска сайта показываем таблицу последней выгрузки из папки данных, а не пустую страницу:
-        по ней же видно, кому письма уже ушли."""
+        """После перезапуска сайта запоминаем последнюю выгрузку из папки данных: запросы без даты (скачать таблицу,
+        отправить письма) берут её. На странице таблица показывается только за выбранную дату, см. status(day)."""
         try:
             names = sorted(name for name in os.listdir(self._out_dir)
                            if re.fullmatch(r"leads_\d{4}-\d{2}-\d{2}\.csv", name))
@@ -91,7 +95,7 @@ class LeadsJob:
             self._state, self._message = "running", ""
             self._stop.clear()
             self._target, self._limit = target, limit
-            self._out = os.path.join(self._out_dir, f"leads_{target.isoformat()}.csv")
+            self._out = self._path_for(target)
             self._lines.clear()
             self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text), daemon=True)
             self._thread.start()
@@ -121,42 +125,71 @@ class LeadsJob:
         if self._thread:
             self._thread.join(timeout)
 
-    def status(self) -> dict:
+    def _refresh(self, out: str, busy: bool) -> None:
+        """Колонки «Первое письмо», «Дожим», «Закрывающее» в файле таблицы догоняют журнал отправки. Пока таблицу
+        пишет идущая выгрузка, её не трогаем: выгрузка сама запишет их при следующем сохранении."""
+        if busy:
+            return
+        try:
+            leads.refresh_table(out)
+        except OSError:
+            pass                                  # диск недоступен: таблица на странице всё равно строится из журнала
+
+    def _busy_with(self, day: Optional[date]) -> bool:
+        with self._lock:
+            return self._state == "running" and day is not None and day == self._target
+
+    def status(self, day: Optional[date] = None) -> dict:
+        """Состояние выгрузки и таблица за день `day`. Без даты таблицы в ответе нет: страница показывает компании
+        только за выбранную дату, а не все выгрузки подряд."""
         with self._lock:
             state, message = self._state, self._message
-            target, limit, out = self._target, self._limit, self._out
+            target, limit = self._target, self._limit
         counts = {leads.OK: 0, leads.NO_EMAIL: 0, leads.RETRY: 0}
         rows, sent = [], {}
+        out = self._path_for(day) if day else None
         if out:
+            self._refresh(out, self._busy_with(day))
             saved = leads.load_state(leads.state_path(out))
             counts = {status: leads.count(saved, status) for status in counts}
-            rows = leads.table_rows(saved)
-            sent = journal.sent_overview(os.path.dirname(os.path.abspath(out)))
+            rows = leads.table_rows(saved, journal.sent_stages(self._out_dir))
+            emails = {row[EMAIL_AT].lower() for row in rows}
+            # в ответ идут только адреса этой таблицы, а не всё, что когда-либо отправляли
+            sent = {address: entry for address, entry in journal.sent_overview(self._out_dir).items()
+                    if address in emails}
         return {
             "state": state,
             "message": message,
             "date": target.isoformat() if target else "",
+            "view_date": day.isoformat() if day else "",
             "limit": limit,
             "counts": counts,
             "header": leads.WEB_HEADER,
-            "rows": rows,                      # таблица целиком: страница показывает её по мере заполнения
-            "sent": sent,                      # адрес -> что отправлено (журналы отправки): строки таблицы бледнеют
+            "rows": rows,                      # таблица выбранной даты: страница показывает её по мере заполнения
+            "sent": sent,                      # адрес -> последнее отправленное письмо (для текста и времени в строке)
             "log": list(self._lines),
             "has_table": bool(out and os.path.exists(out) and counts[leads.OK]),
             "api_available": self.api_available,
         }
 
-    def output_path(self) -> Optional[str]:
-        """Таблица текущей (или последней) выгрузки, если файл есть и в нём есть организации с почтой."""
-        out = self._out
-        if not out or not os.path.exists(out):
+    def _table_file(self, day: Optional[date]) -> Optional[str]:
+        out = self._path_for(day) if day else self._out
+        return out if out and os.path.exists(out) else None
+
+    def output_path(self, day: Optional[date] = None) -> Optional[str]:
+        """Таблица за день `day` (без даты - текущей или последней выгрузки), если файл есть и в нём есть организации
+        с почтой."""
+        out = self._table_file(day)
+        if not out:
             return None
         return out if leads.count(leads.load_state(leads.state_path(out)), leads.OK) else None
 
-    def table(self):
-        """(имя файла .xlsx, содержимое) или None, если выгрузку ещё не запускали."""
-        out = self._out
-        if not out or not os.path.exists(out):
+    def table(self, day: Optional[date] = None):
+        """(имя файла .xlsx, содержимое) за день `day` (без даты - текущей или последней выгрузки) или None, если
+        выгрузки ещё не было."""
+        out = self._table_file(day)
+        if not out:
             return None
-        rows = leads.table_rows(leads.load_state(leads.state_path(out)))
+        self._refresh(out, self._busy_with(day or self._target))
+        rows = leads.table_rows(leads.load_state(leads.state_path(out)), journal.sent_stages(self._out_dir))
         return os.path.splitext(os.path.basename(out))[0] + ".xlsx", xlsx_table.build(leads.WEB_HEADER, rows)

@@ -7,6 +7,7 @@ from datetime import date
 from unittest import mock
 
 import leads
+from mailing import journal
 from checko_api import CheckoApiError, CheckoApiNotFound, CheckoApiQuotaExceeded
 from checko_updates import CheckoBlocked, CheckoError, NewCompany
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord
@@ -15,8 +16,10 @@ from egrul_pdf import ExtractError
 DAY = date(2026, 10, 9)
 A, B, C = "7707083004", "7707083011", "7707083029"      # с почтой / без почты / ещё нет в ЕГРЮЛ
 
-HEADER = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
+HEADER = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты",
+          "Первое письмо", "Дожим", "Закрывающее"]
 OKVED = ["62.01", "Разработка компьютерного программного обеспечения", "ЕГРЮЛ"]     # + источник почты
+NOT_SENT = ["нет", "нет", "нет"]                                                      # письма этапов 1-3 ещё не уходили
 
 WITH_EMAIL = ("Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
               "Сведения о лице, имеющем право без доверенности действовать от имени юридического лица\n"
@@ -113,10 +116,59 @@ class LeadsTest(LeadsCase):
         self.assertEqual(self.run_leads(self.standard_egrul()), 0)
         self.assertEqual(self.read_csv(), [
             HEADER,
-            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED,
+            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED + NOT_SENT,
         ])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
+
+    # ---- колонки «Первое письмо», «Дожим», «Закрывающее» ----
+
+    def save_journal(self, stage, state):
+        journal.save_state(os.path.join(os.path.dirname(self.out), f"letters_{stage}.sent.json"), state)
+
+    @staticmethod
+    def entry(status=journal.SENT, when="2026-10-11T15:00:00+00:00"):
+        return {"status": status, "time": when, "note": "", "subject": "Тема"}
+
+    def test_stage_columns_follow_the_sending_journals(self):
+        self.run_leads(self.standard_egrul())
+        self.save_journal(1, {"sales@example.ru": self.entry()})
+        self.assertTrue(leads.refresh_table(self.out))
+        self.assertEqual(self.read_csv()[1][6:], ["да", "нет", "нет"])
+        self.save_journal(2, {"sales@example.ru": self.entry()})
+        self.save_journal(3, {"sales@example.ru": self.entry()})
+        self.assertTrue(leads.refresh_table(self.out))
+        self.assertEqual(self.read_csv()[1][6:], ["да", "да", "да"])
+        self.assertFalse(leads.refresh_table(self.out))          # ничего не изменилось - файл не переписывается
+
+    def test_a_rejected_address_is_not_marked_as_sent(self):
+        self.run_leads(self.standard_egrul())
+        self.save_journal(1, {"sales@example.ru": self.entry(journal.REJECTED)})
+        leads.refresh_table(self.out)
+        self.assertEqual(self.read_csv()[1][6:], NOT_SENT)
+
+    def test_a_new_export_keeps_the_sent_marks(self):
+        self.save_journal(1, {"sales@example.ru": self.entry()})
+        self.run_leads(self.standard_egrul())                    # выгрузка сама читает журнал при сохранении
+        self.assertEqual(self.read_csv()[1][6:], ["да", "нет", "нет"])
+
+    def test_refresh_does_not_touch_a_table_without_a_state_file(self):
+        self.assertFalse(leads.refresh_table(self.out))
+        self.assertFalse(os.path.exists(self.out))
+        self.run_leads(self.standard_egrul())
+        with open(self.out, "rb") as fh:
+            before = fh.read()
+        with open(leads.state_path(self.out), "w", encoding="utf-8") as fh:
+            fh.write("{ испорчено")                              # испорченный служебный файл не стирает готовую таблицу
+        self.assertFalse(leads.refresh_table(self.out))
+        with open(self.out, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_table_rows_have_the_stage_flags(self):
+        state = {A: {"status": leads.OK, "name": "Ф", "director": "И", "email": "Sales@Example.ru", "note": ""}}
+        rows = leads.table_rows(state, {"sales@example.ru": {1: "t", 3: "t"}})        # адрес сравнивается без учёта регистра
+        self.assertEqual(rows[0][6:], ["да", "нет", "да"])
+        self.assertEqual(leads.table_rows(state)[0][6:], NOT_SENT)
 
     def test_csv_is_excel_friendly(self):
         self.run_leads(self.standard_egrul())
@@ -132,7 +184,7 @@ class LeadsTest(LeadsCase):
 
     def test_company_with_email_is_kept_even_without_director(self):
         self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))
-        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru", "", "", "ЕГРЮЛ"])
+        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru", "", "", "ЕГРЮЛ"] + NOT_SENT)
 
     def test_log_has_no_personal_data(self):
         self.run_leads(self.standard_egrul())
@@ -158,14 +210,14 @@ class LeadsTest(LeadsCase):
         first = self.standard_egrul()
         self.run_leads(first, FakeChecko(companies(A, B)))
         self.assertEqual(first.searched, [A])               # без почты не трогаем, с почтой дозаполняем
-        self.assertEqual(self.read_csv()[1][3:], OKVED)
+        self.assertEqual(self.read_csv()[1][3:6], OKVED)
         second = self.standard_egrul()
         self.run_leads(second, FakeChecko(companies(A, B)))
         self.assertEqual(second.searched, [])               # во второй раз - уже не нужно
 
     def test_company_without_okved_is_not_asked_again(self):
         self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))      # в этой выписке ОКВЭД нет
-        self.assertEqual(self.read_csv()[1][3:], ["", "", "ЕГРЮЛ"])
+        self.assertEqual(self.read_csv()[1][3:6], ["", "", "ЕГРЮЛ"])
         again = FakeEgrul({A: (b"no-director", "")})
         self.run_leads(again, FakeChecko(companies(A)))
         self.assertEqual(again.searched, [])
@@ -316,7 +368,7 @@ class ApiSourceTest(LeadsCase):
         api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.assertEqual(self.run_api(api), 0)
         self.assertEqual(self.read_csv(), [HEADER,
-                                           [f"checko {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED])
+                                           [f"checko {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED + NOT_SENT])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
         self.assertIn("нет в Checko", self.state()[C]["note"])
@@ -330,7 +382,7 @@ class ApiSourceTest(LeadsCase):
         self.run_api(FakeApi({A: api_payload("c@example.ru", register=False)}), FakeChecko(companies(A)))
         self.assertEqual(self.state()[A]["status"], leads.OK)
         self.assertIn("не из ЕГРЮЛ", self.state()[A]["note"])
-        self.assertEqual(self.read_csv()[1][-1], "контакты Checko")        # такие адреса для рассылки не годятся
+        self.assertEqual(self.read_csv()[1][5], "контакты Checko")        # такие адреса для рассылки не годятся
 
     def test_missing_okved_is_noted_and_left_empty(self):
         self.run_api(FakeApi({A: api_payload("a@example.ru", okved=None)}), FakeChecko(companies(A)))

@@ -63,6 +63,18 @@ def sent_overview(directory: str) -> dict:
     return overview
 
 
+def sent_stages(directory: str) -> dict:
+    """Адрес (маленькими буквами) -> {этап: время} по журналам первого, второго и третьего письма в папке данных:
+    только письма, принятые сервером. Отказ по адресу сюда не входит. Для колонок «Первое письмо», «Дожим»,
+    «Закрывающее» в таблице выгрузки."""
+    stages = {}
+    for stage in (1, 2, 3):
+        for address, entry in load_state(os.path.join(directory, f"letters_{stage}.sent.json")).items():
+            if entry.get("status") == SENT:
+                stages.setdefault(address, {})[stage] = entry.get("time", "")
+    return stages
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 

@@ -249,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/leads/session":
             self._leads_session()
         elif url.path in ("/api/leads/status", "/api/leads/download", "/api/send/status"):
-            self._leads_get(url.path)
+            self._leads_get(url.path, url.query)
         elif url.path in ("/api/search", "/api/extract"):
             wait = self.server.limiter.check(self.client_ip())
             if wait:
@@ -311,14 +311,9 @@ class Handler(BaseHTTPRequestHandler):
         with open(LEADS_PAGE_PATH, "rb") as fh:
             self._send(200, fh.read(), "text/html; charset=utf-8")
 
-    def _leads_get(self, path):
+    def _leads_get(self, path, query=""):
         job = self._leads_enabled()
         if job is None or not self._leads_authorized(job):
-            return
-        if path == "/api/leads/status":
-            payload = job.status()
-            payload["send_enabled"] = self.server.send_service is not None
-            self._json(200, payload)
             return
         if path == "/api/send/status":
             service = self.server.send_service
@@ -327,7 +322,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, service.status())
             return
-        table = job.table()
+        raw_day = (parse_qs(query).get("date") or [""])[0].strip()
+        try:
+            day = date.fromisoformat(raw_day) if raw_day else None      # таблица показывается только за выбранную дату
+        except ValueError:
+            self._error(400, "Дата должна быть в виде ГГГГ-ММ-ДД.")
+            return
+        if path == "/api/leads/status":
+            payload = job.status(day)
+            payload["send_enabled"] = self.server.send_service is not None
+            self._json(200, payload)
+            return
+        table = job.table(day)
         if table is None:
             self._error(404, "Таблицы пока нет.")
         else:
@@ -426,10 +432,14 @@ class Handler(BaseHTTPRequestHandler):
             expected = body.get("expected")
             if expected is not None and not isinstance(expected, int):
                 raise ValueError
+            raw_day = body.get("date") or ""
+            if not isinstance(raw_day, str):
+                raise ValueError
+            day = date.fromisoformat(raw_day.strip()) if raw_day.strip() else None     # письма из таблицы этой даты
         except (ValueError, UnicodeDecodeError):
-            self._error(400, "Некорректный запрос: нужен JSON с числом писем.")
+            self._error(400, "Некорректный запрос: нужен JSON с числом писем и датой ГГГГ-ММ-ДД.")
             return
-        leads_path = job.output_path()
+        leads_path = job.output_path(day)
         if not leads_path:
             self._error(400, "Таблицы пока нет: сначала выгрузите компании.")
             return

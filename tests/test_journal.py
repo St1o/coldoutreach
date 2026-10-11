@@ -5,7 +5,7 @@ import unittest
 from mailing import journal
 
 
-class SentOverviewTest(unittest.TestCase):
+class JournalCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -17,6 +17,8 @@ class SentOverviewTest(unittest.TestCase):
     def entry(status, when="2026-10-11T00:17:03+00:00"):
         return {"status": status, "time": when, "note": "", "subject": "Тема"}
 
+
+class SentOverviewTest(JournalCase):
     def test_empty_folder_has_nothing(self):
         self.assertEqual(journal.sent_overview(self.tmp.name), {})
 
@@ -38,6 +40,23 @@ class SentOverviewTest(unittest.TestCase):
         self.save("letters_test.sent.json", {"me@x.ru": self.entry(journal.SENT)})
         self.save("letters_1.sent.json", {"a@x.ru": self.entry("temp-error")})
         self.assertEqual(journal.sent_overview(self.tmp.name), {})
+
+
+class SentStagesTest(JournalCase):
+    def test_each_accepted_stage_is_listed_with_its_time(self):
+        self.save("letters_1.sent.json", {"a@x.ru": self.entry(journal.SENT), "b@x.ru": self.entry(journal.SENT)})
+        self.save("letters_2.sent.json", {"a@x.ru": self.entry(journal.SENT, "2026-10-14T09:00:00+00:00")})
+        stages = journal.sent_stages(self.tmp.name)
+        self.assertEqual(stages["a@x.ru"], {1: "2026-10-11T00:17:03+00:00", 2: "2026-10-14T09:00:00+00:00"})
+        self.assertEqual(list(stages["b@x.ru"]), [1])
+
+    def test_rejected_test_and_temporary_entries_do_not_count(self):
+        self.save("letters_1.sent.json", {"a@x.ru": self.entry(journal.REJECTED), "b@x.ru": self.entry("temp-error")})
+        self.save("letters_test.sent.json", {"me@x.ru": self.entry(journal.SENT)})
+        self.assertEqual(journal.sent_stages(self.tmp.name), {})
+
+    def test_empty_folder_has_no_stages(self):
+        self.assertEqual(journal.sent_stages(self.tmp.name), {})
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@
 """
 import argparse
 import csv
+import io
 import json
 import os
 import sys
@@ -30,8 +31,11 @@ from checko_api import (
 from checko_updates import CheckoBlocked, CheckoClient, CheckoError
 from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
+from mailing import journal
 
-FIELDS = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
+STAGE_COLUMNS = ["Первое письмо", "Дожим", "Закрывающее"]     # в таблице «да» или «нет»: ушло ли письмо этого этапа
+YES, NO = "да", "нет"
+FIELDS = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"] + STAGE_COLUMNS
 
 SOURCE_REGISTER = "ЕГРЮЛ"             # почта из выписки ЕГРЮЛ: на такие адреса рассылка разрешена
 SOURCE_CHECKO = "контакты Checko"      # почта из контактов Checko («открытые источники»): для рассылки не годится
@@ -131,24 +135,56 @@ def load_state(path: str) -> dict:
         return {}
 
 
-def save_results(out: str, state: dict) -> None:
-    """Служебный файл и таблица (только организации с почтой) перезаписываются целиком."""
+def _folder(out: str) -> str:
+    return os.path.dirname(os.path.abspath(out))
+
+
+def _csv_text(state: dict, sent: dict) -> str:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(FIELDS)
+    writer.writerows(table_rows(state, sent))
+    return buffer.getvalue()
+
+
+def _write_csv(out: str, text: str) -> None:
+    def write(tmp):
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:    # BOM: Excel читает кириллицу
+            fh.write(text)
+
+    _write_atomic(out, write)
+
+
+def save_results(out: str, state: dict, sent: dict = None) -> None:
+    """Служебный файл и таблица (только организации с почтой) перезаписываются целиком. Колонки «Первое письмо»,
+    «Дожим», «Закрывающее» берутся из журналов отправки в той же папке (sent - готовый journal.sent_stages)."""
+    if sent is None:
+        sent = journal.sent_stages(_folder(out))
+
     def write_state(tmp):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False)
 
-    def write_csv(tmp):
-        with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:    # BOM: Excel читает кириллицу
-            writer = csv.writer(fh, delimiter=";")
-            writer.writerow(FIELDS)
-            for entry in state.values():
-                if entry["status"] == OK:
-                    writer.writerow([entry["name"], entry["director"], entry["email"],
-                                     entry.get("okved", ""), entry.get("okved_name", ""),
-                                     entry.get("email_source", "")])
-
     _write_atomic(state_path(out), write_state)
-    _write_atomic(out, write_csv)
+    _write_csv(out, _csv_text(state, sent))
+
+
+def refresh_table(out: str) -> bool:
+    """Обновляет в CSV колонки «Первое письмо», «Дожим», «Закрывающее» по журналам отправки: письма уходят уже
+    после выгрузки, и таблица на диске должна это отражать. True - файл изменился. Выгрузки за эту дату ещё не было
+    (или служебный файл пуст или испорчен) - ничего не трогает, чтобы не стереть готовую таблицу."""
+    state = load_state(state_path(out))
+    if not state:
+        return False
+    text = _csv_text(state, journal.sent_stages(_folder(out)))
+    try:
+        with open(out, encoding="utf-8-sig", newline="") as fh:
+            if fh.read() == text:
+                return False
+    except FileNotFoundError:
+        pass
+    _write_csv(out, text)
+    return True
 
 
 def needs_check(entry) -> bool:
@@ -166,11 +202,19 @@ def count(state: dict, status: str) -> int:
 WEB_HEADER = FIELDS
 
 
-def table_rows(state: dict) -> list:
-    """Строки таблицы для сайта и Excel-файла (те же колонки, что в CSV): организации с почтой, в порядке проверки."""
-    return [[entry["name"], entry["director"], entry["email"], entry.get("okved", ""),
-             entry.get("okved_name", ""), entry.get("email_source", "")]
-            for entry in state.values() if entry["status"] == OK]
+def table_rows(state: dict, sent: dict = None) -> list:
+    """Строки таблицы для сайта и Excel-файла (те же колонки, что в CSV): организации с почтой, в порядке проверки.
+    sent - журнал отправки (journal.sent_stages): в колонках этапов «да», если письмо этого этапа принято сервером."""
+    sent = sent or {}
+    rows = []
+    for entry in state.values():
+        if entry["status"] != OK:
+            continue
+        stages = sent.get(entry["email"].lower(), {})
+        rows.append([entry["name"], entry["director"], entry["email"], entry.get("okved", ""),
+                     entry.get("okved_name", ""), entry.get("email_source", "")]
+                    + [YES if stage in stages else NO for stage in (1, 2, 3)])
+    return rows
 
 
 def _wait(seconds: float, should_stop, sleep) -> bool:

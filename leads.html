@@ -10,12 +10,14 @@
     --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #5d6b7c;
     --line: #dde2e9; --accent: #1f5fd1; --accent-text: #ffffff;
     --ok: #17703a; --error: #b3261e;
+    --sent-bg: rgba(255, 204, 0, .32);              /* отправленное письмо: полупрозрачная жёлтая заливка ячеек */
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #12161c; --card: #1a2029; --text: #e7ebf0; --muted: #98a4b3;
       --line: #2b3441; --accent: #5b92f0; --accent-text: #0c1320;
       --ok: #5ccd8a; --error: #ff8a80;
+      --sent-bg: rgba(255, 204, 0, .24);
     }
   }
   * { box-sizing: border-box; }
@@ -23,7 +25,7 @@
     margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  main { max-width: 980px; margin: 0 auto; }
+  main { max-width: 1200px; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin: 0 0 4px; }
   h2 { font-size: 1.15rem; margin: 0 0 8px; }
   .sub { color: var(--muted); margin: 0 0 8px; }
@@ -69,7 +71,11 @@
   tr:last-child td { border-bottom: 0; }
   td.empty { color: var(--muted); text-align: center; }
   td.mail-status { white-space: nowrap; color: var(--muted); font-size: .8rem; }
-  tr.sent td { opacity: .4; }                       /* письмо ушло: строка бледнеет */
+  td.stage { text-align: center; white-space: nowrap; }
+  td.stage.no { color: var(--muted); }
+  /* Ушло письмо: строка залита жёлтым до колонки последнего отправленного письма (первое, дожим, закрывающее);
+     колонки писем, которых ещё не было, остаются без заливки. */
+  td.sent { background: var(--sent-bg); }
   tr.rejected td { color: var(--error); }
   .note { color: var(--muted); font-size: .85rem; margin: 8px 0 0; }
   pre {
@@ -87,7 +93,7 @@
 <body>
 <main>
   <h1>Новые компании: ФИО и почта</h1>
-  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора, почта и вид деятельности берутся из API Checko; в таблицу попадают только организации с почтой. Таблица заполняется на этой странице по мере проверки, письма отправляются кнопкой ниже.</p>
+  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора, почта и вид деятельности берутся из API Checko; в таблицу попадают только организации с почтой. Таблица показывается только за выбранную дату и заполняется на этой странице по мере проверки, письма отправляются кнопкой ниже.</p>
   <p class="nav"><a href="/mail">Пробное письмо и лимит отправки</a></p>
 
   <form id="login" class="card" autocomplete="off" hidden>
@@ -122,7 +128,7 @@
     </form>
 
     <section id="progress" class="card" hidden>
-      <div class="counts">
+      <div id="counts" class="counts">
         <div><b id="n-ok">0</b><span>с почтой (в таблице)</span></div>
         <div><b id="n-sent">0</b><span>письмо отправлено</span></div>
         <div><b id="n-wait">0</b><span>ждут отправки</span></div>
@@ -137,7 +143,7 @@
 
     <section id="send" class="card" hidden>
       <h2>Отправка писем</h2>
-      <p class="note">Письма первого этапа уходят из таблицы выше: сначала вы увидите, что будет отправлено, и подтвердите. Отправка идёт в фоне с паузой между письмами; лимит в сутки задаётся на странице <a href="/mail">/mail</a>. Те, кому письмо уже ушло, в таблице бледные и повторно не получают его.</p>
+      <p class="note">Письма первого этапа уходят из таблицы выше: сначала вы увидите, что будет отправлено, и подтвердите. Отправка идёт в фоне с паузой между письмами; лимит в сутки задаётся на странице <a href="/mail">/mail</a>. Те, кому письмо уже ушло, в таблице залиты жёлтым (до колонки последнего ушедшего письма: первое письмо, дожим, закрывающее) и повторно первое письмо не получают.</p>
       <div class="row">
         <div class="field">
           <label for="send-count">Сколько писем отправить <span class="hint">для нового ящика 10–15 в сутки</span></label>
@@ -173,6 +179,7 @@ let timer = null;
 let sendEnabled = false;
 let sendState = null;
 let pending = null;                      // что показали в окне подтверждения: отправляем ровно это
+let shownDate = '';                      // за какую дату показана таблица
 let watchUntil = 0;                      // до этого момента опрашиваем сервер, даже если отправка ещё не «взяла замок»
 
 function savedPassword() {
@@ -232,13 +239,25 @@ async function fetchSession() {
 
 const WHEN = { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' };
 const STAGES = { 1: 'Письмо', 2: 'Дожим', 3: 'Закрывающее' };
+const STAGE_TITLES = ['Первое письмо', 'Дожим', 'Закрывающее'];     // колонки таблицы: «да» или «нет»
+const YES = 'да';
+
+// Дата, за которую показываем таблицу: та, что введена в поле, если она целая и настоящая; иначе таблицы нет.
+function viewDate() {
+  const value = $('date').value.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return '';
+  const day = new Date(Date.UTC(+match[1], +match[2] - 1, +match[3]));
+  const real = day.getUTCFullYear() === +match[1] && day.getUTCMonth() === +match[2] - 1 && day.getUTCDate() === +match[3];
+  return real ? value : '';
+}
 
 function mailStatus(sent) {
   if (!sent) return { text: 'ждёт отправки', cls: '' };
   if (sent.status === 'rejected') return { text: 'адрес не принят', cls: 'rejected' };
   let when = '';
   try { when = ' ' + new Date(sent.time).toLocaleString('ru-RU', WHEN); } catch (e) { /* без времени */ }
-  return { text: (STAGES[sent.stage] || 'Письмо') + ' отправлено' + when, cls: 'sent' };
+  return { text: (STAGES[sent.stage] || 'Письмо') + ' отправлено' + when, cls: '' };
 }
 
 let lastKey = '';
@@ -247,6 +266,7 @@ function renderTable(header, rows, sent, follow) {
   if (key === lastKey) return;                     // ничего не изменилось - не перерисовываем
   lastKey = key;
   const emailAt = Math.max(0, header.indexOf('Почта'));
+  const stageAt = STAGE_TITLES.map((title) => header.indexOf(title));
   const table = $('rows');
   table.replaceChildren();
   const head = table.createTHead().insertRow();
@@ -254,7 +274,16 @@ function renderTable(header, rows, sent, follow) {
   const body = table.createTBody();
   rows.forEach((row) => {
     const tr = body.insertRow();
-    row.forEach((value) => { tr.insertCell().textContent = value; });   // textContent: чужой текст не станет разметкой
+    // Заливка идёт от первой колонки до колонки последнего ушедшего письма: ушло только первое - до «Первое письмо»,
+    // был дожим - до «Дожим», закрывающее - до «Закрывающее». Колонки писем, которых не было, не заливаются.
+    let filledTo = -1;
+    stageAt.forEach((at) => { if (at >= 0 && row[at] === YES) filledTo = at; });
+    row.forEach((value, at) => {
+      const cell = tr.insertCell();
+      cell.textContent = value;                    // textContent: чужой текст не станет разметкой
+      if (stageAt.includes(at)) cell.className = 'stage' + (value === YES ? '' : ' no');
+      if (at <= filledTo) cell.classList.add('sent');
+    });
     const state = mailStatus((sent || {})[String(row[emailAt] || '').toLowerCase()]);
     const cell = tr.insertCell();
     cell.className = 'mail-status';
@@ -273,25 +302,29 @@ function renderTable(header, rows, sent, follow) {
 }
 
 function sentCounts(data) {
-  const header = data.header || [];
-  const emailAt = Math.max(0, header.indexOf('Почта'));
-  let sent = 0;
-  (data.rows || []).forEach((row) => {
-    const entry = (data.sent || {})[String(row[emailAt] || '').toLowerCase()];
-    if (entry && entry.status === 'sent') sent += 1;
-  });
-  return { sent, wait: (data.rows || []).length - sent };
+  const firstAt = Math.max(0, (data.header || []).indexOf(STAGE_TITLES[0]));
+  const rows = data.rows || [];
+  const sent = rows.filter((row) => row[firstAt] === YES).length;
+  return { sent, wait: rows.length - sent };
 }
 
-function render(data) {
+// Таблица видна, только когда выбрана дата и за неё уже что-то собрано (или сейчас собирается).
+function render(data, running) {
+  const c = data.counts;
+  const collected = c.ok + c.no_email + c.retry > 0 || running;
   $('progress').hidden = false;
-  renderTable(data.header || [], data.rows || [], data.sent || {}, data.state === 'running');
-  const counts = sentCounts(data);
-  $('n-ok').textContent = data.counts.ok;
-  $('n-sent').textContent = counts.sent;
-  $('n-wait').textContent = counts.wait;
-  $('n-no').textContent = data.counts.no_email;
-  $('n-retry').textContent = data.counts.retry;
+  $('counts').hidden = !collected;
+  if (collected) {
+    renderTable(data.header || [], data.rows || [], data.sent || {}, running);
+    const counts = sentCounts(data);
+    $('n-ok').textContent = c.ok;
+    $('n-sent').textContent = counts.sent;
+    $('n-wait').textContent = counts.wait;
+    $('n-no').textContent = c.no_email;
+    $('n-retry').textContent = c.retry;
+  } else {
+    $('table-wrap').hidden = true;
+  }
   const log = $('log');
   log.textContent = data.log.join('\n');
   log.hidden = !data.log.length;
@@ -317,9 +350,11 @@ function renderSend(data, state) {
 
 async function poll() {
   clearTimeout(timer);
+  const day = viewDate();
+  shownDate = day;
   let data;
   try {
-    data = await (await api('/api/leads/status')).json();
+    data = await (await api('/api/leads/status?date=' + encodeURIComponent(day))).json();
   } catch (error) {
     if (error.status === 401 && !triedSession) {         // пароль устарел или не тот: берём актуальный у сайта
       triedSession = true;
@@ -333,31 +368,40 @@ async function poll() {
     return;
   }
   triedSession = false;
+  if (day !== viewDate()) { poll(); return; }            // пока ждали ответ, дату сменили: ответ уже не про неё
   $('login').hidden = true;
   $('app').hidden = false;
   storePassword(password);
   sendEnabled = !!data.send_enabled;
-  const hasRows = (data.rows || []).length > 0;
-  $('stop').hidden = data.state !== 'running';
-  if (data.state === 'idle' && !hasRows) {
-    $('start').disabled = false;               // ничего ещё не запускали
-    $('progress').hidden = true;
-    $('send').hidden = true;
-    return;
-  }
-  render(data);
-  if (data.state === 'running') {
-    setStatus('Идёт выгрузка за ' + data.date + '. Не закрывайте страницу, пока она идёт.');
+  const running = data.state === 'running';
+  const c = data.counts;
+  const collected = c.ok + c.no_email + c.retry > 0;
+  const mine = day && data.date === day;                 // идущая или последняя выгрузка - за выбранную дату
+  $('stop').hidden = !running;
+  if (running) {
+    setStatus('Идёт выгрузка за ' + data.date + '.' + (mine || !day ? '' : ' Показана таблица за ' + day + '.')
+              + ' Не закрывайте страницу, пока она идёт.');
   } else {
     $('start').disabled = false;
-    if (data.state === 'idle') {
-      setStatus('Показана последняя выгрузка за ' + data.date + '.');
-    } else {
+    if (!day) {
+      setStatus('');                                     // дата не выбрана - показывать нечего
+    } else if (!collected) {
+      setStatus('За ' + day + ' выгрузки ещё не было: вставьте текст с Checko и нажмите «Запустить».');
+    } else if (mine && data.state !== 'idle') {
       const kind = data.state === 'done' ? 'ok' : 'error';
       if (data.state === 'stopped' && data.log.join(' ').includes('Checko недоступен')) $('text').focus();
       setStatus(data.message || '', kind);
+    } else {
+      setStatus('Показана сохранённая выгрузка за ' + day + '.');
     }
   }
+  if (!day && !running) {
+    $('progress').hidden = true;
+    $('send').hidden = true;
+    renderSend({ rows: [] }, null);
+    return;
+  }
+  render(data, running && mine);
   let state = null;
   if (sendEnabled) {
     try { state = await (await api('/api/send/status')).json(); } catch (error) { state = null; }
@@ -365,7 +409,7 @@ async function poll() {
   renderSend(data, state);
   const sending = !!(state && state.running);
   if (sending) watchUntil = Date.now() + 8000;          // и ещё несколько секунд после конца: последние письма уже в журнале
-  if (data.state === 'running') timer = setTimeout(poll, 3000);
+  if (running) timer = setTimeout(poll, 3000);
   else if (sending) timer = setTimeout(poll, 5000);
   else if (Date.now() < watchUntil) timer = setTimeout(poll, 2000);
 }
@@ -453,7 +497,10 @@ function updateDatesHint() {
        : ' За ' + chosen + ' в тексте организаций нет: выберите одну из этих дат.');
 }
 $('text').addEventListener('input', updateDatesHint);
-$('date').addEventListener('input', updateDatesHint);
+$('date').addEventListener('input', () => {
+  updateDatesHint();
+  if (viewDate() !== shownDate) poll();            // выбрали другую дату (или стёрли её): таблица только за выбранную
+});
 
 // ---- кнопка «Отправить»: сначала проверка, потом подтверждение, потом запуск ----
 
@@ -498,7 +545,7 @@ $('send-btn').addEventListener('click', async () => {
   $('send-btn').disabled = true;
   setSendStatus('Проверяем письма…');
   try {
-    const request = { count, include_unwritten: $('unwritten').checked };
+    const request = { count, include_unwritten: $('unwritten').checked, date: viewDate() };   // письма из таблицы выбранной даты
     const info = await (await api('/api/send/prepare', {
       method: 'POST', headers: jsonHeaders(), body: JSON.stringify(request) })).json();
     if (!info.letters) {
@@ -539,7 +586,7 @@ $('confirm-yes').addEventListener('click', async () => {
 
 $('download').addEventListener('click', async () => {
   try {
-    const response = await api('/api/leads/download');
+    const response = await api('/api/leads/download?date=' + encodeURIComponent(viewDate()));
     const blob = await response.blob();
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);

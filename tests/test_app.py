@@ -274,6 +274,7 @@ class RateLimiterTest(unittest.TestCase):
 
 # ---- закрытая выгрузка «новые компании» (/leads) ----
 
+import csv
 import datetime
 import io
 import tempfile
@@ -380,45 +381,103 @@ class LeadsWebTest(LeadsCase):
         status, _, body = self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
         self.assertEqual((status, json.loads(body)["date"]), (202, "2026-10-09"))
         job.join(5)
-        data = json.loads(self.request("/api/leads/status")[2])
+        data = json.loads(self.request("/api/leads/status?date=2026-10-09")[2])
         self.assertEqual(data["state"], "done")
+        self.assertEqual(data["view_date"], "2026-10-09")
         self.assertEqual(data["counts"], {"ok": 1, "no_email": 0, "retry": 0})
         self.assertTrue(data["has_table"])
         self.assertIn("[1/1] 7707083004: ok", data["log"])
         self.assertEqual(self.calls, [(datetime.date(2026, 10, 9), 5)])
 
-        self.assertEqual(data["header"], ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"])
-        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", ""]])        # таблица на странице
+        header = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты",
+                  "Первое письмо", "Дожим", "Закрывающее"]
+        self.assertEqual(data["header"], header)
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", "", "нет", "нет", "нет"]])        # таблица на странице
 
-        status, headers, body = self.request("/api/leads/download")
-        self.assertEqual(status, 200)
-        self.assertIn("spreadsheetml.sheet", headers["Content-Type"])
-        self.assertIn('filename="leads_2026-10-09.xlsx"', headers["Content-Disposition"])
-        sheet = openpyxl.load_workbook(io.BytesIO(body)).active
-        self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
-                         [["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"], ["ФИРМА", "Иванов Иван", "a@b.ru", None, None, None]])
+        for query in ("?date=2026-10-09", ""):                 # без даты - последняя выгрузка
+            status, headers, body = self.request("/api/leads/download" + query)
+            self.assertEqual(status, 200)
+            self.assertIn("spreadsheetml.sheet", headers["Content-Type"])
+            self.assertIn('filename="leads_2026-10-09.xlsx"', headers["Content-Disposition"])
+            sheet = openpyxl.load_workbook(io.BytesIO(body)).active
+            self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
+                             [header, ["ФИРМА", "Иванов Иван", "a@b.ru", None, None, None, "нет", "нет", "нет"]])
 
     def test_status_marks_who_already_got_a_letter(self):
         job = self.start()
         self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
         job.join(5)
-        data = json.loads(self.request("/api/leads/status")[2])
+        data = json.loads(self.request("/api/leads/status?date=2026-10-09")[2])
         self.assertEqual((data["sent"], data["send_enabled"]), ({}, False))
         journal.save_state(os.path.join(self.tmp.name, "letters_1.sent.json"),
-                           {"a@b.ru": journal.make_entry(journal.SENT, "Тема", {})})
-        data = json.loads(self.request("/api/leads/status")[2])
+                           {"a@b.ru": journal.make_entry(journal.SENT, "Тема", {}),
+                            "other@x.ru": journal.make_entry(journal.SENT, "Тема", {})})
+        data = json.loads(self.request("/api/leads/status?date=2026-10-09")[2])
         self.assertEqual(data["sent"]["a@b.ru"]["stage"], 1)
         self.assertEqual(data["sent"]["a@b.ru"]["status"], journal.SENT)
+        self.assertEqual(list(data["sent"]), ["a@b.ru"])         # чужие адреса из журнала в ответ не попадают
+        self.assertEqual(data["rows"][0][6:], ["да", "нет", "нет"])
 
-    def test_the_last_table_is_still_shown_after_the_site_restarts(self):
+    def test_stage_columns_are_kept_in_the_table_file_too(self):
         job = self.start()
         self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
         job.join(5)
-        data = LeadsJob(TOKEN, run=self.fake_run, out_dir=self.tmp.name, api_key="KEY").status()
-        self.assertEqual((data["state"], data["date"]), ("idle", "2026-10-09"))
-        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", ""]])
+        for stage in (1, 2):
+            journal.save_state(os.path.join(self.tmp.name, f"letters_{stage}.sent.json"),
+                               {"a@b.ru": journal.make_entry(journal.SENT, "Тема", {})})
+        data = json.loads(self.request("/api/leads/status?date=2026-10-09")[2])
+        self.assertEqual(data["rows"][0][6:], ["да", "да", "нет"])
+        with open(os.path.join(self.tmp.name, "leads_2026-10-09.csv"), encoding="utf-8-sig", newline="") as fh:
+            rows = list(csv.reader(fh, delimiter=";"))
+        self.assertEqual(rows[0][6:], ["Первое письмо", "Дожим", "Закрывающее"])
+        self.assertEqual(rows[1][6:], ["да", "да", "нет"])           # файл на диске ведётся так же, как таблица на странице
+
+    # ---- таблица только за выбранную дату ----
+
+    def test_without_a_date_there_is_no_table(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        for query in ("", "?date="):                              # страницу открыли снова, дату не выбрали
+            data = json.loads(self.request("/api/leads/status" + query)[2])
+            self.assertEqual((data["rows"], data["sent"], data["has_table"], data["view_date"]), ([], {}, False, ""), query)
+            self.assertEqual(data["counts"], {"ok": 0, "no_email": 0, "retry": 0})
+            self.assertEqual(data["header"][-3:], ["Первое письмо", "Дожим", "Закрывающее"])
+
+    def test_another_date_shows_its_own_table_only(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        data = json.loads(self.request("/api/leads/status?date=2026-10-08")[2])
+        self.assertEqual((data["rows"], data["has_table"], data["view_date"]), ([], False, "2026-10-08"))
+        self.assertEqual(data["date"], "2026-10-09")              # «date» - за что шла последняя выгрузка
+        self.assertEqual(self.request("/api/leads/download?date=2026-10-08")[0], 404)
+
+    def test_a_table_saved_earlier_is_shown_for_its_date_after_a_restart(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        fresh = LeadsJob(TOKEN, run=self.fake_run, out_dir=self.tmp.name, api_key="KEY")
+        self.assertEqual((fresh.status()["state"], fresh.status()["rows"]), ("idle", []))      # без даты - пусто
+        data = fresh.status(datetime.date(2026, 10, 9))
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", "", "нет", "нет", "нет"]])
         self.assertTrue(data["has_table"])
-        self.assertEqual(LeadsJob(TOKEN, run=self.fake_run, out_dir=tempfile.mkdtemp()).status()["rows"], [])
+        self.assertEqual(LeadsJob(TOKEN, run=self.fake_run, out_dir=tempfile.mkdtemp()).status(
+            datetime.date(2026, 10, 9))["rows"], [])
+
+    def test_a_wrong_date_is_rejected(self):
+        self.start()
+        for query in ("?date=%D0%B2%D1%87%D0%B5%D1%80%D0%B0", "?date=2026-13-45", "?date=2026-10-9x"):
+            self.assertEqual(self.request("/api/leads/status" + query)[0], 400, query)
+            self.assertEqual(self.request("/api/leads/download" + query)[0], 400, query)
+
+    def test_the_last_table_is_remembered_for_downloads_after_the_site_restarts(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        fresh = LeadsJob(TOKEN, run=self.fake_run, out_dir=self.tmp.name, api_key="KEY")
+        self.assertEqual(fresh.table()[0], "leads_2026-10-09.xlsx")
+        self.assertTrue(fresh.output_path().endswith("leads_2026-10-09.csv"))
 
     def test_the_date_must_be_chosen_by_the_user(self):
         self.start()
@@ -645,6 +704,29 @@ class SendWebTest(LeadsCase):
                                          ("start", "leads_2026-10-09.csv", 7, False, 3)])
         self.assertTrue(json.loads(self.request("/api/leads/status")[2])["send_enabled"])
         self.assertEqual(json.loads(self.request("/api/send/status")[2])["lines"], ["Сейчас отправка не идёт."])
+
+    def test_the_letters_come_from_the_table_of_the_chosen_date(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        status, _, body = self.request("/api/send/prepare", "POST", {"count": 7, "date": "2026-10-09"})
+        self.assertEqual(status, 200)
+        status, _, body = self.request("/api/send/start", "POST", {"count": 7, "expected": 3, "date": " 2026-10-09 "})
+        self.assertEqual(status, 202)
+        self.assertEqual(service.calls, [("prepare", "leads_2026-10-09.csv", 7, False),
+                                         ("start", "leads_2026-10-09.csv", 7, False, 3)])
+        status, _, body = self.request("/api/send/start", "POST", {"count": 7, "date": "2026-10-08"})
+        self.assertEqual(status, 400)                              # за эту дату выгрузки не было: чужую таблицу не берём
+        self.assertIn("Таблицы пока нет", json.loads(body)["error"])
+        self.assertEqual(len(service.calls), 2)
+
+    def test_a_wrong_date_in_the_send_request_is_rejected(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        for date_value in ("вчера", "2026-13-45", 20261009, ["2026-10-09"]):
+            self.assertEqual(self.request("/api/send/start", "POST", {"count": 3, "date": date_value})[0], 400, date_value)
+        self.assertEqual(service.calls, [])
 
     def test_no_table_means_no_send(self):
         service = FakeSendService()
