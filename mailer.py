@@ -174,8 +174,10 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             senders[box.id] = MailruSender(box.user, box.password, port=port)
     names = {box.id: box.from_name for box in slots}
 
+    draw = getattr(rng, "random", rng)           # rng - либо объект с .random() (random, random.Random), либо функция без аргументов
+
     def pause_for() -> float:
-        return pause * (1 + rng.random() * jitter) if jitter else pause     # ровная пауза похожа на программу
+        return pause * (1 + draw() * jitter) if jitter else pause           # ровная пауза похожа на программу
 
     code, temp_in_a_row, done, done_by = 0, 0, 0, Counter()
     try:

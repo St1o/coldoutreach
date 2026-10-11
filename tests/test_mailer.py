@@ -704,5 +704,24 @@ class SslContextTest(unittest.TestCase):
                 smtpmod.make_ssl_context()
 
 
+class PauseSpreadTest(RunTest):
+    def test_the_pause_is_random_between_the_minimum_and_the_spread(self):
+        values = iter([0.0, 1.0])
+        code = self.go(table("a@b.ru;Т1;Х", "c@d.ru;Т2;Х", "e@f.ru;Т3;Х"), send=True, pause=30, jitter=1.5,
+                       rng=lambda: next(values))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.sleeps, [30, 75])             # от 30 до 30 * (1 + 1.5) секунд
+
+    def test_without_spread_the_pause_is_exact(self):
+        self.go(table("a@b.ru;Т1;Х", "c@d.ru;Т2;Х"), send=True, pause=30, jitter=0)
+        self.assertEqual(self.sleeps, [30])
+
+    def test_the_command_line_spreads_the_pause_by_default(self):
+        from unittest import mock
+        with mock.patch.object(mailer, "run", return_value=0) as fake:
+            mailer.main(["x.csv", "--env", os.devnull, "--settings", os.devnull])
+        self.assertEqual(fake.call_args.kwargs["jitter"], 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

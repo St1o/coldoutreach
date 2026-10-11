@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 
 FALLBACK_ID = "12"
 EXCLUDE_ID = "-"                # решение агента в карте ОКВЭД: этому виду деятельности не писать
+TIME_TAGS = ("утро", "день", "вечер")      # пометки вариантов по времени суток: «- утро: Доброе утро!»; без пометки - всегда
+SUBJECT_SLOT = "тема"                      # место «тема» в разделе «Варианты…»: темы по кругу вместо одной рекомендованной
 
 
 class ComposeError(Exception):
@@ -21,6 +23,15 @@ class Group:
         """{{группа_словами}}: название группы маленькими буквами; у запасной группы пусто."""
         return "" if self.id == FALLBACK_ID else self.name[:1].lower() + self.name[1:]
 
+    @property
+    def short(self) -> str:
+        """{{группа_кратко}} (только в темах): название группы до двоеточия или скобки, маленькими буквами:
+        «услуги для бизнеса»; у запасной группы пусто, тогда берутся темы без неё."""
+        if self.id == FALLBACK_ID:
+            return ""
+        base = re.split(r"[:(,]", self.name, maxsplit=1)[0].strip()
+        return base[:1].lower() + base[1:]
+
 
 @dataclass
 class Texts:
@@ -31,6 +42,7 @@ class Texts:
     pain2: dict = field(default_factory=dict)
     fallback1: str = ""
     fallback2: str = ""
+    variants: dict = field(default_factory=dict)      # имя места -> [(пометка времени суток или "", текст)]; раздел «Варианты…»
 
 
 def _key(name: str) -> str:
@@ -204,6 +216,8 @@ def parse_letters(text: str) -> Texts:
                     _store(texts, 2, found.group(1), found.group(2))
         elif heading.startswith("Закрывающее"):
             own[3] = _fenced(lines)
+        elif heading.startswith("Варианты"):
+            texts.variants = _parse_variants(lines)
         elif heading.startswith("Блоки боли для письма 1"):
             name, parts = None, []
             for line in lines + ["**"]:
@@ -216,6 +230,26 @@ def parse_letters(text: str) -> Texts:
                     parts.append(line.strip())
     texts.subjects, texts.templates, texts.fallback_templates = subjects, templates, fallback_templates
     return texts
+
+
+def _parse_variants(lines) -> dict:
+    """Раздел «Варианты фраз»: «### место» и под ним строки «- вариант». Пометка времени суток в начале строки:
+    «- утро: Доброе утро!» (утро, день, вечер); без пометки вариант годится всегда. Остальные строки пропускаются."""
+    variants, slot = {}, None
+    for line in lines:
+        header = re.match(r"^###\s+(.+?)\s*$", line)
+        if header:
+            slot = header.group(1).strip().casefold()
+            variants.setdefault(slot, [])
+            continue
+        item = re.match(r"^\s*[-*]\s+(.*\S)\s*$", line)
+        if item and slot is not None:
+            tag, text = "", item.group(1)
+            tagged = re.match(r"^(" + "|".join(TIME_TAGS) + r")\s*:\s*(.+)$", text, re.I)
+            if tagged:
+                tag, text = tagged.group(1).casefold(), tagged.group(2).strip()
+            variants[slot].append((tag, text))
+    return variants
 
 
 def _store(texts: Texts, stage: int, name: str, block: str) -> None:
