@@ -259,6 +259,7 @@ class TwoMailboxesTest(ServiceCase):
         state = self.service.status()
         self.assertEqual([(box["id"], box["address"], box["room"]) for box in state["mailboxes"]],
                          [("1", "sender@mail.ru", 7), ("2", "second@mail.ru", 7)])
+        self.assertEqual([(box["week"], box["week_cap"]) for box in state["mailboxes"]], [(1, 15), (1, 15)])
         text = json.dumps(self.service.prepare(self.leads, 10), ensure_ascii=False) + json.dumps(state, ensure_ascii=False)
         for secret in ("second-secret-pw", "@x.ru", "СЕКРЕТНАЯ"):
             self.assertNotIn(secret, text)
@@ -268,6 +269,15 @@ class TwoMailboxesTest(ServiceCase):
         box = self.service.mailbox_infos()[1]
         self.assertEqual((box["first_message"], box["source"]), ("2026-01-01", "задана вручную"))
         self.assertEqual(box["room"], 40)                          # давно прогрет: действует только лимит в сутки
+        self.assertEqual((box["week"], box["week_cap"]), (3, 40))
+
+    def test_the_week_cap_limits_what_the_page_promises_for_today(self):
+        cfg.save_settings({"mailboxes": {"1": {"first_message": "2026-01-01"}}}, self.settings)   # ящик 1 давно прогрет
+        self.write_leads([lead(f"p{i}@x.ru", "47.11") for i in range(30)])
+        info = self.service.prepare(self.leads, 30)
+        self.assertEqual((info["letters"], info["today"], info["room"]), (30, 30, 47))           # 40 + 7
+        info = self.service.prepare(self.leads, 30, only_mailbox="2")
+        self.assertEqual((info["today"], info["room"]), (7, 7))                                  # новый ящик: 7, а не 30
 
 
 if __name__ == "__main__":

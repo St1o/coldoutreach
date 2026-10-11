@@ -532,8 +532,8 @@ class DailyLimitSettingTest(unittest.TestCase):
 
     def test_parse_accepts_whole_numbers_in_range_only(self):
         self.assertEqual(cfg.parse_daily_limit(" 12 "), 12)
-        self.assertEqual(cfg.parse_daily_limit(200), 200)
-        for bad in ("0", "201", "-1", "abc", "", None, "1.5"):
+        self.assertEqual(cfg.parse_daily_limit(50), 50)                       # выше 50 с /mail не ставится
+        for bad in ("0", "51", "201", "-1", "abc", "", None, "1.5"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 cfg.parse_daily_limit(bad)
 

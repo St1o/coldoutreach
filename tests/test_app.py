@@ -944,13 +944,16 @@ class MailWebTest(unittest.TestCase):
             self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["daily_limit"], 12)
             # то же значение видит программа отправки и оно главнее local.env
             self.assertEqual(cfg.resolve_daily_limit(settings_path=self.settings_path), (12, "сайт"))
+            self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["max"], 50)
+            status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": "50"})
+            self.assertEqual((status, json.loads(body)["daily_limit"]), (200, 50))
 
     def test_bad_limit_is_refused_and_nothing_is_saved(self):
         self.start()
-        for bad in ("0", "201", "-5", "abc", "", "1.5"):
+        for bad in ("0", "51", "201", "-5", "abc", "", "1.5"):
             status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": bad})
             self.assertEqual(status, 400, bad)
-            self.assertIn("от 1 до 200", json.loads(body)["error"])
+            self.assertIn("от 1 до 50", json.loads(body)["error"])
         self.assertFalse(os.path.exists(self.settings_path))
 
     def test_page_has_the_limit_block_for_one_mailbox(self):

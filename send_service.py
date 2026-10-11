@@ -19,7 +19,7 @@ from mailing import config as mailcfg, journal, mailboxes as boxes
 from mailing.lock import lock_holder
 from mailing.table import Letter, LettersError
 
-MIN_COUNT, MAX_COUNT = 1, mailcfg.DAILY_LIMIT_MAX
+MIN_COUNT, MAX_COUNT = 1, 200               # писем в партии за одно нажатие (лимит в сутки и предел недели режут её сами)
 LETTERS_NAME = "letters_1.csv"
 _COUNT = re.compile(r"Собрано писем: (\d+)")
 _CLI_HINT = " (напишите его или добавьте --include-unwritten)"      # подсказка для командной строки
@@ -90,7 +90,8 @@ class SendService:
                 continue
             state = boxes.mailbox_state(self.data_dir, box.id, settings, ceiling, now)
             infos.append({"id": box.id, "label": box.label, "address": box.user, "first_message": state["first_message"] or "",
-                          "source": state["source"], "day": state["day"], "quota": state["quota"],
+                          "source": state["source"], "day": state["day"], "week": state["week"], "week_cap": state["week_cap"],
+                          "quota": state["quota"],
                           "sent_today": state["sent_today"], "sent_24h": state["sent_24h"], "ceiling": ceiling,
                           "room": None if state["room"] == math.inf else state["room"], "text": boxes.describe_state(state),
                           "selected": chosen is None or box.id in chosen})

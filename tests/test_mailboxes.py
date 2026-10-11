@@ -7,7 +7,7 @@ import random
 import smtplib
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import mailer
@@ -92,11 +92,12 @@ class SelectTest(unittest.TestCase):
 
 
 class WarmupQuotaTest(unittest.TestCase):
-    def test_seven_on_the_first_day_then_three_more_every_day(self):
-        self.assertEqual([boxes.warmup_quota(day) for day in range(1, 8)], [7, 10, 13, 16, 19, 22, 25])
+    def test_seven_on_the_first_day_then_three_more_every_day_until_the_week_cap(self):
+        self.assertEqual([boxes.warmup_quota(day) for day in range(1, 8)], [7, 10, 13, 15, 15, 15, 15])
+        self.assertEqual(boxes.warmup_quota(8), 28)                        # новая неделя: 28 = 7 + 3 * 7, под пределом 30
 
     def test_never_above_the_daily_limit_and_zero_before_the_first_day(self):
-        self.assertEqual([boxes.warmup_quota(day, 15) for day in (1, 2, 3, 4, 9)], [7, 10, 13, 15, 15])
+        self.assertEqual([boxes.warmup_quota(day, 12) for day in (1, 2, 3, 4, 9)], [7, 10, 12, 12, 12])
         self.assertEqual(boxes.warmup_quota(0, 40), 0)
         self.assertEqual(boxes.warmup_quota(-3), 0)
 
@@ -106,6 +107,45 @@ class WarmupQuotaTest(unittest.TestCase):
         self.assertEqual(boxes.warmup_day(date(2026, 10, 10), today), 3)
         self.assertEqual(boxes.warmup_day(None, today), 1)                  # писем ещё не было: первый день - сегодня
         self.assertEqual(boxes.warmup_day(date(2026, 10, 14), today), -1)   # дата в будущем
+
+
+class WeekCapTest(unittest.TestCase):
+    """Жёсткий предел по неделям прогрева: дни 1-7 не больше 15, дни 8-14 не больше 30, с дня 15 не больше 40."""
+
+    def test_the_values_are_named_constants_next_to_the_ramp(self):
+        self.assertEqual((boxes.WARMUP_FIRST_DAY, boxes.WARMUP_STEP), (7, 3))
+        self.assertEqual(boxes.WARMUP_WEEK_CAPS, ((7, 15), (14, 30)))
+        self.assertEqual(boxes.WARMUP_CAP_LATER, 40)
+
+    def test_cap_and_week_number_by_day(self):
+        days = (0, -2, 1, 7, 8, 14, 15, 16, 99)
+        self.assertEqual([boxes.week_cap(day) for day in days], [0, 0, 15, 15, 30, 30, 40, 40, 40])
+        self.assertEqual([boxes.week_number(day) for day in days], [0, 0, 1, 1, 2, 2, 3, 3, 3])
+
+    def test_a_cap_beats_the_ramp_exactly_where_the_ramp_would_overshoot(self):
+        self.assertEqual(boxes.warmup_quota(3), 13)                          # ещё под пределом 15: рост как был
+        self.assertEqual(boxes.warmup_quota(4), 15)                          # 16 > 15
+        self.assertEqual(boxes.warmup_quota(7), 15)                          # 25 > 15
+        self.assertEqual(boxes.warmup_quota(8), 28)                          # 28 <= 30
+        self.assertEqual(boxes.warmup_quota(9), 30)                          # 31 > 30
+        self.assertEqual(boxes.warmup_quota(14), 30)                         # 46 > 30
+        self.assertEqual(boxes.warmup_quota(15), 40)                         # 49 > 40
+        self.assertEqual(boxes.warmup_quota(300), 40)
+
+    def test_the_setting_on_the_site_can_only_lower_the_cap_never_raise_it(self):
+        self.assertEqual(boxes.warmup_quota(5, 10), 10)                      # ниже предела недели 15: действует он
+        self.assertEqual(boxes.warmup_quota(5, 50), 15)                      # выше предела: поднять его нельзя
+        self.assertEqual(boxes.warmup_quota(10, 50), 30)
+        self.assertEqual(boxes.warmup_quota(20, 50), 40)
+        self.assertEqual(boxes.warmup_quota(20, 25), 25)
+        self.assertEqual(boxes.warmup_quota(10, 0), 30)                      # 0 - «без лимита» на /mail, предел недели остаётся
+
+    def test_the_site_cannot_set_a_limit_above_50(self):
+        self.assertEqual((cfg.DAILY_LIMIT_MIN, cfg.DAILY_LIMIT_MAX), (1, 50))
+        self.assertEqual(cfg.parse_daily_limit(50), 50)
+        for bad in (51, 200, 0, -1):
+            with self.assertRaises(ValueError, msg=bad):
+                cfg.parse_daily_limit(bad)
 
 
 class MailboxStateTest(unittest.TestCase):
@@ -153,7 +193,7 @@ class MailboxStateTest(unittest.TestCase):
     def test_the_date_set_on_the_site_beats_the_journal(self):
         self.journal("letters_1.sent.json", {"a@x.ru": sent_entry("2026-10-11", "2")})
         state = self.state(settings={"mailboxes": {"2": {"first_message": "2026-10-08"}}})
-        self.assertEqual((state["day"], state["quota"], state["source"]), (5, 19, boxes.SOURCE_SETTING))
+        self.assertEqual((state["day"], state["quota"], state["source"]), (5, 15, boxes.SOURCE_SETTING))   # 19 по росту, 15 по неделе
 
     def test_the_daily_limit_still_caps_the_quota_and_the_rolling_day(self):
         settings = {"mailboxes": {"2": {"first_message": "2026-09-01"}}}      # давно прогретый ящик
@@ -162,9 +202,23 @@ class MailboxStateTest(unittest.TestCase):
         state = self.state(settings=settings, ceiling=40)                     # вчера 15:00 UTC: ещё в скользящих сутках
         self.assertEqual((state["sent_24h"], state["sent_today"], state["room"]), (38, 0, 2))
 
+    def test_state_names_the_week_and_its_cap_for_every_stage_of_the_warmup(self):
+        def at(days_ago, **kw):
+            first = (date(2026, 10, 12) - timedelta(days=days_ago)).isoformat()
+            return self.state(settings={"mailboxes": {"2": {"first_message": first}}}, **kw)
+
+        self.assertEqual([(at(d)["day"], at(d)["week"], at(d)["week_cap"]) for d in (0, 6, 7, 13, 14, 60)],
+                         [(1, 1, 15), (7, 1, 15), (8, 2, 30), (14, 2, 30), (15, 3, 40), (61, 3, 40)])
+        state = at(8, ceiling=50)                                         # 9-й день: рост даёт 31, предел недели 30
+        self.assertEqual((state["quota"], state["room"]), (30, 30))
+        state = at(8, ceiling=20)                                         # потолок с /mail ниже предела: действует он
+        self.assertEqual((state["quota"], state["room"]), (20, 20))
+        self.assertEqual((self.state("1", warmup=False)["week"], self.state("1", warmup=False)["week_cap"]), (None, None))
+
     def test_a_future_date_means_no_letters_until_it_comes(self):
         state = self.state(settings={"mailboxes": {"2": {"first_message": "2026-10-14"}}})
         self.assertEqual((state["day"], state["quota"], state["room"]), (-1, 0, 0))
+        self.assertEqual((state["week"], state["week_cap"]), (0, 0))
         self.assertIn("прогрев начнётся 2026-10-14", boxes.describe_state(state))
 
     def test_without_warmup_only_the_daily_limit_counts(self):
@@ -183,6 +237,16 @@ class MailboxStateTest(unittest.TestCase):
         self.assertIn("день прогрева 1", text)
         self.assertIn("на сегодня можно 7", text)
         self.assertIn("осталось 7", text)
+        self.assertIn("неделя 1, жёсткий предел недели 15", text)
+
+    def test_description_shows_which_week_cap_acts(self):
+        def text(days_ago):
+            first = (date(2026, 10, 12) - timedelta(days=days_ago)).isoformat()
+            return boxes.describe_state(self.state(settings={"mailboxes": {"2": {"first_message": first}}}))
+
+        self.assertIn("день прогрева 5 (неделя 1, жёсткий предел недели 15), на сегодня можно 15", text(4))
+        self.assertIn("день прогрева 10 (неделя 2, жёсткий предел недели 30), на сегодня можно 30", text(9))
+        self.assertIn("день прогрева 20 (неделя 3 и дальше, жёсткий предел недели 40), на сегодня можно 40", text(19))
 
 
 class JournalOfAMissingFolderTest(unittest.TestCase):
@@ -321,7 +385,22 @@ class RunWithMailboxesTest(unittest.TestCase):
         self.run_batch(0, new=False, settings_path=settings)
         self.assertEqual(len(self.servers["2"].sent), 7)                 # новый ящик: 7 в первый день
         self.assertEqual(len(self.servers["1"].sent), 23)                # остальное - первый ящик
-        self.assertIn("Ящик 2: день прогрева 1, на сегодня можно 7", self.output())
+        self.assertIn("Ящик 2: день прогрева 1 (неделя 1, жёсткий предел недели 15), на сегодня можно 7", self.output())
+
+    def test_the_week_cap_stops_a_mailbox_even_when_the_ramp_and_the_site_limit_would_allow_more(self):
+        self.table(30)
+        settings = os.path.join(self.folder, "settings.json")
+        first = (boxes.today_msk() - timedelta(days=5)).isoformat()                              # 6-й день: рост 22, предел 15
+        cfg.save_settings({"mailboxes": {"1": {"first_message": first}}}, settings)
+        # настоящее «сейчас» (now=None): журнал пишет настоящее время, и второй запуск должен видеть письма первого
+        self.run_batch(0, new=False, selected=[two_boxes()[0]], settings_path=settings, daily_limit=40, now=None)
+        self.assertEqual(len(self.servers["1"].sent), 15)
+        self.assertIn("жёсткий предел недели 15", self.output())
+        self.assertEqual(len(journal.load_state(journal.state_path(self.path))), 15)            # остальные ждут следующих дней
+        self.logs.clear()
+        self.run_batch(0, new=False, selected=[two_boxes()[0]], settings_path=settings, daily_limit=40, now=None)
+        self.assertEqual(len(self.servers["1"].sent), 15)                                       # второй запуск в тот же день: ничего
+        self.assertIn("Отправлять нечего", self.output())
 
     def test_nothing_goes_when_every_quota_is_used_up(self):
         self.table(5)
@@ -479,6 +558,7 @@ class MainWithMailboxesTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Ящик 1 (f***@mail.ru): день прогрева 1", text)
         self.assertIn("Ящик 2 (s***@mail.ru): день прогрева 1", text)
+        self.assertEqual(text.count("жёсткий предел недели 15"), 2)
         for secret in (FIRST, SECOND, PW1, PW2):
             self.assertNotIn(secret, text)
 
@@ -493,6 +573,24 @@ class MainWithMailboxesTest(unittest.TestCase):
         self.assertNotIn("Писем в таблице", out.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(mailer.main([folder, "--env", self.env]), 1)       # без --status папку не принимаем
+
+    def test_status_of_a_data_folder_shows_the_week_cap_of_each_mailbox(self):
+        self.write_env()
+        today = boxes.today_msk()
+        cfg.save_settings({"mailboxes": {"1": {"first_message": (today - timedelta(days=10)).isoformat()},       # день 11
+                                         "2": {"first_message": (today - timedelta(days=20)).isoformat()}}},     # день 21
+                          self.settings)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = mailer.main([os.path.dirname(self.table.path), "--status", "--env", self.env, "--settings", self.settings])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(code, 0)
+        self.assertIn("день прогрева 11 (неделя 2, жёсткий предел недели 30)", lines[0])
+        self.assertIn("на сегодня можно 30", lines[0])
+        self.assertIn("день прогрева 21 (неделя 3 и дальше, жёсткий предел недели 40)", lines[1])
+        self.assertIn("на сегодня можно 40", lines[1])
+        for secret in (FIRST, SECOND, PW1, PW2):
+            self.assertNotIn(secret, out.getvalue())
 
     def test_background_start_passes_the_choice_on_to_the_sender(self):
         self.write_env()

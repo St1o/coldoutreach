@@ -4,7 +4,9 @@
 третий - _3 и так до _5. Пароли живут только там и сюда попадают из окружения; в repr и в сообщения не выводятся.
 
 Прогрев (решение владельца 2026-10-11): у каждого ящика своя дата первого письма. В первый день с ящика можно отправить
-7 писем, в каждый следующий на 3 больше (7, 10, 13, …), но не больше лимита в сутки (страница /mail, по умолчанию 40).
+7 писем, в каждый следующий на 3 больше (7, 10, 13, …), но не больше жёсткого предела недели прогрева (дни 1-7: 15,
+дни 8-14: 30, с дня 15: 40; зашит в программу и от настройки на /mail не зависит) и не больше лимита в сутки
+(страница /mail, по умолчанию 40, может быть только ниже предела недели; выше 50 его не поставить).
 Дату можно задать на странице /mail (settings.json); если не задана, это день самого раннего письма ящика в журнале,
 а если писем ещё не было, прогрев начинается сегодня."""
 import math
@@ -20,6 +22,10 @@ from . import config, journal
 MAX_MAILBOXES = 5
 WARMUP_FIRST_DAY = 7              # писем с ящика в первый день
 WARMUP_STEP = 3                   # на сколько больше с каждым следующим днём
+# Жёсткий предел писем за день по неделям прогрева (чтобы письма не шли в спам). От настройки на /mail не зависит:
+# она может только снизить предел. (последний день недели, предел) для дней 1-7 и 8-14, дальше WARMUP_CAP_LATER.
+WARMUP_WEEK_CAPS = ((7, 15), (14, 30))
+WARMUP_CAP_LATER = 40             # с дня 15 (с третьей недели) и дальше
 SETTINGS_KEY = "mailboxes"        # settings.json: {"mailboxes": {"2": {"first_message": "2026-10-12"}}}
 FIRST_KEY = "first_message"
 SOURCE_SETTING, SOURCE_JOURNAL, SOURCE_NONE = "задана вручную", "по журналу отправки", "ещё не отправляли"
@@ -167,11 +173,27 @@ def warmup_day(first: Optional[date], today: date) -> int:
     return 1 if first is None else (today - first).days + 1
 
 
-def warmup_quota(day: int, ceiling: int = 0) -> int:
-    """Сколько писем с ящика можно отправить за день прогрева: 7, 10, 13, … не больше лимита в сутки (0 - без лимита)."""
+def week_cap(day: int) -> int:
+    """Жёсткий предел писем за день для дня прогрева day: 15 в дни 1-7, 30 в дни 8-14, 40 с дня 15. До начала (день < 1) 0."""
     if day < 1:
         return 0
-    quota = WARMUP_FIRST_DAY + WARMUP_STEP * (day - 1)
+    for last_day, cap in WARMUP_WEEK_CAPS:
+        if day <= last_day:
+            return cap
+    return WARMUP_CAP_LATER
+
+
+def week_number(day: int) -> int:
+    """Номер недели прогрева (дни 1-7 - неделя 1, 8-14 - неделя 2, с дня 15 - неделя 3 и дальше); до начала 0."""
+    return 0 if day < 1 else min((day - 1) // 7 + 1, len(WARMUP_WEEK_CAPS) + 1)
+
+
+def warmup_quota(day: int, ceiling: int = 0) -> int:
+    """Сколько писем с ящика можно отправить за день прогрева: 7, 10, 13, … не больше предела недели (week_cap) и не
+    больше лимита в сутки с /mail (0 - без лимита; он может только снизить предел недели, поднять его не может)."""
+    if day < 1:
+        return 0
+    quota = min(WARMUP_FIRST_DAY + WARMUP_STEP * (day - 1), week_cap(day))
     return min(quota, ceiling) if ceiling else quota
 
 
@@ -184,14 +206,15 @@ def mailbox_state(folder: str, mailbox_id: str, settings: dict, ceiling: int = 0
     sent_24h = journal.sent_last_24h(folder, now, mailbox_id)
     room = max(0, ceiling - sent_24h) if ceiling else math.inf
     state = {"id": str(mailbox_id), "ceiling": ceiling, "sent_24h": sent_24h, "warmup": warmup, "today": today.isoformat(),
-             "first_message": None, "source": "", "day": None, "quota": None, "sent_today": None}
+             "first_message": None, "source": "", "day": None, "quota": None, "sent_today": None,
+             "week": None, "week_cap": None}
     if warmup:
         first, source = first_message_day(folder, settings, mailbox_id)
         day = warmup_day(first, today)
         quota, sent_today = warmup_quota(day, ceiling), journal.sent_on_day(folder, today, mailbox_id)
         room = min(room, max(0, quota - sent_today))
         state.update(first_message=first.isoformat() if first else None, source=source, day=day, quota=quota,
-                     sent_today=sent_today)
+                     sent_today=sent_today, week=week_number(day), week_cap=week_cap(day))
     state["room"] = room
     return state
 
@@ -205,8 +228,9 @@ def describe_state(state: dict) -> str:
     if state["day"] < 1:
         return f"прогрев начнётся {state['first_message']}: до этой даты писем нет"
     ceiling = f"; лимит в сутки {state['ceiling']}, за 24 часа отправлено {state['sent_24h']}" if state["ceiling"] else ""
-    return (f"день прогрева {state['day']}, на сегодня можно {state['quota']}, отправлено сегодня {state['sent_today']}, "
-            f"осталось {state['room']}{ceiling}")
+    week = f"{state['week']}" if state["week"] <= len(WARMUP_WEEK_CAPS) else f"{state['week']} и дальше"
+    return (f"день прогрева {state['day']} (неделя {week}, жёсткий предел недели {state['week_cap']}), "
+            f"на сегодня можно {state['quota']}, отправлено сегодня {state['sent_today']}, осталось {state['room']}{ceiling}")
 
 
 # ---- раздача писем ----

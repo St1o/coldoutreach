@@ -11,7 +11,7 @@ ENV_FILE = os.path.join(ROOT, "local.env")
 SETTINGS_FILE = os.path.join(ROOT, "settings.json")                       # пишет страница /mail
 DEFAULT_DAILY_LIMIT = 40
 DAILY_LIMIT_KEY = "daily_limit_per_mailbox"
-DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 200
+DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 50          # лимит с /mail: выше 50 не ставится; предел недели прогрева задан в mailboxes.py
 _EMAIL_RE = re.compile(r"^[^@\s<>,;\"'()\[\]]+@[^@\s<>,;\"'()\[\]]+\.[^@\s<>,;\"'()\[\]]+$")
 
 
@@ -82,7 +82,7 @@ def save_settings(values: dict, path: str = "") -> None:
 
 
 def parse_daily_limit(raw) -> int:
-    """Лимит писем в сутки на один ящик: целое число от 1 до 200, иначе ValueError."""
+    """Лимит писем в сутки на один ящик: целое число от 1 до 50, иначе ValueError."""
     try:
         number = int(str(raw).strip())
     except ValueError:
