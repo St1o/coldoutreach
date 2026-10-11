@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass, field
 
 FALLBACK_ID = "12"
+EXCLUDE_ID = "-"                # решение агента в карте ОКВЭД: этому виду деятельности не писать
 
 
 class ComposeError(Exception):
@@ -82,6 +83,8 @@ def parse_segment(text: str) -> list:
         if group_id == FALLBACK_ID or not with_classes:
             if group_id == FALLBACK_ID:
                 groups.append(Group(FALLBACK_ID, rest.split(":")[0].strip(), frozenset()))
+            else:                       # группа без списка классов: компании попадают в неё только по карте ОКВЭД
+                groups.append(Group(group_id, rest.strip(), frozenset()))
             continue
         classes = set()
         for token in with_classes.group(2).split(","):
@@ -97,6 +100,59 @@ def parse_segment(text: str) -> list:
     if len(groups) < 2:
         raise ComposeError("в таблице групп файла сегмента не нашлось ни одной группы с классами ОКВЭД")
     return groups
+
+
+def okved_digits(code: str) -> str:
+    """Код ОКВЭД -> только цифры, первый знак с ведущим нулём: «1.11» -> «0111», «47.91.2» -> «47912»; не код -> «».
+    Иерархия ОКВЭД совпадает с началом цифровой строки: «479» (подкласс) - начало «4791» и «47912»."""
+    found = re.match(r"^\s*(\d{1,2})(?:[.,]\s*(\d{1,2}))?(?:[.,]\s*(\d{1,2}))?\s*$", code or "")
+    if not found:
+        return ""
+    first, *rest = found.groups()
+    return first.zfill(2) + "".join(part or "" for part in rest)
+
+
+def _map_group(cell: str, code: str, groups: list) -> str:
+    text = re.sub(r"[*`]", "", cell).strip()
+    if not text:
+        raise ComposeError(f"в карте ОКВЭД для кода {code} не указана группа")
+    if text in ("-", "—", "–") or text.casefold().startswith(("не писать", "нет")):
+        return EXCLUDE_ID
+    ids = {group.id for group in groups}
+    found = re.match(r"^(\d+[а-яa-z]?)(?:\.|\s|$)", text)
+    if found:
+        if found.group(1) not in ids:
+            raise ComposeError(f"в карте ОКВЭД для кода {code} указана группа {found.group(1)}, "
+                               "которой нет в таблице групп файла сегмента")
+        return found.group(1)
+    if text.casefold().startswith("запас"):
+        return FALLBACK_ID
+    for group in groups:
+        if _key(group.name) == _key(text):
+            return group.id
+    raise ComposeError(f"в карте ОКВЭД для кода {code} непонятная группа «{text}»: нужен номер группы из таблицы "
+                       "файла сегмента, 12 (запасная) или «не писать»")
+
+
+def parse_okved_map(text: str, groups: list) -> dict:
+    """Карта ОКВЭД от агента: таблица «Код | Название | Группа | …» -> {цифры кода: номер группы или EXCLUDE_ID}.
+    Читаются разделы «## Карта…» (если их нет, весь файл); строки, где первая ячейка не код ОКВЭД, пропускаются.
+    Решение для короткого кода («47.91») действует на все его подкоды, если для них нет своей строки."""
+    sections = [lines for heading, lines in _sections(text) if heading.casefold().startswith("карта")]
+    lines = [line for section in sections for line in section] if sections else text.splitlines()
+    result = {}
+    for line in lines:
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        digits = okved_digits(re.sub(r"[*`]", "", cells[0]))
+        if not digits or len(cells) < 3:
+            continue
+        group = _map_group(cells[2], cells[0], groups)
+        if result.get(digits, group) != group:
+            raise ComposeError(f"в карте ОКВЭД код {cells[0]} встречается дважды с разными группами")
+        result[digits] = group
+    return result
 
 
 def parse_letters(text: str) -> Texts:
