@@ -30,11 +30,12 @@ from datetime import date, datetime, timedelta
 
 from mailing import config, journal
 from mailing.agentmd import (
-    EXCLUDE_ID, FALLBACK_ID, ComposeError, Texts, _key, check_texts, okved_digits, parse_letters, parse_okved_map,
-    parse_segment)
+    EXCLUDE_ID, FALLBACK_ID, ComposeError, Texts, _key, check_texts, okved_digits, parse_form_rules, parse_letters,
+    parse_okved_map, parse_segment)
 
 OUT_FIELDS = ["Почта", "Тема", "Текст", "Группа", "Источник адреса"]
 LEAD_COLUMNS = {"email": "Почта", "okved": "ОКВЭД (код)", "source": "Источник почты"}
+NAME_COLUMN = "Название"                          # из него берётся только форма организации (ООО, МБУ…); название дальше не идёт
 OKVED_NAME_COLUMN = "ОКВЭД (название)"            # нужна только для списка кодов агенту; в старых выгрузках её может не быть
 OKVED_MAP_NAME, OKVED_REPORT_NAME = "okved-map.md", "okved_to_classify.md"
 SOURCE_REGISTER = "ЕГРЮЛ"
@@ -62,7 +63,8 @@ def check_link(link: str) -> str:
 
 
 def uses_placeholder(texts: Texts, name: str) -> bool:
-    return any(match.group(1) == name for template in texts.templates.values()
+    return any(match.group(1) == name
+               for template in list(texts.templates.values()) + list(texts.fallback_templates.values())
                for match in _PLACEHOLDER.finditer(template))
 
 
@@ -107,6 +109,31 @@ def fill(template: str, values: dict) -> str:
     return text
 
 
+# Сокращения форм организаций, которые программа узнаёт в начале названия (Checko пишет: ООО "ТЕККИН", МБУ МП "КЦМИ").
+# Первое слово названия, которого здесь нет, формой не считается: оно может быть частью самого названия.
+KNOWN_FORMS = frozenset("""
+    ООО ОАО ЗАО ПАО НАО АО ИП КФХ ПК СПК ТОО
+    МБУ МАУ МКУ МУП МУ ГБУ ГАУ ГКУ ГУП ГУ ФГБУ ФГАУ ФГКУ ФГУП ФБУ КГБУ КГАУ КГКУ ОГБУ БУ АУ КУ
+    МБОУ МАОУ МКОУ МБДОУ МАДОУ МКДОУ ГБОУ ГАОУ ГБПОУ ГАПОУ ФГБОУ ФГАОУ ГБДОУ МБУК МБУДО МАУДО МБУЗ ГБУЗ КГБУЗ
+    АНО АНОО НКО НП ТСЖ ТСН СНТ ГСК ЖСК ТОС РОО МОО ОО ЧУ ЧОУ НОУ НОЧУ ЧУДО АНПО
+""".split())
+OTHER_FORM = "другая"                              # название есть, но начинается не с известного сокращения
+DEFAULT_FORMS = frozenset({"ООО"})                 # пока агент не решил иначе: сегмент «только ООО» (решение владельца 2026-10-07)
+_FORM_WORD = re.compile(r"^[\s«\"“<(]*([А-ЯЁ]{2,8})(?![А-ЯЁа-яё])")
+_FULL_OOO = re.compile(r"^[\s«\"“<(]*общество\s+с\s+ограниченной\s+ответственностью", re.I)
+
+
+def org_form(name):
+    """Название компании -> форма организации: «ООО "ТЕККИН"» -> «ООО», «МБУ МП "КЦМИ"» -> «МБУ»; не из известных ->
+    «другая»; колонки с названием нет (None) -> None, форма не проверяется. Название нигде не сохраняется."""
+    if name is None:
+        return None
+    if _FULL_OOO.match(name):
+        return "ООО"
+    found = _FORM_WORD.match(name)
+    return found.group(1) if found and found.group(1) in KNOWN_FORMS else OTHER_FORM
+
+
 def okved_class(code: str):
     """«62.01», «01.11», «1.11» (ведущий ноль потерян в Excel), «1,11» -> 62, 1, 1, 1; не разобрать -> None."""
     found = re.match(r"^\s*(\d{1,2})(?:[.,]|\s*$)", code or "")
@@ -115,9 +142,10 @@ def okved_class(code: str):
 
 class Composer:
     def __init__(self, groups: list, texts: Texts, link: str, signature: str, include_unwritten: bool = False,
-                 okved_map: dict = None):
+                 okved_map: dict = None, form_rules: dict = None):
         self.groups = {group.id: group for group in groups}
         self.okved_map = okved_map or {}
+        self.form_rules = form_rules or {}             # форма -> писать (True) или не писать (False), решение агента
         self.by_class = {}
         for group in groups:
             for cls in group.classes:
@@ -126,6 +154,15 @@ class Composer:
         # Подпись нужна, только если в шаблонах есть {{подпись}}; нет такой подстановки - нет и подписи
         self.signature = check_signature(signature) if uses_placeholder(texts, "подпись") else ""
         self.include_unwritten = include_unwritten
+
+    def form_decided(self, form) -> bool:
+        return form is None or form in self.form_rules or form in DEFAULT_FORMS
+
+    def form_allowed(self, form) -> bool:
+        """Пишем ли организации такой формы: решение агента, иначе только ООО. Формы нет в таблице (None) - не проверяем."""
+        if form is None:
+            return True
+        return self.form_rules[form] if form in self.form_rules else form in DEFAULT_FORMS
 
     def decision(self, okved: str):
         """Решение агента по коду (карта ОКВЭД): номер группы или EXCLUDE_ID; самый длинный подходящий код главнее
@@ -151,7 +188,10 @@ class Composer:
         key = _key(group.name)
         pain1 = self.texts.pain1.get(key) if group_id != FALLBACK_ID else None
         pain2 = self.texts.pain2.get(key) if group_id != FALLBACK_ID else None
-        return fill(self.texts.templates[stage], {
+        # Запасная группа и группа без своего блока боли: свой шаблон письма, если агент его написал
+        own = group_id == FALLBACK_ID or not self.is_written(group_id)
+        template = (self.texts.fallback_templates.get(stage) if own else None) or self.texts.templates[stage]
+        return fill(template, {
             "группа_словами": group.words,
             "боль_1": pain1 or self.texts.fallback1,
             "боль_2": pain2 or self.texts.fallback2,
@@ -163,7 +203,8 @@ class Composer:
 # --- вход: таблица, стоп-лист, ответы, журналы ------------------------------------------------------------
 
 def read_leads(path: str) -> list:
-    """Таблица /leads -> [{"email", "okved", "okved_name", "source"}]; ФИО и названия компаний не читаются."""
+    """Таблица /leads -> [{"email", "okved", "okved_name", "source", "form"}]; ФИО не читаются, от названия остаётся
+    только форма организации."""
     try:
         with open(path, encoding="utf-8-sig", newline="") as fh:
             text = fh.read()
@@ -182,11 +223,16 @@ def read_leads(path: str) -> list:
     index = {key: names.index(column) for key, column in LEAD_COLUMNS.items()}
     if OKVED_NAME_COLUMN in names:
         index["okved_name"] = names.index(OKVED_NAME_COLUMN)
+    name_at = names.index(NAME_COLUMN) if NAME_COLUMN in names else None
     leads = []
     for row in rows[1:]:
         if any(cell.strip() for cell in row):
             lead = {key: (row[i].strip() if i < len(row) else "") for key, i in index.items()}
             lead.setdefault("okved_name", "")
+            if name_at is None:
+                lead["form"] = None                                    # старая выгрузка без названия: форму не проверяем
+            else:
+                lead["form"] = org_form(row[name_at] if name_at < len(row) else "")
             leads.append(lead)
     return leads
 
@@ -229,6 +275,7 @@ class Result:
     unwritten: Counter = field(default_factory=Counter)     # группа -> сколько писем не собрано
     unmapped: Counter = field(default_factory=Counter)      # (код ОКВЭД, его название) -> компаний без решения агента
     by_map: int = 0                                         # сколько подходящих адресов отнесено по карте ОКВЭД
+    unknown_forms: Counter = field(default_factory=Counter)  # форма организации без решения агента -> компаний
 
 
 def compose_first(composer: Composer, leads: list, subject: str, folder: str, stoplist, responded,
@@ -244,6 +291,14 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
             result.skipped["некорректный адрес"] += 1
         elif lead["source"] != SOURCE_REGISTER:
             result.skipped["почта не из ЕГРЮЛ (контакты Checko или источник неизвестен)"] += 1
+        elif not composer.form_allowed(lead.get("form")):
+            form = lead["form"]
+            label = "не определена по названию" if form == OTHER_FORM else f"«{form}»"
+            if composer.form_decided(form):
+                result.skipped[f"форма организации {label}: агент решил не писать"] += 1
+            else:
+                result.unknown_forms[form] += 1
+                result.skipped[f"форма организации {label}: решения агента ещё нет, по умолчанию пишем только ООО"] += 1
         elif address in seen:
             result.skipped["повтор адреса (одна цепочка на адрес)"] += 1
         elif address in handled:
@@ -327,25 +382,36 @@ def compose_test(composer: Composer, subject: str, stage: int, addresses: list) 
     return result
 
 
-def write_okved_report(folder: str, composer: Composer, unmapped: Counter) -> str:
-    """Список кодов ОКВЭД без решения агента -> okved_to_classify.md в папке данных (коды и названия видов деятельности:
-    ни адресов, ни названий компаний). Решений не осталось - старый файл удаляется. Возвращает путь или пустую строку."""
+def write_okved_report(folder: str, composer: Composer, unmapped: Counter, unknown_forms: Counter = None) -> str:
+    """Что осталось решить агенту -> okved_to_classify.md в папке данных: коды ОКВЭД с названиями видов деятельности и
+    формы организаций (только сокращение вроде «МБУ»): ни адресов, ни названий компаний, ни ФИО. Решать нечего - старый
+    файл удаляется. Возвращает путь или пустую строку."""
+    unknown_forms = unknown_forms or Counter()
     path = os.path.join(folder, OKVED_REPORT_NAME)
-    if not unmapped:
+    if not unmapped and not unknown_forms:
         if os.path.exists(path):
             os.remove(path)
         return ""
-    rows = []
-    for (code, name), number in sorted(unmapped.items(), key=lambda item: (-item[1], item[0])):
-        now = composer.groups[composer.by_class.get(okved_class(code), FALLBACK_ID)]
-        rows.append("| " + " | ".join((code or "(пусто)", (name or "(название не указано)").replace("|", "/"), str(number),
-                                      f"{now.id}. {now.name}")) + " |")
-    lines = ["# Виды деятельности (ОКВЭД), по которым агент ещё не принял решение", "",
-             "Составлено программой compose.py. Здесь только коды и названия видов деятельности: адресов, названий "
-             "компаний и ФИО нет. Передайте файл агенту outreach-segment: задача «Карта ОКВЭД» "
-             "(01-Segment/instructions.md). Его ответ - файл okved-map.md в папке 01-Segment/output.", "",
-             "Колонка «Группа сейчас» показывает, куда код попадёт без решения агента (по первым двум знакам).", "",
-             "| Код | Название вида деятельности | Компаний | Группа сейчас |", "|---|---|---|---|"] + rows
+    lines = ["# Что осталось решить агенту (outreach-segment)", "",
+             "Составлено программой compose.py. Здесь только коды и названия видов деятельности и сокращения форм "
+             "организаций: адресов, названий компаний и ФИО нет. Передайте файл агенту: задача «Карта ОКВЭД» "
+             "(01-Segment/instructions.md). Ответ агента - файл okved-map.md в папке 01-Segment/output.", ""]
+    if unknown_forms:
+        lines += ["## Формы организаций без решения", "",
+                  "Пока агент не решил иначе, программа пишет только ООО. Для каждой формы нужно решение «писать» или "
+                  "«не писать»; если для формы письмо должно звучать иначе, скажите об этом в заметке.", "",
+                  "| Форма | Компаний |", "|---|---|"]
+        lines += [f"| {'(не определена по названию)' if form == OTHER_FORM else form} | {number} |"
+                  for form, number in sorted(unknown_forms.items(), key=lambda item: (-item[1], item[0]))]
+        lines.append("")
+    if unmapped:
+        lines += ["## Виды деятельности (ОКВЭД) без решения", "",
+                  "Колонка «Группа сейчас» показывает, куда код попадёт без решения агента (по первым двум знакам).", "",
+                  "| Код | Название вида деятельности | Компаний | Группа сейчас |", "|---|---|---|---|"]
+        for (code, name), number in sorted(unmapped.items(), key=lambda item: (-item[1], item[0])):
+            now = composer.groups[composer.by_class.get(okved_class(code), FALLBACK_ID)]
+            lines.append("| " + " | ".join((code or "(пусто)", (name or "(название не указано)").replace("|", "/"), str(number),
+                                            f"{now.id}. {now.name}")) + " |")
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -433,12 +499,14 @@ def main(argv=None, today=None, log=print) -> int:
         map_path = args.okved_map or os.environ.get("OUTREACH_OKVED_MAP", "")
         if not map_path and os.path.exists(os.path.join(os.path.dirname(os.path.abspath(segment_path)), OKVED_MAP_NAME)):
             map_path = os.path.join(os.path.dirname(os.path.abspath(segment_path)), OKVED_MAP_NAME)
-        okved_map = {}
+        okved_map, form_rules = {}, {}
         if map_path:
             with open(map_path, encoding="utf-8-sig") as fh:
-                okved_map = parse_okved_map(fh.read(), groups)
+                map_text = fh.read()
+            okved_map, form_rules = parse_okved_map(map_text, groups), parse_form_rules(map_text)
         composer = Composer(groups, texts, args.link or os.environ.get("SURVEY_LINK", ""),
-                            args.signature or os.environ.get("MAIL_SIGNATURE", ""), args.include_unwritten, okved_map)
+                            args.signature or os.environ.get("MAIL_SIGNATURE", ""), args.include_unwritten, okved_map,
+                            form_rules)
         subject = pick_subject(texts, args.subject)
 
         stop_path = args.stoplist or os.path.join(folder, "stoplist.txt")
@@ -474,13 +542,19 @@ def main(argv=None, today=None, log=print) -> int:
         log(f"  не собрано: для группы {group_id} «{names[group_id]}» ещё нет блока боли - {number} "
             "(напишите его или добавьте --include-unwritten)")
     if args.stage == 1 and not args.test_to:
-        report = write_okved_report(folder, composer, result.unmapped)
+        report = write_okved_report(folder, composer, result.unmapped, result.unknown_forms)
+        if result.unknown_forms:
+            log("  формы организаций без решения агента: "
+                + ", ".join(f"{'не определена' if form == OTHER_FORM else form} - {number}"
+                            for form, number in sorted(result.unknown_forms.items())) + "; пока пишем только ООО")
         if result.by_map:
             log(f"  карта ОКВЭД: решение агента есть у {result.by_map} из {result.by_map + sum(result.unmapped.values())} "
                 "подходящих адресов")
-        if report:
+        if result.unmapped:
             log(f"  ОКВЭД без решения агента: кодов {len(result.unmapped)}, компаний {sum(result.unmapped.values())}; "
-                f"они идут по таблице классов. Список для агента: {OKVED_REPORT_NAME} в папке данных")
+                "они идут по таблице классов")
+        if report:
+            log(f"  Список для агента: {OKVED_REPORT_NAME} в папке данных")
     if not result.letters:
         log("Писать некому: ни одного письма не собрано, файл не создан.")
         return 0

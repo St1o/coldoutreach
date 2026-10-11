@@ -26,6 +26,7 @@ class Group:
 class Texts:
     subjects: list                                    # [(текст, рекомендована)]
     templates: dict                                   # этап -> текст шаблона
+    fallback_templates: dict = field(default_factory=dict)   # этап -> свой шаблон для запасной группы и групп без текста
     pain1: dict = field(default_factory=dict)         # ключ группы -> блок боли письма 1
     pain2: dict = field(default_factory=dict)
     fallback1: str = ""
@@ -155,10 +156,38 @@ def parse_okved_map(text: str, groups: list) -> dict:
     return result
 
 
+def parse_form_rules(text: str) -> dict:
+    """Решения агента по формам организаций: раздел «## Формы…» файла карты, таблица «Форма | Решение | Почему» ->
+    {«ООО»: True, «МБУ»: False}. Решение: «писать» или «не писать». Нет раздела - пустой словарь."""
+    rules = {}
+    for heading, lines in _sections(text):
+        if not heading.casefold().startswith("форм"):
+            continue
+        for line in lines:
+            if not line.lstrip().startswith("|"):
+                continue
+            cells = [re.sub(r"[*`]", "", cell).strip() for cell in line.strip().strip("|").split("|")]
+            form = cells[0].upper()
+            if len(cells) < 2 or not re.fullmatch(r"[А-ЯЁA-Z]{2,8}", form) or form == "ФОРМА":
+                continue                                    # шапка, разделитель и строки не про форму
+            decision = cells[1].casefold()
+            if decision.startswith(("не писать", "нет")):
+                answer = False
+            elif decision.startswith(("писать", "да")):
+                answer = True
+            else:
+                raise ComposeError(f"в карте для формы {form} непонятное решение «{cells[1]}»: нужно «писать» или «не писать»")
+            if rules.get(form, answer) != answer:
+                raise ComposeError(f"в карте форма {form} встречается дважды с разными решениями")
+            rules[form] = answer
+    return rules
+
+
 def parse_letters(text: str) -> Texts:
     """Файл писем -> Texts: темы, шаблоны трёх писем, блоки боли по группам, запасные блоки."""
-    subjects, templates, texts = [], {}, Texts([], {})
+    subjects, templates, fallback_templates, texts = [], {}, {}, Texts([], {})
     for heading, lines in _sections(text):
+        own = fallback_templates if "запасн" in heading.casefold() else templates   # «Письмо 1. Запасной шаблон»
         if heading.startswith("Темы"):
             for line in lines:
                 found = re.match(r"^\s*\d+\.\s+(.*\S)\s*$", line)
@@ -166,15 +195,15 @@ def parse_letters(text: str) -> Texts:
                     raw = found.group(1)
                     subjects.append((re.sub(r"\s*\(рекомендую\)\s*", "", raw).strip(), "(рекомендую)" in raw))
         elif re.match(r"Письмо 1\b", heading):
-            templates[1] = _fenced(lines)
+            own[1] = _fenced(lines)
         elif heading.startswith("Дожим"):
-            templates[2] = _fenced(lines)
-            for line in lines:
+            own[2] = _fenced(lines)
+            for line in ([] if own is fallback_templates else lines):          # блоки боли только у основного дожима
                 found = re.match(r"^\*([^*\n]+?):\*\s*(.+?)\s*$", line)
                 if found:
                     _store(texts, 2, found.group(1), found.group(2))
         elif heading.startswith("Закрывающее"):
-            templates[3] = _fenced(lines)
+            own[3] = _fenced(lines)
         elif heading.startswith("Блоки боли для письма 1"):
             name, parts = None, []
             for line in lines + ["**"]:
@@ -185,7 +214,7 @@ def parse_letters(text: str) -> Texts:
                     name, parts = (found.group(1) if found else None), []
                 elif name is not None and line.strip():
                     parts.append(line.strip())
-    texts.subjects, texts.templates = subjects, templates
+    texts.subjects, texts.templates, texts.fallback_templates = subjects, templates, fallback_templates
     return texts
 
 
@@ -212,5 +241,8 @@ def check_texts(texts: Texts, groups: list) -> None:
                                "«Письмо 1», «Дожим», «Закрывающее»)")
     if not texts.subjects:
         raise ComposeError("в файле писем нет тем (нумерованный список под заголовком «Темы»)")
-    if not texts.fallback1 or not texts.fallback2:
-        raise ComposeError("в файле писем нет запасных блоков боли («Запасной вариант» для письма 1 и для дожима)")
+    # Запасной блок боли не нужен тому этапу, у которого есть свой шаблон для запасной группы
+    if (not texts.fallback1 and 1 not in texts.fallback_templates) or (
+            not texts.fallback2 and 2 not in texts.fallback_templates):
+        raise ComposeError("в файле писем нет запасных блоков боли («Запасной вариант» для письма 1 и для дожима) "
+                           "или своего шаблона для запасной группы")
