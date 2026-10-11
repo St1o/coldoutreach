@@ -407,6 +407,10 @@ def main(argv=None, today=None, log=print) -> int:
     per_group = Counter(letter[3] for letter in result.letters)
     log(f"Собрано писем: {len(result.letters)}. По группам: "
         + "; ".join(f"{gid} {names[gid]} - {number}" for gid, number in sorted(per_group.items(), key=lambda i: i[0])))
+    if args.stage == 1 and not args.test_to:         # группы без своего текста: пусть будет видно, что письмо запасное
+        fallback = Counter(letter[3] for letter in result.letters if not composer.is_written(letter[3]))
+        for group_id, number in sorted(fallback.items()):
+            log(f"  запасной вариант текста: для группы {group_id} «{names[group_id]}» блок боли ещё не написан - писем {number}")
     if args.preview:
         shown = set()
         for letter in result.letters:

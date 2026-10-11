@@ -86,6 +86,13 @@ class PrepareTest(ServiceCase):
         self.assertEqual(self.service.prepare(self.leads, 2)["letters"], 2)
         self.assertEqual(self.service.prepare(self.leads, 10, include_unwritten=True)["letters"], 4)
 
+    def test_fallback_letters_are_named_in_the_summary_only_when_they_are_included(self):
+        plain = json.dumps(self.service.prepare(self.leads, 10), ensure_ascii=False)
+        self.assertNotIn("запасной вариант текста", plain)
+        with_fallback = self.service.prepare(self.leads, 10, include_unwritten=True)
+        self.assertEqual(sum("запасной вариант текста: для группы 11" in line for line in with_fallback["summary"]), 1)
+        self.assertIn("писем 1", " ".join(with_fallback["summary"]))
+
     def test_daily_room_counts_what_was_sent_in_the_last_day(self):
         journal.save_state(os.path.join(self.data, "letters_1.sent.json"),
                            {"old@x.ru": journal.make_entry(journal.SENT, "Тема", {})})
