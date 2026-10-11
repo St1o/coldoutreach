@@ -15,9 +15,15 @@ from egrul_pdf import ExtractError
 DAY = date(2026, 10, 9)
 A, B, C = "7707083004", "7707083011", "7707083029"      # с почтой / без почты / ещё нет в ЕГРЮЛ
 
+HEADER = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
+OKVED = ["62.01", "Разработка компьютерного программного обеспечения", "ЕГРЮЛ"]     # + источник почты
+
 WITH_EMAIL = ("Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
               "Сведения о лице, имеющем право без доверенности действовать от имени юридического лица\n"
-              "26 Фамилия\nИмя\nОтчество\nИВАНОВ\nИВАН\nИВАНОВИЧ\n27 ИНН 1\n")
+              "26 Фамилия\nИмя\nОтчество\nИВАНОВ\nИВАН\nИВАНОВИЧ\n27 ИНН 1\n"
+              "Сведения об основном виде деятельности\n"
+              "50 Код и наименование вида деятельности 62.01 Разработка компьютерного программного обеспечения\n"
+              "51 ГРН и дата внесения в ЕГРЮЛ записи\n")
 NO_EMAIL = WITH_EMAIL.split("11 ГРН\n")[1]
 NO_DIRECTOR = "Адрес электронной почты\n10 E-mail SALES@EXAMPLE.RU\n11 ГРН\n"
 PDFS = {b"with-email": WITH_EMAIL, b"no-email": NO_EMAIL, b"no-director": NO_DIRECTOR}
@@ -106,8 +112,8 @@ class LeadsTest(LeadsCase):
     def test_only_companies_with_email_are_in_the_table(self):
         self.assertEqual(self.run_leads(self.standard_egrul()), 0)
         self.assertEqual(self.read_csv(), [
-            ["Название", "ФИО директора", "Почта"],
-            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"],
+            HEADER,
+            [f"ФИРМА {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED,
         ])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
@@ -117,7 +123,7 @@ class LeadsTest(LeadsCase):
         with open(self.out, "rb") as fh:
             raw = fh.read()
         self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))      # BOM
-        self.assertIn("Название;ФИО директора;Почта".encode(), raw)
+        self.assertIn(";".join(HEADER).encode(), raw)
 
     def test_director_falls_back_to_search_result(self):
         egrul = FakeEgrul({A: (b"no-director", "Генеральный директор: Петров Пётр Петрович")})
@@ -126,7 +132,7 @@ class LeadsTest(LeadsCase):
 
     def test_company_with_email_is_kept_even_without_director(self):
         self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))
-        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru"])
+        self.assertEqual(self.read_csv()[1], [f"ФИРМА {A}", "", "sales@example.ru", "", "", "ЕГРЮЛ"])
 
     def test_log_has_no_personal_data(self):
         self.run_leads(self.standard_egrul())
@@ -143,6 +149,27 @@ class LeadsTest(LeadsCase):
         self.run_leads(second)
         self.assertEqual(second.searched, [C])            # A и B повторно не проверяются
 
+    def test_entry_saved_before_okved_existed_is_filled_in_once(self):
+        old = {A: {"status": leads.OK, "name": "ФИРМА", "director": "Иванов", "email": "sales@example.ru", "note": ""},
+               B: {"status": leads.NO_EMAIL, "name": "Б", "director": "", "email": "", "note": ""}}
+        os.makedirs(os.path.dirname(self.out))
+        with open(leads.state_path(self.out), "w", encoding="utf-8") as fh:
+            json.dump(old, fh, ensure_ascii=False)
+        first = self.standard_egrul()
+        self.run_leads(first, FakeChecko(companies(A, B)))
+        self.assertEqual(first.searched, [A])               # без почты не трогаем, с почтой дозаполняем
+        self.assertEqual(self.read_csv()[1][3:], OKVED)
+        second = self.standard_egrul()
+        self.run_leads(second, FakeChecko(companies(A, B)))
+        self.assertEqual(second.searched, [])               # во второй раз - уже не нужно
+
+    def test_company_without_okved_is_not_asked_again(self):
+        self.run_leads(FakeEgrul({A: (b"no-director", "")}), FakeChecko(companies(A)))      # в этой выписке ОКВЭД нет
+        self.assertEqual(self.read_csv()[1][3:], ["", "", "ЕГРЮЛ"])
+        again = FakeEgrul({A: (b"no-director", "")})
+        self.run_leads(again, FakeChecko(companies(A)))
+        self.assertEqual(again.searched, [])
+
     def test_retry_company_appears_when_registry_catches_up(self):
         self.run_leads(self.standard_egrul())
         later = FakeEgrul({A: (b"with-email", ""), B: (b"no-email", ""), C: (b"with-email", "")})
@@ -154,7 +181,7 @@ class LeadsTest(LeadsCase):
         self.run_leads(egrul, FakeChecko(companies(A)))
         self.assertEqual(self.state()[A]["status"], leads.RETRY)
         self.assertIn("таймаут", self.state()[A]["note"])
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+        self.assertEqual(self.read_csv(), [HEADER])
         fixed = FakeEgrul({A: (b"with-email", "")})
         self.run_leads(fixed, FakeChecko(companies(A)))
         self.assertEqual(len(self.read_csv()), 2)
@@ -243,7 +270,7 @@ class LeadsTest(LeadsCase):
 
     def test_nothing_found_still_writes_an_empty_table(self):
         self.assertEqual(self.run_leads(self.standard_egrul(), FakeChecko([])), 0)
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"]])
+        self.assertEqual(self.read_csv(), [HEADER])
 
 
 class FakeApi:
@@ -261,8 +288,17 @@ class FakeApi:
         return result
 
 
-def api_payload(email="", register=True, fio="Иванов Иван Иванович"):
+OKVED_PAYLOAD = {"Код": OKVED[0], "Наим": OKVED[1], "Версия": "2014"}
+
+
+def leads_company(inn, name):
+    return NewCompany(inn=inn, ogrn="1" * 13, reg_date=DAY, name=name)
+
+
+def api_payload(email="", register=True, fio="Иванов Иван Иванович", okved=OKVED_PAYLOAD):
     body = {"data": {"НаимСокр": "ООО ФИРМА", "Руковод": [{"ФИО": fio}]}, "meta": {"status": "ok"}}
+    if okved:
+        body["data"]["ОКВЭД"] = okved
     if email and register:
         body["source_data"] = {"СвАдрЭлПочты": {"E-mail": email}}
     elif email:
@@ -279,16 +315,27 @@ class ApiSourceTest(LeadsCase):
     def test_statuses_and_table(self):
         api = FakeApi({A: api_payload("sales@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
         self.assertEqual(self.run_api(api), 0)
-        self.assertEqual(self.read_csv(), [["Название", "ФИО директора", "Почта"],
-                                           ["ООО ФИРМА", "Иванов Иван Иванович", "sales@example.ru"]])
+        self.assertEqual(self.read_csv(), [HEADER,
+                                           [f"checko {A}", "Иванов Иван Иванович", "sales@example.ru"] + OKVED])
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
         self.assertIn("нет в Checko", self.state()[C]["note"])
+
+    def test_name_comes_from_the_checko_list_and_the_api_name_is_only_a_fallback(self):
+        listed = [leads_company(A, "ООО ИЗ СПИСКА"), leads_company(B, "")]
+        self.run_api(FakeApi({A: api_payload("a@example.ru"), B: api_payload("b@example.ru")}), FakeChecko(listed))
+        self.assertEqual([row[0] for row in self.read_csv()[1:]], ["ООО ИЗ СПИСКА", "ООО ФИРМА"])
 
     def test_contact_email_is_marked(self):
         self.run_api(FakeApi({A: api_payload("c@example.ru", register=False)}), FakeChecko(companies(A)))
         self.assertEqual(self.state()[A]["status"], leads.OK)
         self.assertIn("не из ЕГРЮЛ", self.state()[A]["note"])
+        self.assertEqual(self.read_csv()[1][-1], "контакты Checko")        # такие адреса для рассылки не годятся
+
+    def test_missing_okved_is_noted_and_left_empty(self):
+        self.run_api(FakeApi({A: api_payload("a@example.ru", okved=None)}), FakeChecko(companies(A)))
+        self.assertEqual(self.read_csv()[1][3], "")
+        self.assertIn("ОКВЭД не найден", self.state()[A]["note"])
 
     def test_rerun_asks_only_for_what_is_pending(self):
         first = FakeApi({A: api_payload("a@example.ru"), B: api_payload(""), C: CheckoApiNotFound("нет")})
@@ -310,12 +357,46 @@ class ApiSourceTest(LeadsCase):
         self.assertEqual(self.run_api(api, max_errors_in_a_row=2), 5)
         self.assertEqual(api.asked, [A, B])
 
+    def test_if_every_organization_failed_it_is_not_reported_as_done(self):
+        api = FakeApi({i: CheckoApiError("нет соединения") for i in (A, B, C)})
+        self.assertEqual(self.run_api(api), 5)                          # ошибок меньше предела подряд, но результата нет
+        self.assertIn("Ни одну организацию проверить не удалось", "\n".join(self.logs))
+        self.assertEqual(self.read_csv(), [HEADER])
+
+    def test_a_partly_failed_run_is_still_done(self):
+        api = FakeApi({A: api_payload("a@example.ru"), B: CheckoApiError("HTTP 500"), C: CheckoApiNotFound("нет")})
+        self.assertEqual(self.run_api(api), 0)
+
+    def test_not_found_organizations_are_not_failures(self):
+        api = FakeApi({A: CheckoApiNotFound("нет"), B: CheckoApiNotFound("нет"), C: CheckoApiNotFound("нет")})
+        self.assertEqual(self.run_api(api), 0)                          # «ещё не появилась» - не сбой связи
+
     def test_log_has_no_personal_data(self):
         self.run_api(FakeApi({A: api_payload("secret@example.ru", fio="Тайный Человек"), B: api_payload(""), C: api_payload("")}))
         text = "\n".join(self.logs)
         for secret in ("secret@example.ru", "Тайный", "ФИРМА"):
             self.assertNotIn(secret, text)
 
+
+
+class PastedTextDateTest(LeadsCase):
+    def test_text_without_the_chosen_date_says_which_dates_it_has(self):
+        from checko_updates import PastedPages
+        text = (f"1.\tООО А\nадрес\nДата регистрации 9 октября 2026 года ОГРН 1269600032877 ИНН {A}\n"
+                f"2.\tООО Б\nадрес\nДата регистрации 8 октября 2026 года ОГРН 1269600032855 ИНН {B}\n")
+        api = FakeApi({})
+        code = leads.run(date(2026, 10, 10), self.out, pause=0, checko=PastedPages(text), egrul=FakeEgrul({}),
+                         log=self.logs.append, process=lambda c: leads.process_company_api(api, c))
+        self.assertEqual(code, 7)
+        self.assertEqual(api.asked, [])
+        self.assertTrue(any("нет организаций за 2026-10-10" in line and "2026-10-09 (1), 2026-10-08 (1)" in line
+                            for line in self.logs))
+
+    def test_empty_text_or_a_site_without_companies_is_not_an_error(self):
+        from checko_updates import PastedPages
+        self.assertEqual(self.run_leads(FakeEgrul({}), FakeChecko([])), 0)
+        self.assertEqual(leads.run(DAY, self.out, pause=0, checko=PastedPages("пусто"), egrul=FakeEgrul({}),
+                                   log=self.logs.append), 0)
 
 
 class HelpersTest(unittest.TestCase):

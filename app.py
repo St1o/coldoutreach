@@ -32,12 +32,21 @@ from urllib.parse import parse_qs, urlparse
 from egrul_inn_search import (
     EgrulCaptchaRequired, EgrulClient, EgrulError, EgrulTimeout, validate_inn,
 )
-from leads import today_moscow as leads_today
 from leads_job import JobRunning, LeadsJob
+from send_service import SendError, SendService
+from letter_template import render_letter
+from mailing import config as mailcfg
+from mail_service import MailError, MailService
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE_PATH = os.path.join(HERE, "index.html")
 LEADS_PAGE_PATH = os.path.join(HERE, "leads.html")
+MAIL_PAGE_PATH = os.path.join(HERE, "mail.html")
+MAIL_MAX_BODY = 100_000       # запрос страницы /mail: тема и текст одного письма
+MAIL_FIELDS = ("company", "director", "okved", "signature", "offer")
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+SEND_MAX_BODY = 2_000       # запрос кнопки «Отправить»: число писем и две отметки
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")      # имена, под которыми страницу открывают на этом же компьютере
 MAX_BODY = 2_000_000          # текст страниц Checko, вставленный на странице /leads
 
 # Страница использует только свои встроенные скрипт и стили и обращается только к себе.
@@ -231,7 +240,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok", "text/plain; charset=utf-8")
         elif url.path == "/leads":
             self._leads_page()
-        elif url.path in ("/api/leads/status", "/api/leads/download"):
+        elif url.path == "/mail":
+            self._mail_page()
+        elif url.path == "/api/mail/defaults":
+            self._mail_defaults()
+        elif url.path == "/api/mail/settings":
+            self._mail_settings()
+        elif url.path == "/api/leads/session":
+            self._leads_session()
+        elif url.path in ("/api/leads/status", "/api/leads/download", "/api/send/status"):
             self._leads_get(url.path)
         elif url.path in ("/api/search", "/api/extract"):
             wait = self.server.limiter.check(self.client_ip())
@@ -267,6 +284,27 @@ class Handler(BaseHTTPRequestHandler):
             self._error(401, "Неверный пароль.")
         return False
 
+    def _local_request(self):
+        """Запрос идёт с этого же компьютера, со страницы этого сайта, а не с чужого сайта в браузере:
+        адрес собеседника - сам компьютер (заголовок прокси не в счёт), Host - 127.0.0.1 или localhost
+        (при подмене DNS в нём будет чужое имя), Sec-Fetch-Site - свой сайт."""
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host.split("]")[0] + "]" if host.startswith("[") else host.partition(":")[0]
+        if name not in LOCAL_HOSTS:
+            return False
+        return self.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
+
+    def _leads_session(self):
+        """Пароль страницы для самой страницы, только когда сайт запущен у вас на компьютере (run_local.py):
+        вводить его не нужно. На хостинге и для чужих запросов страницы нет."""
+        job = self.server.leads_job
+        if not self.server.auto_login or job is None or not job.enabled or not self._local_request():
+            self._error(404, "Страница не найдена.")
+            return
+        self._json(200, {"token": job.token})
+
     def _leads_page(self):
         if self._leads_enabled() is None:
             return
@@ -278,18 +316,139 @@ class Handler(BaseHTTPRequestHandler):
         if job is None or not self._leads_authorized(job):
             return
         if path == "/api/leads/status":
-            self._json(200, job.status())
+            payload = job.status()
+            payload["send_enabled"] = self.server.send_service is not None
+            self._json(200, payload)
+            return
+        if path == "/api/send/status":
+            service = self.server.send_service
+            if service is None:
+                self._error(404, "Отправка с этой страницы выключена.")
+            else:
+                self._json(200, service.status())
             return
         table = job.table()
         if table is None:
             self._error(404, "Таблицы пока нет.")
         else:
             name, content = table
-            self._send(200, content, "text/csv; charset=utf-8",
+            self._send(200, content, XLSX_TYPE,
                        [("Content-Disposition", f'attachment; filename="{name}"')])
+
+    # ---- пробное письмо через mail.ru (страница /mail, тот же пароль, что у /leads) ----
+
+    def _mail_enabled(self):
+        """Служба отправки, если задан пароль страницы (LEADS_TOKEN); иначе страница скрыта (404)."""
+        job, service = self.server.leads_job, self.server.mail_service
+        if job is None or not job.enabled or service is None:
+            self._error(404, "Страница не найдена.")
+            return None
+        return service
+
+    def _mail_page(self):
+        if self._mail_enabled() is None:
+            return
+        with open(MAIL_PAGE_PATH, "rb") as fh:
+            self._send(200, fh.read(), "text/html; charset=utf-8")
+
+    def _mail_defaults(self):
+        service = self._mail_enabled()
+        if service is not None and self._leads_authorized(self.server.leads_job):
+            self._json(200, service.defaults())
+
+    def _limit_payload(self):
+        value, source = mailcfg.resolve_daily_limit(settings_path=self.server.settings_path)
+        return {"daily_limit": value, "source": source, "min": mailcfg.DAILY_LIMIT_MIN, "max": mailcfg.DAILY_LIMIT_MAX}
+
+    def _mail_settings(self):
+        """Лимит писем в сутки на один ящик, который действует для mailer.py (страница /mail)."""
+        if self._mail_enabled() is not None and self._leads_authorized(self.server.leads_job):
+            try:
+                self._json(200, self._limit_payload())
+            except ValueError:
+                self._error(500, "В MAIL_DAILY_LIMIT (файл local.env) не число: исправьте или задайте лимит здесь.")
+
+    def _mail_post(self, path):
+        service = self._mail_enabled()
+        if service is None or not self._leads_authorized(self.server.leads_job):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAIL_MAX_BODY:
+                raise ValueError
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict) or not all(isinstance(v, str) for v in body.values()):
+                raise ValueError
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "Некорректный запрос: нужен JSON с текстовыми полями до 100 КБ.")
+            return
+        if path == "/api/mail/preview":
+            subject, text = render_letter(**{k: body.get(k, "") for k in MAIL_FIELDS})
+            self._json(200, {"subject": subject, "body": text})
+            return
+        if path == "/api/mail/settings":
+            try:
+                limit = mailcfg.parse_daily_limit(body.get("daily_limit", ""))
+            except ValueError as exc:
+                self._error(400, str(exc))
+                return
+            settings = mailcfg.load_settings(self.server.settings_path)
+            settings[mailcfg.DAILY_LIMIT_KEY] = limit
+            try:
+                mailcfg.save_settings(settings, self.server.settings_path)
+            except OSError as exc:
+                self._error(500, f"Не удалось сохранить настройку: {exc.strerror or exc}")
+                return
+            self._json(200, self._limit_payload())
+            return
+        try:
+            self._json(200, service.send(body.get("to", ""), body.get("subject", ""), body.get("body", "")))
+        except MailError as exc:
+            self._error(exc.status, exc.message)
+
+    def _send_post(self, path):
+        """Кнопка «Отправить» на странице /leads: проверка (что уйдёт) и запуск отправки в фоне."""
+        job = self._leads_enabled()
+        if job is None or not self._leads_authorized(job):
+            return
+        service = self.server.send_service
+        if service is None:
+            self._error(404, "Отправка с этой страницы выключена.")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= SEND_MAX_BODY:
+                raise ValueError
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError
+            include_unwritten = bool(body.get("include_unwritten"))
+            expected = body.get("expected")
+            if expected is not None and not isinstance(expected, int):
+                raise ValueError
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "Некорректный запрос: нужен JSON с числом писем.")
+            return
+        leads_path = job.output_path()
+        if not leads_path:
+            self._error(400, "Таблицы пока нет: сначала выгрузите компании.")
+            return
+        try:
+            if path == "/api/send/prepare":
+                self._json(200, service.prepare(leads_path, body.get("count"), include_unwritten))
+            else:
+                self._json(202, service.start(leads_path, body.get("count"), include_unwritten, expected))
+        except SendError as exc:
+            self._error(exc.status, exc.message)
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path in ("/api/mail/preview", "/api/mail/send", "/api/mail/settings"):
+            self._mail_post(path)
+            return
+        if path in ("/api/send/prepare", "/api/send/start"):
+            self._send_post(path)
+            return
         if path not in ("/api/leads/start", "/api/leads/stop"):
             self._error(404, "Страница не найдена.")
             return
@@ -305,28 +464,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             raw_date = str(body.get("date") or "").strip()
-            target = date.fromisoformat(raw_date) if raw_date else leads_today()
+            if not raw_date:
+                self._error(400, "Укажите дату регистрации (ГГГГ-ММ-ДД): она должна совпадать с датой в тексте с Checko.")
+                return
+            target = date.fromisoformat(raw_date)
             limit = int(body.get("limit") or 0)
             if not 0 <= limit <= 2000:
                 raise ValueError
             text = body.get("text") or ""
             if not isinstance(text, str):
                 raise ValueError
-            pause = float(body.get("pause") or 6)
-            if not 1 <= pause <= 60:
-                raise ValueError
-            source = body.get("source") or ("api" if job.api_available else "egrul")
-            if source not in ("api", "egrul"):
-                raise ValueError
         except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
-            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, пауза 1-60 с, текст до 2 МБ.")
+            self._error(400, "Некорректные данные: дата ГГГГ-ММ-ДД, количество 0-2000, текст до 2 МБ.")
             return
-        if source == "api" and not job.api_available:
-            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY на сервере "
-                             "или выберите источник «Выписки ФНС».")
+        if not job.api_available:
+            self._error(400, "Ключ Checko API не задан: добавьте переменную CHECKO_API_KEY в настройках сервера.")
             return
         try:
-            job.start(target, limit, text, pause, source)
+            job.start(target, limit, text)
         except JobRunning:
             self._error(409, "Выгрузка уже идёт.")
             return
@@ -362,13 +517,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host="127.0.0.1", port=8000, service=None, limiter=None, trusted_proxies=0,
-                leads_job=None):
+                leads_job=None, mail_service=None, settings_path=None, send_service=None, auto_login=False):
     server = ThreadingHTTPServer((host, port), Handler)
     server.service = service or Service()
     server.limiter = limiter or RateLimiter()
     server.auth_limiter = RateLimiter(5, 60)
     server.trusted_proxies = trusted_proxies
     server.leads_job = leads_job
+    server.mail_service = mail_service
+    server.send_service = send_service
+    server.auto_login = auto_login
+    server.settings_path = settings_path or mailcfg.SETTINGS_FILE
     return server
 
 
@@ -386,15 +545,28 @@ def main(argv=None):
                         help="сколько прокси хостинга стоит перед сайтом (0 - нет)")
     args = parser.parse_args(argv)
 
-    leads_job = LeadsJob(env("LEADS_TOKEN", ""), api_key=env("CHECKO_API_KEY", ""))
+    data_dir = env("OUTREACH_DATA", "")              # папка данных рассылки: задана только при запуске у вас на компьютере
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+    leads_job = LeadsJob(env("LEADS_TOKEN", ""), out_dir=data_dir or None, api_key=env("CHECKO_API_KEY", ""))
+    mail_service = MailService(
+        env("MAILRU_USER", ""), env("MAILRU_APP_PASSWORD", ""), env("MAIL_FROM_NAME", ""),
+        example={"to": env("MAIL_EXAMPLE_TO", ""), "director": env("MAIL_EXAMPLE_DIRECTOR", "")})
+    send_service = SendService(data_dir) if data_dir else None
     server = make_server(args.host, args.port, Service(max_queue=args.max_queue),
-                         RateLimiter(args.rate_limit), args.trusted_proxies, leads_job)
+                         RateLimiter(args.rate_limit), args.trusted_proxies, leads_job, mail_service,
+                         send_service=send_service, auto_login=env("LEADS_AUTO_LOGIN") == "1")
     print(f"Сайт запущен: http://{args.host}:{server.server_port}  (Ctrl+C - остановить)")
     if leads_job.enabled:
         print("Страница /leads включена (пароль из LEADS_TOKEN)."
               + (" Источник API Checko доступен." if leads_job.api_available else ""))
     elif env("LEADS_TOKEN"):
-        print("LEADS_TOKEN короче 12 знаков: страница /leads отключена.")
+        print("LEADS_TOKEN короче 12 знаков: страницы /leads и /mail отключены.")
+    if leads_job.enabled and send_service is not None:
+        print(f"Кнопка «Отправить» на /leads включена. Папка данных: {data_dir}")
+    if leads_job.enabled:
+        print("Страница /mail включена (тот же пароль)."
+              + ("" if mail_service.configured else " Отправка не настроена: нужны MAILRU_USER и MAILRU_APP_PASSWORD."))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

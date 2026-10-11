@@ -2,7 +2,11 @@
 .github
 __pycache__
 *.pyc
-test_*.py
+tests
 README.md
 vypiski
 выписки
+local.env
+.idea
+.venv
+venv

@@ -1,4 +1,4 @@
-"""Новые организации за день -> таблица: название, ФИО директора, почта.
+"""Новые организации за день -> таблица: название, ФИО директора, почта, основной ОКВЭД.
 
 Алгоритм:
     1. Со страницы https://checko.ru/company/updates собрать ИНН организаций,
@@ -31,7 +31,10 @@ from checko_updates import CheckoBlocked, CheckoClient, CheckoError
 from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
 
-FIELDS = ["Название", "ФИО директора", "Почта"]
+FIELDS = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
+
+SOURCE_REGISTER = "ЕГРЮЛ"             # почта из выписки ЕГРЮЛ: на такие адреса рассылка разрешена
+SOURCE_CHECKO = "контакты Checko"      # почта из контактов Checko («открытые источники»): для рассылки не годится
 
 OK = "ok"                # есть почта - идёт в таблицу
 NO_EMAIL = "no_email"    # выписка получена, почты нет - в таблицу не идёт и повторно не проверяется
@@ -49,7 +52,8 @@ def director_from_search(raw: str) -> str:
 
 def process_company(client: EgrulClient, company) -> dict:
     """Одна организация -> запись состояния. Капча пробрасывается наверх."""
-    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "okved": "",
+             "okved_name": "", "note": ""}
     try:
         records = client.search_by_inn(company.inn)
         if not records:
@@ -71,6 +75,8 @@ def process_company(client: EgrulClient, company) -> dict:
         return entry
 
     entry["email"] = data.email
+    entry["email_source"] = SOURCE_REGISTER
+    entry["okved"], entry["okved_name"] = data.okved, data.okved_name
     entry["director"] = data.director or director_from_search(record.director)
     entry["status"] = OK if data.email else NO_EMAIL
     return entry
@@ -78,7 +84,8 @@ def process_company(client: EgrulClient, company) -> dict:
 
 def process_company_api(api, company) -> dict:
     """Одна организация через API Checko -> запись состояния. Исчерпанный лимит пробрасывается."""
-    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "note": ""}
+    entry = {"status": RETRY, "name": company.name, "director": "", "email": "", "okved": "",
+             "okved_name": "", "note": ""}
     try:
         info = parse_company(api.company(company.inn))
     except CheckoApiQuotaExceeded:
@@ -90,12 +97,18 @@ def process_company_api(api, company) -> dict:
         entry["note"] = f"ошибка: {exc}"[:200]
         return entry
 
-    entry["name"] = info.name or company.name
+    entry["name"] = company.name or info.name      # название из списка Checko; из API - только если в списке его нет
     entry["director"] = info.director
     entry["email"] = info.email
+    entry["email_source"] = SOURCE_REGISTER if info.email_from_register else SOURCE_CHECKO
+    entry["okved"], entry["okved_name"] = info.okved, info.okved_name
     entry["status"] = OK if info.email else NO_EMAIL
+    notes = []
     if info.email and not info.email_from_register:
-        entry["note"] = "почта из контактов Checko, не из ЕГРЮЛ"
+        notes.append("почта из контактов Checko, не из ЕГРЮЛ")
+    if not info.okved:
+        notes.append("ОКВЭД не найден в ответе API")
+    entry["note"] = "; ".join(notes)
     return entry
 
 
@@ -130,14 +143,34 @@ def save_results(out: str, state: dict) -> None:
             writer.writerow(FIELDS)
             for entry in state.values():
                 if entry["status"] == OK:
-                    writer.writerow([entry["name"], entry["director"], entry["email"]])
+                    writer.writerow([entry["name"], entry["director"], entry["email"],
+                                     entry.get("okved", ""), entry.get("okved_name", ""),
+                                     entry.get("email_source", "")])
 
     _write_atomic(state_path(out), write_state)
     _write_atomic(out, write_csv)
 
 
+def needs_check(entry) -> bool:
+    """Проверять ли организацию (снова): ошибка или нет в ЕГРЮЛ; а также запись из старого запуска,
+    сделанного до появления ОКВЭД и источника почты (ключа «okved» в ней нет) - её дозаполняем один раз."""
+    if entry is None:
+        return True
+    return entry["status"] == RETRY or (entry["status"] == OK and "okved" not in entry)
+
+
 def count(state: dict, status: str) -> int:
     return sum(1 for entry in state.values() if entry["status"] == status)
+
+
+WEB_HEADER = FIELDS
+
+
+def table_rows(state: dict) -> list:
+    """Строки таблицы для сайта и Excel-файла (те же колонки, что в CSV): организации с почтой, в порядке проверки."""
+    return [[entry["name"], entry["director"], entry["email"], entry.get("okved", ""),
+             entry.get("okved_name", ""), entry.get("email_source", "")]
+            for entry in state.values() if entry["status"] == OK]
 
 
 def _wait(seconds: float, should_stop, sleep) -> bool:
@@ -158,7 +191,8 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         process=None) -> int:
     """Возвращает код выхода: 0 - готово, 2 - ФНС потребовала капчу, 3 - Checko недоступен,
     4 - остановлено пользователем, 5 - слишком много ошибок подряд (ФНС отвечает не как обычно:
-    дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko.
+    дальше стучаться бессмысленно), 6 - исчерпан лимит API Checko, 7 - во вставленном тексте нет
+    организаций за выбранную дату (есть за другие).
 
     process(company) -> запись состояния: по умолчанию выписки ФНС (egrul), можно подставить API.
 
@@ -177,10 +211,16 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
     except CheckoError as exc:
         log(f"Ошибка при чтении Checko: {exc}")
         return 3
-    log(f"Найдено организаций: {len(companies)}")
+    log(f"Найдено организаций: {len(companies)}; названий в списке: {sum(1 for c in companies if c.name)}")
+    other_dates = checko.dates() if not companies and hasattr(checko, "dates") else {}
+    if other_dates:
+        listed = ", ".join(f"{day.isoformat()} ({number})" for day, number in sorted(other_dates.items(), reverse=True))
+        log(f"В вставленном тексте нет организаций за {target.isoformat()}. Есть за: {listed}. "
+            "Укажите одну из этих дат в поле «Дата регистрации».")
+        return 7
 
     state = load_state(state_path(out))
-    todo = [c for c in companies if state.get(c.inn, {}).get("status", RETRY) == RETRY]
+    todo = [c for c in companies if needs_check(state.get(c.inn))]
     if state:
         log(f"Уже проверено раньше: {len(companies) - len(todo)}; осталось: {len(todo)}")
     if limit:
@@ -188,6 +228,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
 
     code = 0
     errors_in_a_row = 0
+    processed = failed = 0
     for number, company in enumerate(todo, 1):
         if should_stop() or (number > 1 and _wait(pause, should_stop, sleep)):   # пауза: не нагружаем ФНС
             code = 4
@@ -218,6 +259,8 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
         # в журнал - только статус, без ФИО и почты (в публичных репозиториях журнал открыт всем)
         log(f"[{number}/{len(todo)}] {company.inn}: {entry['status']}"
             + (f" ({entry['note']})" if entry["note"] else ""))
+        failure = entry["status"] == RETRY and entry["note"].startswith("ошибка")
+        processed, failed = processed + 1, failed + failure
         errors_in_a_row = errors_in_a_row + 1 if entry["note"].startswith("ошибка") else 0
         if errors_in_a_row >= max_errors_in_a_row:
             log(f"{errors_in_a_row} ошибок подряд - останавливаемся: сайт ФНС отвечает не как обычно. "
@@ -226,6 +269,9 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
             break
     if code == 4:
         log("Остановлено по запросу. Результат сохранён.")
+    elif code == 0 and processed and failed == processed:
+        log("Ни одну организацию проверить не удалось: все запросы закончились ошибкой. Причина в строках выше.")
+        code = 5
 
     save_results(out, state)                # файл создаётся и когда обработать нечего
     log(f"Готово. В таблице {out}: {count(state, OK)} организаций с почтой. "
@@ -235,7 +281,7 @@ def run(target: date, out: str, limit: int = 0, pause: float = 2.0, max_pages: i
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Новые организации за день: название, ФИО директора, почта")
+    parser = argparse.ArgumentParser(description="Новые организации за день: название, ФИО директора, почта, основной ОКВЭД")
     parser.add_argument("--date", type=date.fromisoformat, default=None,
                         help="дата регистрации ГГГГ-ММ-ДД (по умолчанию сегодня по Москве)")
     parser.add_argument("--out", help="CSV-файл (по умолчанию leads_<дата>.csv)")

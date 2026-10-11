@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import threading
 import time
 import unittest
@@ -6,6 +8,7 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
+from mailing import config as cfg
 from app import RateLimiter, Service, make_server
 from egrul_inn_search import EgrulCaptchaRequired, EgrulError, EgrulRecord, EgrulTimeout
 
@@ -272,15 +275,22 @@ class RateLimiterTest(unittest.TestCase):
 # ---- закрытая выгрузка «новые компании» (/leads) ----
 
 import datetime
+import io
 import tempfile
+
+import openpyxl
 
 import leads
 from leads_job import LeadsJob
+from mailing import journal
+from send_service import SendError
 
 TOKEN = "correct-horse-battery"
 
 
-class LeadsWebTest(unittest.TestCase):
+class LeadsCase(unittest.TestCase):
+    """Общая оснастка: сайт с подставной выгрузкой."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -307,17 +317,18 @@ class LeadsWebTest(unittest.TestCase):
         log("[1/1] 7707083004: ok")
         return self.code
 
-    def start(self, token=TOKEN, api_key=""):
+    def start(self, token=TOKEN, api_key="KEY", send_service=None, auto_login=False):
         job = LeadsJob(token, run=self.fake_run, out_dir=self.tmp.name, api_key=api_key)
         server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
-                             leads_job=job)
+                             leads_job=job, send_service=send_service, auto_login=auto_login)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(AppTest.stop, server)
         self.job, self.base = job, f"http://127.0.0.1:{server.server_port}"
         return job
 
-    def request(self, path, method="GET", body=None, token=TOKEN):
+    def request(self, path, method="GET", body=None, token=TOKEN, extra=None):
         headers = {"X-Leads-Token": token} if token is not None else {}
+        headers.update(extra or {})
         data = None
         if body is not None:
             data = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -329,6 +340,9 @@ class LeadsWebTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.headers, exc.read()
 
+
+
+class LeadsWebTest(LeadsCase):
     # ---- доступ ----
 
     def test_disabled_without_a_sufficient_token(self):
@@ -336,14 +350,14 @@ class LeadsWebTest(unittest.TestCase):
             self.start(token)
             self.assertEqual(self.request("/leads")[0], 404)
             self.assertEqual(self.request("/api/leads/status", token="short")[0], 404)
-            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token="short")[0], 404)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1}, token="short")[0], 404)
         self.assertEqual(self.calls, [])
 
     def test_wrong_or_missing_password(self):
         self.start()
         for token in ("wrong", None):
             self.assertEqual(self.request("/api/leads/status", token=token)[0], 401)
-            self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1}, token=token)[0], 401)
+            self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1}, token=token)[0], 401)
         self.assertEqual(self.calls, [])
 
     def test_password_guessing_is_limited(self):
@@ -373,29 +387,56 @@ class LeadsWebTest(unittest.TestCase):
         self.assertIn("[1/1] 7707083004: ok", data["log"])
         self.assertEqual(self.calls, [(datetime.date(2026, 10, 9), 5)])
 
+        self.assertEqual(data["header"], ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"])
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", ""]])        # таблица на странице
+
         status, headers, body = self.request("/api/leads/download")
         self.assertEqual(status, 200)
-        self.assertIn("text/csv", headers["Content-Type"])
-        self.assertIn('filename="leads_2026-10-09.csv"', headers["Content-Disposition"])
-        self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
-        self.assertIn("Название;ФИО директора;Почта".encode(), body)
-        self.assertIn("ФИРМА;Иванов Иван;a@b.ru".encode(), body)
+        self.assertIn("spreadsheetml.sheet", headers["Content-Type"])
+        self.assertIn('filename="leads_2026-10-09.xlsx"', headers["Content-Disposition"])
+        sheet = openpyxl.load_workbook(io.BytesIO(body)).active
+        self.assertEqual([[cell.value for cell in row] for row in sheet.iter_rows()],
+                         [["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"], ["ФИРМА", "Иванов Иван", "a@b.ru", None, None, None]])
 
-    def test_empty_date_means_today_in_moscow(self):
+    def test_status_marks_who_already_got_a_letter(self):
         job = self.start()
-        self.request("/api/leads/start", "POST", {"date": "", "limit": 0})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
         job.join(5)
-        self.assertEqual(self.calls, [(leads.today_moscow(), 0)])
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual((data["sent"], data["send_enabled"]), ({}, False))
+        journal.save_state(os.path.join(self.tmp.name, "letters_1.sent.json"),
+                           {"a@b.ru": journal.make_entry(journal.SENT, "Тема", {})})
+        data = json.loads(self.request("/api/leads/status")[2])
+        self.assertEqual(data["sent"]["a@b.ru"]["stage"], 1)
+        self.assertEqual(data["sent"]["a@b.ru"]["status"], journal.SENT)
+
+    def test_the_last_table_is_still_shown_after_the_site_restarts(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+        data = LeadsJob(TOKEN, run=self.fake_run, out_dir=self.tmp.name, api_key="KEY").status()
+        self.assertEqual((data["state"], data["date"]), ("idle", "2026-10-09"))
+        self.assertEqual(data["rows"], [["ФИРМА", "Иванов Иван", "a@b.ru", "", "", ""]])
+        self.assertTrue(data["has_table"])
+        self.assertEqual(LeadsJob(TOKEN, run=self.fake_run, out_dir=tempfile.mkdtemp()).status()["rows"], [])
+
+    def test_the_date_must_be_chosen_by_the_user(self):
+        self.start()
+        for body in ({"limit": 1}, {"date": "", "limit": 1}, {"date": "   "}):
+            status, _, answer = self.request("/api/leads/start", "POST", body)
+            self.assertEqual(status, 400, body)
+            self.assertIn("Укажите дату", json.loads(answer)["error"])
+        self.assertEqual(self.calls, [])                       # ни одного запроса за «сегодня» по умолчанию
 
     def test_second_start_while_running_is_rejected(self):
         self.gate = threading.Event()
         job = self.start()
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 409)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 409)
         self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
         self.gate.set()
         job.join(5)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)   # снова можно
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)   # снова можно
         job.join(5)
 
     def test_invalid_input_is_rejected(self):
@@ -408,9 +449,7 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual(self.request("/api/leads/start", "POST", b"")[0], 400)
         with mock.patch("app.MAX_BODY", 500):                  # слишком большое тело запроса
             self.assertEqual(self.request("/api/leads/start", "POST", b"{" + b" " * 600 + b"}")[0], 400)
-        self.assertEqual(self.request("/api/leads/start", "POST", {"text": 123})[0], 400)
-        for pause in (0.5, 61, "долго"):
-            self.assertEqual(self.request("/api/leads/start", "POST", {"pause": pause})[0], 400, pause)
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "text": 123})[0], 400)
         self.assertEqual(self.calls, [])
 
     def test_stop_button(self):
@@ -418,7 +457,7 @@ class LeadsWebTest(unittest.TestCase):
         job = self.start()
         self.assertEqual(self.request("/api/leads/stop", "POST", {}, token=None)[0], 401)     # нужен пароль
         self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": False})
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         self.assertEqual(json.loads(self.request("/api/leads/status")[2])["state"], "running")
         self.assertEqual(json.loads(self.request("/api/leads/stop", "POST", {})[2]), {"was_running": True})
         job.join(5)
@@ -426,63 +465,36 @@ class LeadsWebTest(unittest.TestCase):
         self.assertEqual(data["state"], "stopped")
         self.assertIn("Остановлено вами", data["message"])
         self.until_stop = False
-        self.assertEqual(self.request("/api/leads/start", "POST", {"limit": 1})[0], 202)      # снова можно
+        self.assertEqual(self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})[0], 202)      # снова можно
         job.join(5)
 
-    def test_export_waits_out_a_captcha(self):
+    def test_export_can_be_stopped(self):
         job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
-        self.assertEqual(self.kwargs["captcha_wait"], 600)
         self.assertTrue(callable(self.kwargs["should_stop"]))
 
-    # ---- источник данных: API Checko или выписки ФНС ----
+    # ---- источник данных: всегда API Checko ----
 
     def test_status_tells_whether_api_is_configured(self):
-        self.start()
+        self.start(api_key="")
         self.assertFalse(json.loads(self.request("/api/leads/status")[2])["api_available"])
         self.start(api_key="KEY")
         self.assertTrue(json.loads(self.request("/api/leads/status")[2])["api_available"])
 
-    def test_default_source_is_api_when_the_key_is_set(self):
-        job = self.start(api_key="KEY")
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20})
+    def test_export_always_goes_through_the_api_with_a_short_pause(self):
+        job = self.start()
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1, "pause": 20, "source": "egrul"})   # лишние поля не нужны
         job.join(5)
         self.assertIn("process", self.kwargs)
-        self.assertEqual(self.kwargs["pause"], 0.3)             # API без капчи: пауза короткая, не 20 с
+        self.assertEqual(self.kwargs["pause"], 0.05)            # API без капчи: лимит 32 в секунду, мы не больше 20
 
-    def test_default_source_without_a_key_is_the_register_extracts(self):
-        job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 20})
-        job.join(5)
-        self.assertNotIn("process", self.kwargs)
-        self.assertEqual(self.kwargs["pause"], 20)
-
-    def test_explicit_extracts_even_with_a_key(self):
-        job = self.start(api_key="KEY")
-        self.request("/api/leads/start", "POST", {"limit": 1, "source": "egrul"})
-        job.join(5)
-        self.assertNotIn("process", self.kwargs)
-
-    def test_api_source_without_a_key_is_refused_with_a_hint(self):
-        self.start()
-        status, _, body = self.request("/api/leads/start", "POST", {"source": "api"})
+    def test_without_a_key_the_export_is_refused_with_a_hint(self):
+        self.start(api_key="")
+        status, _, body = self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         self.assertEqual(status, 400)
         self.assertIn("CHECKO_API_KEY", json.loads(body)["error"])
         self.assertEqual(self.calls, [])
-
-    def test_unknown_source_is_rejected(self):
-        self.start(api_key="KEY")
-        self.assertEqual(self.request("/api/leads/start", "POST", {"source": "foo"})[0], 400)
-
-    def test_pause_is_passed_to_the_export(self):
-        job = self.start()
-        self.request("/api/leads/start", "POST", {"limit": 1, "pause": 12})
-        job.join(5)
-        self.assertEqual(self.kwargs["pause"], 12)
-        self.request("/api/leads/start", "POST", {"limit": 1})
-        job.join(5)
-        self.assertEqual(self.kwargs["pause"], 6)             # по умолчанию 6 секунд
 
     def test_pasted_text_replaces_checko(self):
         from checko_updates import PastedPages
@@ -505,14 +517,14 @@ class LeadsWebTest(unittest.TestCase):
     def test_stop_and_error_states(self):
         job = self.start()
         self.code = 3
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
         data = json.loads(self.request("/api/leads/status")[2])
         self.assertEqual(data["state"], "stopped")
         self.assertIn("Checko", data["message"])
 
         self.error = RuntimeError("сломалось")
-        self.request("/api/leads/start", "POST", {"limit": 1})
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 1})
         job.join(5)
         data = json.loads(self.request("/api/leads/status")[2])
         self.assertEqual(data["state"], "error")
@@ -532,6 +544,292 @@ class LeadsWebTest(unittest.TestCase):
         self.start()
         self.assertEqual(self.request("/healthz", token=None)[0], 200)
         self.assertEqual(self.request("/", token=None)[0], 200)
+
+
+# ---- пробное письмо через mail.ru (/mail) ----
+
+class FakeSendService:
+    """Вместо SendService: запоминает вызовы и отвечает по сценарию."""
+
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def prepare(self, leads_path, count, include_unwritten=False):
+        self.calls.append(("prepare", os.path.basename(leads_path), count, include_unwritten))
+        if self.error:
+            raise self.error
+        return {"letters": 3, "summary": ["Собрано писем: 3."], "examples": [], "daily_limit": 40,
+                "sent_24h": 0, "room": 40}
+
+    def start(self, leads_path, count, include_unwritten=False, expected=None):
+        self.calls.append(("start", os.path.basename(leads_path), count, include_unwritten, expected))
+        if self.error:
+            raise self.error
+        return {"started": True, "letters": 3, "daily_limit": 40, "message": "Отправка запущена."}
+
+    def status(self):
+        return {"running": False, "lines": ["Сейчас отправка не идёт."], "ready": True}
+
+
+class SessionTest(LeadsCase):
+    """Пароль страницы для самой страницы: только на своём компьютере и только для своих запросов."""
+
+    def test_off_unless_the_site_runs_on_the_owners_computer(self):
+        self.start()
+        self.assertEqual(self.request("/api/leads/session", token=None)[0], 404)
+
+    def test_the_page_gets_the_password_from_the_site(self):
+        self.start(auto_login=True)
+        status, headers, body = self.request("/api/leads/session", token=None)
+        self.assertEqual((status, json.loads(body)), (200, {"token": TOKEN}))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Sec-Fetch-Site": "same-origin"})[0], 200)
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Host": "localhost:8000"})[0], 200)
+        self.assertEqual(self.request("/api/leads/session", token=None, extra={"Host": "[::1]:8000"})[0], 200)
+
+    def test_foreign_sites_and_rebinding_names_get_nothing(self):
+        self.start(auto_login=True)
+        for extra in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
+                      {"Host": "evil.example:8000"}, {"Host": "127.0.0.1.evil.example"}, {"Host": ""}):
+            self.assertEqual(self.request("/api/leads/session", token=None, extra=extra)[0], 404, extra)
+
+    def test_only_the_computer_itself_counts_as_local(self):
+        import types
+        from app import Handler
+
+        def local(peer, **headers):
+            fake = types.SimpleNamespace(client_address=(peer, 5000), headers=headers)
+            fake.headers = types.SimpleNamespace(get=lambda name, default=None: headers.get(name, default))
+            return Handler._local_request(fake)
+
+        self.assertTrue(local("127.0.0.1", Host="127.0.0.1:8000"))
+        self.assertTrue(local("::1", Host="[::1]:8000"))
+        self.assertFalse(local("203.0.113.5", Host="127.0.0.1:8000"))                    # чужой компьютер в сети
+        self.assertFalse(local("127.0.0.1", Host="127.0.0.1:8000", **{"Sec-Fetch-Site": "cross-site"}))
+        self.assertFalse(local("127.0.0.1", Host="my-computer.local:8000"))
+        self.assertFalse(local("127.0.0.1"))                                                # нет Host
+
+    def test_disabled_page_has_no_session_either(self):
+        self.start(token="short", auto_login=True)
+        self.assertEqual(self.request("/api/leads/session", token=None)[0], 404)
+
+
+class SendWebTest(LeadsCase):
+    def table(self, job):
+        self.request("/api/leads/start", "POST", {"date": "2026-10-09", "limit": 5})
+        job.join(5)
+
+    def test_without_a_service_the_buttons_do_not_exist(self):
+        self.start()
+        for path, method in (("/api/send/status", "GET"), ("/api/send/prepare", "POST"), ("/api/send/start", "POST")):
+            self.assertEqual(self.request(path, method, {"count": 1} if method == "POST" else None)[0], 404, path)
+
+    def test_the_password_is_required(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        self.assertEqual(self.request("/api/send/status", token="wrong")[0], 401)
+        self.assertEqual(self.request("/api/send/prepare", "POST", {"count": 1}, token=None)[0], 401)
+        self.assertEqual(self.request("/api/send/start", "POST", {"count": 1}, token="wrong")[0], 401)
+        self.assertEqual(service.calls, [])
+
+    def test_prepare_and_start_use_the_current_table(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        status, _, body = self.request("/api/send/prepare", "POST", {"count": 7, "include_unwritten": True})
+        self.assertEqual((status, json.loads(body)["letters"]), (200, 3))
+        status, _, body = self.request("/api/send/start", "POST", {"count": 7, "expected": 3})
+        self.assertEqual((status, json.loads(body)["started"]), (202, True))
+        self.assertEqual(service.calls, [("prepare", "leads_2026-10-09.csv", 7, True),
+                                         ("start", "leads_2026-10-09.csv", 7, False, 3)])
+        self.assertTrue(json.loads(self.request("/api/leads/status")[2])["send_enabled"])
+        self.assertEqual(json.loads(self.request("/api/send/status")[2])["lines"], ["Сейчас отправка не идёт."])
+
+    def test_no_table_means_no_send(self):
+        service = FakeSendService()
+        self.start(send_service=service)
+        status, _, body = self.request("/api/send/start", "POST", {"count": 3})
+        self.assertEqual(status, 400)
+        self.assertIn("Таблицы пока нет", json.loads(body)["error"])
+        self.assertEqual(service.calls, [])
+
+    def test_errors_of_the_service_are_shown_with_their_code(self):
+        service = FakeSendService(SendError(409, "Отправка уже идёт."))
+        job = self.start(send_service=service)
+        self.table(job)
+        status, _, body = self.request("/api/send/start", "POST", {"count": 3})
+        self.assertEqual((status, json.loads(body)["error"]), (409, "Отправка уже идёт."))
+
+    def test_bad_requests_are_rejected(self):
+        service = FakeSendService()
+        job = self.start(send_service=service)
+        self.table(job)
+        for body in (b"", b"not json", [1], {"count": 3, "expected": "три"}, b"x" * 5000):
+            self.assertEqual(self.request("/api/send/start", "POST", body)[0], 400, body)
+        self.assertEqual(service.calls, [])
+
+
+import smtplib
+
+from mail_service import MailService
+
+
+class FakeMailSender:
+    user = "sender@internet.ru"
+
+    def __init__(self, outbox, error=None):
+        self.outbox, self.error = outbox, error
+
+    def send(self, msg):
+        if self.error:
+            raise self.error
+        self.outbox.append(msg)
+
+    def close(self):
+        pass
+
+
+class MailWebTest(unittest.TestCase):
+    def start(self, token=TOKEN, configured=True, error=None):
+        self.outbox = []
+        mail = MailService("sender@internet.ru" if configured else "", "secret-app-password" if configured else "",
+                           sender_factory=lambda: FakeMailSender(self.outbox, error))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.settings_path = os.path.join(tmp.name, "settings.json")          # настоящий settings.json не трогаем
+        server = make_server("127.0.0.1", 0, Service(FakeClient, min_interval=0), RateLimiter(10000),
+                             leads_job=LeadsJob(token), mail_service=mail, settings_path=self.settings_path)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(AppTest.stop, server)
+        self.base = f"http://127.0.0.1:{server.server_port}"
+
+    request = LeadsWebTest.request
+
+    def test_hidden_without_a_sufficient_password(self):
+        for token in ("", "short"):
+            self.start(token)
+            self.assertEqual(self.request("/mail", token=None)[0], 404)
+            self.assertEqual(self.request("/api/mail/defaults", token="short")[0], 404)
+            self.assertEqual(self.request("/api/mail/send", "POST", {"to": "a@b.ru"}, token="short")[0], 404)
+        self.assertEqual(self.outbox, [])
+
+    def test_api_needs_the_password(self):
+        self.start()
+        self.assertEqual(self.request("/api/mail/defaults", token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/preview", "POST", {}, token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/send", "POST",
+                                      {"to": "a@b.ru", "subject": "Т", "body": "Х"}, token="wrong-password-123")[0], 401)
+        self.assertEqual(self.outbox, [])
+
+    def test_page_is_served_but_carries_no_data(self):
+        self.start()
+        status, headers, body = self.request("/mail", token=None)
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        text = body.decode("utf-8")
+        self.assertNotIn("secret-app-password", text)
+        self.assertNotIn("sender@internet.ru", text)
+        self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))      # ни одного адреса почты в самой странице
+
+    def test_limit_setting_needs_the_password_and_is_hidden_without_one(self):
+        self.start("short")
+        self.assertEqual(self.request("/api/mail/settings", token="short")[0], 404)
+        self.assertEqual(self.request("/api/mail/settings", "POST", {"daily_limit": "5"}, token="short")[0], 404)
+        self.start()
+        self.assertEqual(self.request("/api/mail/settings", token=None)[0], 401)
+        self.assertEqual(self.request("/api/mail/settings", "POST", {"daily_limit": "5"}, token=None)[0], 401)
+        self.assertFalse(os.path.exists(self.settings_path))
+
+    def test_limit_setting_is_saved_and_read_back(self):
+        self.start()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MAIL_DAILY_LIMIT", None)
+            status, _, body = self.request("/api/mail/settings")
+            self.assertEqual((status, json.loads(body)["daily_limit"], json.loads(body)["source"]),
+                             (200, 40, "по умолчанию"))
+            os.environ["MAIL_DAILY_LIMIT"] = "15"
+            self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["source"], "local.env")
+            status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": " 12 "})
+            data = json.loads(body)
+            self.assertEqual((status, data["daily_limit"], data["source"]), (200, 12, "сайт"))
+            self.assertEqual(json.loads(self.request("/api/mail/settings")[2])["daily_limit"], 12)
+            # то же значение видит программа отправки и оно главнее local.env
+            self.assertEqual(cfg.resolve_daily_limit(settings_path=self.settings_path), (12, "сайт"))
+
+    def test_bad_limit_is_refused_and_nothing_is_saved(self):
+        self.start()
+        for bad in ("0", "201", "-5", "abc", "", "1.5"):
+            status, _, body = self.request("/api/mail/settings", "POST", {"daily_limit": bad})
+            self.assertEqual(status, 400, bad)
+            self.assertIn("от 1 до 200", json.loads(body)["error"])
+        self.assertFalse(os.path.exists(self.settings_path))
+
+    def test_page_has_the_limit_block_for_one_mailbox(self):
+        self.start()
+        text = self.request("/mail", token=None)[2].decode("utf-8")
+        self.assertIn("Писем в сутки с одного почтового ящика", text)
+        self.assertIsNone(re.search(r"[\w.-]+@[\w-]+\.\w+", text))
+
+    def test_defaults_give_a_ready_example(self):
+        self.start()
+        status, _, body = self.request("/api/mail/defaults")
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["configured"])
+        self.assertEqual(data["to"], "sender@internet.ru")
+        self.assertIn("ООО «Ромашка»", data["subject"])
+        self.assertNotIn("secret-app-password", body.decode("utf-8"))
+
+    def test_preview_renders_the_template(self):
+        self.start()
+        status, _, body = self.request("/api/mail/preview", "POST", {
+            "company": 'ООО "РОМАШКА"', "director": "ПЕТРОВ СЕРГЕЙ НИКОЛАЕВИЧ", "okved": "торговля",
+            "signature": "Пётр", "offer": "Есть предложение."})
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["subject"], "Вопрос для ООО «Ромашка»")
+        self.assertIn("Добрый день, Сергей Николаевич!", data["body"])
+        self.assertEqual(self.request("/api/mail/preview", "POST", {})[0], 200)        # пустая форма не ломает
+
+    def test_send_delivers_and_reports(self):
+        self.start()
+        status, _, body = self.request("/api/mail/send", "POST",
+                                       {"to": "a@b.ru", "subject": "Тема", "body": "Текст"})
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual([m["To"] for m in self.outbox], ["a@b.ru"])
+        self.assertIn("Message-ID", self.outbox[0])
+
+    def test_errors_reach_the_page_with_a_reason(self):
+        self.start(configured=False)
+        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 503)
+        self.assertIn("MAILRU_APP_PASSWORD", json.loads(body)["error"])
+        self.assertFalse(json.loads(self.request("/api/mail/defaults")[2])["configured"])
+
+        self.start(error=TimeoutError("timed out"))
+        with mock.patch.dict(os.environ, {"RENDER": "true"}):
+            status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 504)
+        self.assertIn("Render", json.loads(body)["error"])
+
+        self.start(error=smtplib.SMTPAuthenticationError(535, b"Application password is REQUIRED"))
+        status, _, body = self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "Х"})
+        self.assertEqual(status, 502)
+        self.assertNotIn("secret-app-password", json.loads(body)["error"])
+
+    def test_bad_requests(self):
+        self.start()
+        self.assertEqual(self.request("/api/mail/send", "POST", b"not json")[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", b"")[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", [1, 2])[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": 5})[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": "не адрес", "subject": "Т", "body": "Х"})[0], 400)
+        self.assertEqual(self.request("/api/mail/send", "POST", {"to": "a@b.ru", "subject": "Т", "body": "x" * 200_000})[0], 400)
+        self.assertEqual(self.request("/api/mail/send")[0], 404)                       # GET на отправку не работает
+        self.assertEqual(self.outbox, [])
 
 
 if __name__ == "__main__":

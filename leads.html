@@ -23,9 +23,12 @@
     margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  main { max-width: 720px; margin: 0 auto; }
+  main { max-width: 980px; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; }
+  h2 { font-size: 1.15rem; margin: 0 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 8px; }
+  .nav { margin: 0 0 20px; font-size: .9rem; }
+  .nav a { color: var(--accent); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
   label { display: block; font-weight: 600; margin: 0 0 6px; }
   .field { margin-bottom: 14px; }
@@ -42,166 +45,354 @@
   }
   button:disabled { opacity: .6; cursor: progress; }
   button.secondary { color: var(--text); background: transparent; border: 1px solid var(--line); margin-left: 8px; }
-  select {
-    width: 100%; padding: 12px 14px; font: inherit; color: var(--text);
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-  }
-  select:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-  #status { margin: 14px 0 0; color: var(--muted); min-height: 1.5em; }
-  #status.ok { color: var(--ok); }
-  #status.error { color: var(--error); }
+  input:focus-visible, button:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .status { margin: 14px 0 0; color: var(--muted); min-height: 1.5em; white-space: pre-line; }
+  .status.ok { color: var(--ok); }
+  .status.error { color: var(--error); }
   .counts { display: flex; gap: 20px; flex-wrap: wrap; margin: 0 0 12px; }
   .counts b { font-size: 1.4rem; display: block; }
   .counts span { color: var(--muted); font-size: .85rem; }
   .check { display: flex; align-items: center; gap: 8px; font-weight: 400; margin: 8px 0 0; font-size: .9rem; }
   .check input { width: auto; margin: 0; }
-  .link { background: none; border: 0; padding: 0; margin-left: auto; font-weight: 400; font-size: .85rem;
-          color: var(--muted); text-decoration: underline; }
-  details { margin: 0 0 14px; }
-  summary { cursor: pointer; font-weight: 600; }
-  details p { color: var(--muted); font-size: .9rem; margin: 8px 0; }
   textarea {
     width: 100%; min-height: 120px; padding: 12px 14px; font: inherit; font-size: .85rem;
     color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
   }
   textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  select { width: 100%; padding: 8px 10px; font: inherit; color: var(--text); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; }
+  .table-wrap { max-height: 420px; overflow: auto; margin: 0 0 12px; border: 1px solid var(--line); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th, td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: break-word; }
+  td:nth-child(3) { white-space: nowrap; }          /* почта не переносится посреди адреса */
+  th { position: sticky; top: 0; background: var(--card); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  td.empty { color: var(--muted); text-align: center; }
+  td.mail-status { white-space: nowrap; color: var(--muted); font-size: .8rem; }
+  tr.sent td { opacity: .4; }                       /* письмо ушло: строка бледнеет */
+  tr.rejected td { color: var(--error); }
+  .note { color: var(--muted); font-size: .85rem; margin: 8px 0 0; }
   pre {
     margin: 0; padding: 12px; max-height: 260px; overflow: auto; font-size: .8rem;
     background: var(--bg); border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
   }
+  dialog { max-width: 640px; width: calc(100% - 32px); border: 1px solid var(--line); border-radius: 12px;
+           background: var(--card); color: var(--text); padding: 20px; }
+  dialog::backdrop { background: rgba(0, 0, 0, .5); }
+  .actions { margin-top: 16px; }
+  #send .row { margin-top: 14px; }
   @media (max-width: 480px) { .row { flex-direction: column; gap: 0; } }
 </style>
 </head>
 <body>
 <main>
   <h1>Новые компании: ФИО и почта</h1>
-  <p class="sub">Организации, зарегистрированные в выбранный день. В таблицу попадают только те, у кого в выписке указана почта.</p>
+  <p class="sub">Организации, зарегистрированные в выбранный день. ФИО директора, почта и вид деятельности берутся из API Checko; в таблицу попадают только организации с почтой. Таблица заполняется на этой странице по мере проверки, письма отправляются кнопкой ниже.</p>
+  <p class="nav"><a href="/mail">Пробное письмо и лимит отправки</a></p>
 
-  <form id="form" class="card" autocomplete="off">
+  <form id="login" class="card" autocomplete="off" hidden>
     <div class="field">
-      <label for="token">Пароль</label>
+      <label for="token">Пароль <span class="hint">обычно вводить его не нужно: он лежит в local.env (строка LEADS_TOKEN), а сайт открывается со ссылкой, где он уже есть</span></label>
       <input id="token" name="password" type="password" autocomplete="current-password" required>
-      <label class="check"><input id="remember" type="checkbox" checked> Запомнить пароль в этом браузере
-        <button id="forget" class="link" type="button">Забыть</button></label>
     </div>
-    <div class="field">
-      <label for="source">Откуда брать ФИО и почту</label>
-      <select id="source">
-        <option value="">Автоматически: API Checko, если на сервере задан ключ</option>
-        <option value="api">API Checko (быстро, без капчи; нужен ключ)</option>
-        <option value="egrul">Выписки ФНС с egrul.nalog.ru (медленно, возможна капча)</option>
-      </select>
-    </div>
-    <div class="row">
-      <div class="field">
-        <label for="date">Дата регистрации <span class="hint">ГГГГ-ММ-ДД, пусто — сегодня</span></label>
-        <input id="date" placeholder="2026-10-09" pattern="\d{4}-\d{2}-\d{2}">
-      </div>
-      <div class="field">
-        <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
-        <input id="limit" type="number" min="0" max="2000" value="5">
-      </div>
-      <div class="field">
-        <label for="pause">Пауза, с <span class="hint">для выписок ФНС</span></label>
-        <input id="pause" type="number" min="1" max="60" value="6">
-      </div>
-    </div>
-    <details id="paste">
-      <summary>Checko не пускает сервер? Вставьте текст страниц сами</summary>
-      <p>Откройте <b>checko.ru/company/updates</b> в своём браузере, нажмите Ctrl+A, затем Ctrl+C и вставьте
-         сюда (Ctrl+V). Если нужный день занимает несколько страниц, откройте вторую, третью и так далее и
-         добавляйте их текст сюда же, пока даты не станут вчерашними. Сервер возьмёт из текста организации
-         за выбранный день.</p>
-      <textarea id="text" spellcheck="false" placeholder="Текст страниц Checko…"></textarea>
-    </details>
-    <button id="start" type="submit">Запустить</button>
-    <button id="stop" type="button" class="secondary" hidden>Остановить</button>
-    <p id="status" role="status" aria-live="polite"></p>
+    <button type="submit">Войти</button>
+    <p id="login-status" class="status" role="status" aria-live="polite"></p>
   </form>
 
-  <section id="progress" class="card" hidden>
-    <div class="counts">
-      <div><b id="n-ok">0</b><span>с почтой (в таблице)</span></div>
-      <div><b id="n-no">0</b><span>без почты</span></div>
-      <div><b id="n-retry">0</b><span>проверить позже</span></div>
-    </div>
-    <pre id="log"></pre>
-    <p><button id="download" type="button" hidden>Скачать таблицу</button></p>
-  </section>
+  <div id="app" hidden>
+    <form id="form" class="card" autocomplete="off">
+      <div class="row">
+        <div class="field">
+          <label for="date">Дата регистрации <span class="hint">ГГГГ-ММ-ДД</span></label>
+          <input id="date" placeholder="ГГГГ-ММ-ДД" pattern="\d{4}-\d{2}-\d{2}" required>
+        </div>
+        <div class="field">
+          <label for="limit">Сколько проверить <span class="hint">0 — все</span></label>
+          <input id="limit" type="number" min="0" max="2000" value="5">
+        </div>
+      </div>
+      <div class="field">
+        <label for="text">Текст с Checko <span class="hint">откройте checko.ru/company/updates, Ctrl+A, Ctrl+C и вставьте сюда; если день занимает несколько страниц, добавьте текст остальных</span></label>
+        <textarea id="text" spellcheck="false" placeholder="Текст страницы Checko…"></textarea>
+        <p id="dates-hint" class="note" hidden></p>
+      </div>
+      <button id="start" type="submit">Запустить</button>
+      <button id="stop" type="button" class="secondary" hidden>Остановить</button>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </form>
+
+    <section id="progress" class="card" hidden>
+      <div class="counts">
+        <div><b id="n-ok">0</b><span>с почтой (в таблице)</span></div>
+        <div><b id="n-sent">0</b><span>письмо отправлено</span></div>
+        <div><b id="n-wait">0</b><span>ждут отправки</span></div>
+        <div><b id="n-no">0</b><span>без почты</span></div>
+        <div><b id="n-retry">0</b><span>проверить позже</span></div>
+      </div>
+      <div id="table-wrap" class="table-wrap" hidden><table id="rows"></table></div>
+      <pre id="log"></pre>
+      <p><button id="download" type="button" hidden>Скачать таблицу</button></p>
+      <p id="download-note" class="note" hidden>Файл Excel (.xlsx). В Google Таблицы: Файл → Импортировать → Загрузить.</p>
+    </section>
+
+    <section id="send" class="card" hidden>
+      <h2>Отправка писем</h2>
+      <p class="note">Письма первого этапа уходят из таблицы выше: сначала вы увидите, что будет отправлено, и подтвердите. Отправка идёт в фоне с паузой между письмами; лимит в сутки задаётся на странице <a href="/mail">/mail</a>. Те, кому письмо уже ушло, в таблице бледные и повторно не получают его.</p>
+      <div class="row">
+        <div class="field">
+          <label for="send-count">Сколько писем отправить <span class="hint">для нового ящика 10–15 в сутки</span></label>
+          <input id="send-count" type="number" min="1" max="200" value="10">
+        </div>
+      </div>
+      <label class="check"><input id="unwritten" type="checkbox" autocomplete="off"> Компаниям из групп, для которых агенты ещё не написали свой текст, отправить запасной вариант письма</label>
+      <p><button id="send-btn" type="button">Отправить</button></p>
+      <p id="send-status" class="status" role="status" aria-live="polite"></p>
+      <pre id="send-lines" hidden></pre>
+    </section>
+  </div>
 </main>
+
+<dialog id="confirm" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Отправить письма?</h2>
+  <pre id="confirm-summary"></pre>
+  <p class="note" id="confirm-limit" hidden></p>
+  <p class="note">Пример письма (адрес и ФИО в письмо не подставляются):</p>
+  <select id="confirm-group" aria-label="Группа для примера"></select>
+  <pre id="confirm-example"></pre>
+  <div class="actions">
+    <button id="confirm-yes" type="button">Отправить</button>
+    <button id="confirm-no" type="button" class="secondary">Отмена</button>
+  </div>
+</dialog>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let timer = null;
 const STORE = 'leads-password';          // хранится только в этом браузере, на сервер не уходит иначе как в заголовке запроса
+let password = '';
+let timer = null;
+let sendEnabled = false;
+let sendState = null;
+let pending = null;                      // что показали в окне подтверждения: отправляем ровно это
+let watchUntil = 0;                      // до этого момента опрашиваем сервер, даже если отправка ещё не «взяла замок»
 
 function savedPassword() {
   try { return localStorage.getItem(STORE) || ''; } catch (e) { return ''; }
 }
-function rememberPassword(on) {
+function storePassword(value) {
   try {
-    if (on) localStorage.setItem(STORE, $('token').value);
+    if (value) localStorage.setItem(STORE, value);
     else localStorage.removeItem(STORE);
   } catch (e) { /* хранилище недоступно - просто не запоминаем */ }
 }
 
-function setStatus(text, kind) {
-  const el = $('status');
+function setText(id, text, kind) {
+  const el = $(id);
   el.textContent = text;
-  el.className = kind || '';
+  el.className = 'status' + (kind ? ' ' + kind : '');
 }
+const setStatus = (text, kind) => setText('status', text, kind);
+const setSendStatus = (text, kind) => setText('send-status', text, kind);
 
-function headers() {
-  return { 'X-Leads-Token': $('token').value };
+function headers(extra) {
+  return Object.assign({ 'X-Leads-Token': password }, extra || {});
 }
+const jsonHeaders = () => headers({ 'Content-Type': 'application/json' });
 
 async function api(path, options) {
-  const response = await fetch(path, Object.assign({ headers: headers() }, options || {}));
+  let response;
+  try {
+    response = await fetch(path, Object.assign({ headers: headers() }, options || {}));
+  } catch (e) {
+    const letters = /ISO-8859-1/.test(String(e && e.message));       // русские буквы в пароле: браузер не отправит заголовок
+    const error = new Error(letters ? 'В пароле русские буквы: нужен пароль из латинских букв и цифр.'
+                                    : 'Нет связи с сайтом: он запущен?');
+    error.status = letters ? 401 : 0;
+    throw error;
+  }
   if (!response.ok) {
     let message = 'Ошибка ' + response.status;
     try { message = (await response.json()).error || message; } catch (e) { /* не JSON */ }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return response;
 }
 
+// На своём компьютере (run_local.py) сайт сам отдаёт странице пароль из local.env: вводить его не нужно.
+let triedSession = false;
+async function fetchSession() {
+  try {
+    const response = await fetch('/api/leads/session');
+    return response.ok ? ((await response.json()).token || '') : '';
+  } catch (e) { return ''; }
+}
+
+// ---- таблица ----
+
+const WHEN = { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' };
+const STAGES = { 1: 'Письмо', 2: 'Дожим', 3: 'Закрывающее' };
+
+function mailStatus(sent) {
+  if (!sent) return { text: 'ждёт отправки', cls: '' };
+  if (sent.status === 'rejected') return { text: 'адрес не принят', cls: 'rejected' };
+  let when = '';
+  try { when = ' ' + new Date(sent.time).toLocaleString('ru-RU', WHEN); } catch (e) { /* без времени */ }
+  return { text: (STAGES[sent.stage] || 'Письмо') + ' отправлено' + when, cls: 'sent' };
+}
+
+let lastKey = '';
+function renderTable(header, rows, sent, follow) {
+  const key = JSON.stringify([header, rows, sent]);
+  if (key === lastKey) return;                     // ничего не изменилось - не перерисовываем
+  lastKey = key;
+  const emailAt = Math.max(0, header.indexOf('Почта'));
+  const table = $('rows');
+  table.replaceChildren();
+  const head = table.createTHead().insertRow();
+  header.concat(['Письмо']).forEach((title) => { const th = document.createElement('th'); th.textContent = title; head.append(th); });
+  const body = table.createTBody();
+  rows.forEach((row) => {
+    const tr = body.insertRow();
+    row.forEach((value) => { tr.insertCell().textContent = value; });   // textContent: чужой текст не станет разметкой
+    const state = mailStatus((sent || {})[String(row[emailAt] || '').toLowerCase()]);
+    const cell = tr.insertCell();
+    cell.className = 'mail-status';
+    cell.textContent = state.text;
+    if (state.cls) tr.className = state.cls;
+  });
+  if (!rows.length) {
+    const cell = body.insertRow().insertCell();
+    cell.colSpan = header.length + 1 || 1;
+    cell.className = 'empty';
+    cell.textContent = 'Пока нет организаций с почтой.';
+  }
+  const wrap = $('table-wrap');
+  wrap.hidden = false;
+  if (follow) wrap.scrollTop = wrap.scrollHeight;  // пока идёт выгрузка, свежие строки видно сразу
+}
+
+function sentCounts(data) {
+  const header = data.header || [];
+  const emailAt = Math.max(0, header.indexOf('Почта'));
+  let sent = 0;
+  (data.rows || []).forEach((row) => {
+    const entry = (data.sent || {})[String(row[emailAt] || '').toLowerCase()];
+    if (entry && entry.status === 'sent') sent += 1;
+  });
+  return { sent, wait: (data.rows || []).length - sent };
+}
+
 function render(data) {
   $('progress').hidden = false;
+  renderTable(data.header || [], data.rows || [], data.sent || {}, data.state === 'running');
+  const counts = sentCounts(data);
   $('n-ok').textContent = data.counts.ok;
+  $('n-sent').textContent = counts.sent;
+  $('n-wait').textContent = counts.wait;
   $('n-no').textContent = data.counts.no_email;
   $('n-retry').textContent = data.counts.retry;
   const log = $('log');
   log.textContent = data.log.join('\n');
+  log.hidden = !data.log.length;
   log.scrollTop = log.scrollHeight;
   $('download').hidden = !data.has_table;
+  $('download-note').hidden = !data.has_table;
 }
 
-async function poll(quiet) {
+// ---- состояние выгрузки и отправки ----
+
+function renderSend(data, state) {
+  sendState = state;
+  const rows = (data.rows || []).length;
+  $('send').hidden = !(sendEnabled && rows);
+  const running = !!(state && state.running);
+  $('send-btn').disabled = running || data.state === 'running';
+  const lines = (state && state.lines) || [];
+  $('send-lines').textContent = lines.join('\n');
+  $('send-lines').hidden = !lines.length;
+  if (running) setSendStatus('Идёт отправка в фоне. Страницу можно закрыть: отправка продолжится.', 'ok');
+  else if ($('send-status').textContent.startsWith('Идёт отправка')) setSendStatus('Отправка закончилась.', 'ok');
+}
+
+async function poll() {
+  clearTimeout(timer);
+  let data;
   try {
-    const data = await (await api('/api/leads/status')).json();
-    if (data.state === 'idle') {
-      $('start').disabled = false;
-      return;                                  // ничего ещё не запускали
+    data = await (await api('/api/leads/status')).json();
+  } catch (error) {
+    if (error.status === 401 && !triedSession) {         // пароль устарел или не тот: берём актуальный у сайта
+      triedSession = true;
+      const fresh = await fetchSession();
+      if (fresh) { password = fresh; poll(); return; }
     }
-    render(data);
-    $('stop').hidden = data.state !== 'running';
-    if (data.state === 'running') {
-      setStatus('Идёт выгрузка за ' + data.date + '. Не закрывайте страницу: пока она открыта, сервер не засыпает.');
-      timer = setTimeout(poll, 3000);
+    if (error.status === 401 || error.status === 429) { showLogin(error.message); return; }
+    if (error.status === 0) { showLogin(error.message); return; }
+    $('start').disabled = false;
+    setStatus(error.message, 'error');
+    return;
+  }
+  triedSession = false;
+  $('login').hidden = true;
+  $('app').hidden = false;
+  storePassword(password);
+  sendEnabled = !!data.send_enabled;
+  const hasRows = (data.rows || []).length > 0;
+  $('stop').hidden = data.state !== 'running';
+  if (data.state === 'idle' && !hasRows) {
+    $('start').disabled = false;               // ничего ещё не запускали
+    $('progress').hidden = true;
+    $('send').hidden = true;
+    return;
+  }
+  render(data);
+  if (data.state === 'running') {
+    setStatus('Идёт выгрузка за ' + data.date + '. Не закрывайте страницу, пока она идёт.');
+  } else {
+    $('start').disabled = false;
+    if (data.state === 'idle') {
+      setStatus('Показана последняя выгрузка за ' + data.date + '.');
     } else {
-      $('start').disabled = false;
-      const kind = data.state === 'done' ? 'ok' : (data.state === 'idle' ? '' : 'error');
-      if (data.state === 'stopped' && data.log.join(' ').includes('Checko недоступен')) {
-        $('paste').open = true;
-      }
+      const kind = data.state === 'done' ? 'ok' : 'error';
+      if (data.state === 'stopped' && data.log.join(' ').includes('Checko недоступен')) $('text').focus();
       setStatus(data.message || '', kind);
     }
-  } catch (error) {
-    $('start').disabled = false;
-    if (quiet) { rememberPassword(false); $('token').value = ''; return; }   // старый пароль не подошёл
-    setStatus(error.message, 'error');
   }
+  let state = null;
+  if (sendEnabled) {
+    try { state = await (await api('/api/send/status')).json(); } catch (error) { state = null; }
+  }
+  renderSend(data, state);
+  const sending = !!(state && state.running);
+  if (sending) watchUntil = Date.now() + 8000;          // и ещё несколько секунд после конца: последние письма уже в журнале
+  if (data.state === 'running') timer = setTimeout(poll, 3000);
+  else if (sending) timer = setTimeout(poll, 5000);
+  else if (Date.now() < watchUntil) timer = setTimeout(poll, 2000);
 }
+
+const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
+function showLogin(message) {
+  storePassword('');
+  password = '';
+  $('app').hidden = true;
+  $('login').hidden = false;
+  let text = message || '';
+  if (LOCAL_HOSTS.includes(location.hostname) && !/латинских/.test(message || '')) {
+    text += (text ? '\n' : '') + 'Если сайт запускали из PyCharm до обновления проекта, остановите его (красный квадрат) '
+          + 'и запустите run_local заново: после этого пароль подставляется сам.';
+  }
+  setText('login-status', text, message ? 'error' : '');
+  $('token').focus();
+}
+
+$('login').addEventListener('submit', (event) => {
+  event.preventDefault();
+  password = $('token').value;
+  $('token').value = '';
+  poll();
+});
+
+// ---- запуск выгрузки ----
 
 $('form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -211,11 +402,10 @@ $('form').addEventListener('submit', async (event) => {
   try {
     await api('/api/leads/start', {
       method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+      headers: jsonHeaders(),
       body: JSON.stringify({ date: $('date').value.trim(), limit: Number($('limit').value || 0),
-                            pause: Number($('pause').value || 6), source: $('source').value, text: $('text').value }),
+                            text: $('text').value }),
     });
-    rememberPassword($('remember').checked);
     poll();
   } catch (error) {
     $('start').disabled = false;
@@ -234,17 +424,118 @@ $('stop').addEventListener('click', async () => {
   $('stop').disabled = false;
 });
 
-$('forget').addEventListener('click', () => {
-  rememberPassword(false);
-  $('token').value = '';
-  setStatus('Пароль удалён из этого браузера.');
+// Дату вы выбираете сами, страница её не подставляет и не меняет. Под текстом показано только, какие даты в нём есть.
+const MONTHS = { января: 1, февраля: 2, марта: 3, апреля: 4, мая: 5, июня: 6, июля: 7, августа: 8, сентября: 9,
+                 октября: 10, ноября: 11, декабря: 12 };
+
+function datesInText(text) {
+  const counts = {};
+  const pattern = /Дата регистрации\s+(\d{1,2})\s+([а-яё]+)\s+(\d{4})/gi;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const month = MONTHS[match[2].toLowerCase()];
+    if (!month) continue;
+    const iso = match[3] + '-' + String(month).padStart(2, '0') + '-' + String(match[1]).padStart(2, '0');
+    counts[iso] = (counts[iso] || 0) + 1;
+  }
+  return counts;
+}
+
+function updateDatesHint() {
+  const counts = datesInText($('text').value);
+  const days = Object.keys(counts).sort().reverse();
+  const hint = $('dates-hint');
+  hint.hidden = !days.length;
+  if (!days.length) return;
+  const chosen = $('date').value.trim();
+  hint.textContent = 'В тексте организации за: ' + days.map((day) => day + ' (' + counts[day] + ')').join(', ') + '.'
+    + (!chosen ? ' Укажите дату.' : counts[chosen] ? ' Будут взяты только организации за ' + chosen + '.'
+       : ' За ' + chosen + ' в тексте организаций нет: выберите одну из этих дат.');
+}
+$('text').addEventListener('input', updateDatesHint);
+$('date').addEventListener('input', updateDatesHint);
+
+// ---- кнопка «Отправить»: сначала проверка, потом подтверждение, потом запуск ----
+
+function fillConfirm(info) {
+  $('confirm-title').textContent = 'Отправить ' + info.letters + ' ' + plural(info.letters) + '?';
+  $('confirm-summary').textContent = info.summary.join('\n');
+  const limit = $('confirm-limit');
+  if (info.daily_limit && info.room !== null && info.room < info.letters) {
+    limit.textContent = 'За последние 24 часа уже отправлено ' + info.sent_24h + ' из ' + info.daily_limit
+      + ': сегодня уйдёт не больше ' + info.room + ', остальное отправьте завтра этой же кнопкой.';
+    limit.hidden = false;
+  } else {
+    limit.hidden = true;
+  }
+  const select = $('confirm-group');
+  select.replaceChildren();
+  info.examples.forEach((example, index) => {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = 'Группа ' + example.group + ' «' + example.name + '»';
+    select.append(option);
+  });
+  const show = () => {
+    const example = info.examples[Number(select.value)];
+    $('confirm-example').textContent = example ? 'Тема: ' + example.subject + '\n\n' + example.text : '';
+  };
+  select.onchange = show;
+  select.hidden = info.examples.length < 2;
+  show();
+  $('confirm-yes').textContent = 'Отправить ' + info.letters + ' ' + plural(info.letters);
+}
+
+function plural(n) {
+  const last = n % 10, tail = n % 100;
+  if (last === 1 && tail !== 11) return 'письмо';
+  if (last >= 2 && last <= 4 && (tail < 12 || tail > 14)) return 'письма';
+  return 'писем';
+}
+
+$('send-btn').addEventListener('click', async () => {
+  const count = Number($('send-count').value);
+  $('send-btn').disabled = true;
+  setSendStatus('Проверяем письма…');
+  try {
+    const request = { count, include_unwritten: $('unwritten').checked };
+    const info = await (await api('/api/send/prepare', {
+      method: 'POST', headers: jsonHeaders(), body: JSON.stringify(request) })).json();
+    if (!info.letters) {
+      setSendStatus('Писем для отправки нет:\n' + info.summary.join('\n'), 'error');
+      return;
+    }
+    pending = Object.assign({ expected: info.letters }, request);
+    setSendStatus('');
+    fillConfirm(info);
+    $('confirm').showModal();
+  } catch (error) {
+    setSendStatus(error.message, 'error');
+  } finally {
+    $('send-btn').disabled = false;
+  }
 });
 
-const saved = savedPassword();
-if (saved) {                                    // пароль уже вводили: подставляем и показываем текущее состояние
-  $('token').value = saved;
-  poll(true);
-}
+$('confirm-no').addEventListener('click', () => { pending = null; $('confirm').close(); });
+
+$('confirm-yes').addEventListener('click', async () => {
+  const request = pending;
+  pending = null;
+  $('confirm').close();
+  if (!request) return;
+  $('send-btn').disabled = true;
+  setSendStatus('Запускаем отправку…');
+  try {
+    const result = await (await api('/api/send/start', {
+      method: 'POST', headers: jsonHeaders(), body: JSON.stringify(request) })).json();
+    setSendStatus(result.message, 'ok');
+    watchUntil = Date.now() + 20000;                    // процесс отправки стартует не мгновенно
+    poll();
+  } catch (error) {
+    setSendStatus(error.message, 'error');
+    $('send-btn').disabled = false;
+  }
+});
 
 $('download').addEventListener('click', async () => {
   try {
@@ -253,7 +544,7 @@ $('download').addEventListener('click', async () => {
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     const match = (response.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
-    link.download = match ? match[1] : 'leads.csv';
+    link.download = match ? match[1] : 'leads.xlsx';
     document.body.append(link);
     link.click();
     link.remove();
@@ -262,6 +553,22 @@ $('download').addEventListener('click', async () => {
     setStatus(error.message, 'error');
   }
 });
+
+// ---- вход: пароль берётся из ссылки (run_local.py открывает её сам) или из этого браузера ----
+
+let fromLink = '';
+try { fromLink = decodeURIComponent(location.hash.slice(1)); } catch (e) { /* испорченная ссылка */ }
+if (fromLink) history.replaceState(null, '', location.pathname);        // пароль не остаётся в адресной строке
+(async () => {
+  password = fromLink;
+  if (!password) {
+    password = await fetchSession();                    // свой компьютер: пароль отдаёт сайт
+    if (password) triedSession = true;
+  }
+  if (!password) password = savedPassword();            // хостинг: пароль, который вводили раньше
+  if (password) poll();
+  else showLogin('');
+})();
 </script>
 </body>
 </html>

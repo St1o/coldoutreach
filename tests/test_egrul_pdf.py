@@ -57,6 +57,36 @@ def with_director(block: str) -> str:
             + block + "\nСведения об уставном капитале\n")
 
 
+class OkvedTest(unittest.TestCase):
+    def test_code_and_name_on_one_line(self):
+        text = ("Сведения об основном виде деятельности\n"
+                "50 Код и наименование вида деятельности 62.01 Разработка компьютерного\nпрограммного обеспечения\n"
+                "51 ГРН и дата внесения в ЕГРЮЛ записи\n1222300047771\n09.09.2022\n")
+        data = parse_extract(text)
+        self.assertEqual((data.okved, data.okved_name), ("62.01", "Разработка компьютерного программного обеспечения"))
+
+    def test_code_and_name_in_separate_lines(self):
+        text = ("Сведения об основном виде деятельности\n50 Код и наименование вида деятельности\n"
+                "47.19.1\nТорговля розничная прочая в неспециализированных магазинах\n"
+                "51 ГРН и дата внесения\n")
+        data = parse_extract(text)
+        self.assertEqual((data.okved, data.okved_name),
+                         ("47.19.1", "Торговля розничная прочая в неспециализированных магазинах"))
+
+    def test_additional_activities_are_not_taken(self):
+        text = ("Сведения об основном виде деятельности\n50 Код 62.01 Разработка\n51 ГРН и дата\n"
+                "Сведения о дополнительных видах деятельности\n60 Код 47.91 Торговля по почте\n")
+        self.assertEqual(parse_extract(text).okved, "62.01")
+
+    def test_section_numbers_and_dates_are_not_mistaken_for_a_code(self):
+        text = "Сведения об основном виде деятельности\n50 Код и наименование вида деятельности\n51 ГРН 09.09.2022\n"
+        self.assertEqual(parse_extract(text).okved, "")
+
+    def test_no_section_no_okved(self):
+        data = parse_extract(WITH_EMAIL)
+        self.assertEqual((data.okved, data.okved_name), ("", ""))
+
+
 class DirectorTest(unittest.TestCase):
     def test_columns_layout_with_page_break(self):
         self.assertEqual(parse_extract(WITH_EMAIL).director, "Иванов Иван Иванович")
