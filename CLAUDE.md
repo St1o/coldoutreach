@@ -24,6 +24,7 @@
 | Задача | Файл (токены) |
 |---|---|
 | Разбор файлов агентов (таблица групп ОКВЭД, шаблоны, блоки боли, карта ОКВЭД `parse_okved_map`) | `mailing/agentmd.py` (3000) |
+| Форма организации (`KNOWN_FORMS`, `org_form`, полные названия форм) и правила форм из `okved-map.md` (`FormFilter`, `load_filter`): общие для `compose.py` и фильтра на `/leads` (`leads.run(form_filter=…)`, статус `form_skipped`: запрос к API по формам «не писать» не делается) | `mailing/forms.py` (2200) |
 | Подстановки, проверки письма, этапы 1-3, `--test-to`, CLI сборки (вместо таблицы можно указать папку данных: все `leads_<дата>.csv`, `--date`; `read_folder_leads`), выбор группы (карта ОКВЭД, `Composer.group_for`), список кодов агенту (`write_okved_report`) | `compose.py` (8500) |
 | Отправка: цикл, раздача писем по ящикам, паузы, коды выхода, `--background`, `--status`, CLI | `mailer.py` (7000) |
 | Ящики из `local.env` (`load_mailboxes`), прогрев (`warmup_quota`, `mailbox_state`), выбор ящиков (`select`), раздача писем по очереди (`assign`), дата первого письма (`set_first_message`) | `mailing/mailboxes.py` (2800) |

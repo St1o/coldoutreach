@@ -11,6 +11,7 @@
     --line: #dde2e9; --accent: #1f5fd1; --accent-text: #ffffff;
     --ok: #17703a; --error: #b3261e;
     --sent-bg: rgba(255, 204, 0, .32);              /* отправленное письмо: полупрозрачная жёлтая заливка ячеек */
+    --warn-bg: rgba(255, 170, 0, .16); --warn-line: #c98a00;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -18,6 +19,7 @@
       --line: #2b3441; --accent: #5b92f0; --accent-text: #0c1320;
       --ok: #5ccd8a; --error: #ff8a80;
       --sent-bg: rgba(255, 204, 0, .24);
+      --warn-bg: rgba(255, 170, 0, .14); --warn-line: #d9a21b;
     }
   }
   * { box-sizing: border-box; }
@@ -77,6 +79,9 @@
      колонки писем, которых ещё не было, остаются без заливки. */
   td.sent { background: var(--sent-bg); }
   tr.rejected td { color: var(--error); }
+  tr.blocked td { color: var(--muted); }             /* форма организации сейчас «не писать»: письма этой строке не уйдут */
+  .alert { margin: 0 0 16px; padding: 12px 16px; border: 1px solid var(--warn-line); border-radius: 12px;
+           background: var(--warn-bg); }
   .note { color: var(--muted); font-size: .85rem; margin: 8px 0 0; }
   pre {
     margin: 0; padding: 12px; max-height: 260px; overflow: auto; font-size: .8rem;
@@ -108,6 +113,7 @@
   </form>
 
   <div id="app" hidden>
+    <p id="forms-notice" class="alert" role="alert" hidden></p>
     <form id="form" class="card" autocomplete="off">
       <div class="row">
         <div class="field">
@@ -136,7 +142,9 @@
         <div><b id="n-wait">0</b><span>ждут отправки</span></div>
         <div><b id="n-no">0</b><span>без почты</span></div>
         <div><b id="n-retry">0</b><span>проверить позже</span></div>
+        <div id="form-box" hidden><b id="n-form">0</b><span>пропущено по форме организации,<br>запрос к API не делали:<br><span id="form-summary"></span></span></div>
       </div>
+      <p id="form-rows-note" class="note" hidden></p>
       <div id="table-wrap" class="table-wrap" hidden><table id="rows"></table></div>
       <pre id="log"></pre>
       <p><button id="download" type="button" hidden>Скачать таблицу</button></p>
@@ -266,7 +274,8 @@ function viewDate() {
   return real ? value : '';
 }
 
-function mailStatus(sent) {
+function mailStatus(sent, note) {
+  if (!sent && note) return { text: note, cls: 'blocked' };          // форма сейчас «не писать»: письмо не ждёт
   if (!sent) return { text: 'ждёт отправки', cls: '' };
   if (sent.status === 'rejected') return { text: 'адрес не принят', cls: 'rejected' };
   let when = '';
@@ -275,8 +284,9 @@ function mailStatus(sent) {
 }
 
 let lastKey = '';
-function renderTable(header, rows, sent, follow) {
-  const key = JSON.stringify([header, rows, sent]);
+function renderTable(header, rows, sent, follow, notes) {
+  notes = notes || [];
+  const key = JSON.stringify([header, rows, sent, notes]);
   if (key === lastKey) return;                     // ничего не изменилось - не перерисовываем
   lastKey = key;
   const emailAt = Math.max(0, header.indexOf('Почта'));
@@ -286,7 +296,7 @@ function renderTable(header, rows, sent, follow) {
   const head = table.createTHead().insertRow();
   header.concat(['Письмо']).forEach((title) => { const th = document.createElement('th'); th.textContent = title; head.append(th); });
   const body = table.createTBody();
-  rows.forEach((row) => {
+  rows.forEach((row, index) => {
     const tr = body.insertRow();
     // Заливка идёт от первой колонки до колонки последнего ушедшего письма: ушло только первое - до «Первое письмо»,
     // был дожим - до «Дожим», закрывающее - до «Закрывающее». Колонки писем, которых не было, не заливаются.
@@ -298,7 +308,7 @@ function renderTable(header, rows, sent, follow) {
       if (stageAt.includes(at)) cell.className = 'stage' + (value === YES ? '' : ' no');
       if (at <= filledTo) cell.classList.add('sent');
     });
-    const state = mailStatus((sent || {})[String(row[emailAt] || '').toLowerCase()]);
+    const state = mailStatus((sent || {})[String(row[emailAt] || '').toLowerCase()], notes[index] || '');
     const cell = tr.insertCell();
     cell.className = 'mail-status';
     cell.textContent = state.text;
@@ -315,27 +325,38 @@ function renderTable(header, rows, sent, follow) {
   if (follow) wrap.scrollTop = wrap.scrollHeight;  // пока идёт выгрузка, свежие строки видно сразу
 }
 
+// «Ждут отправки» - не ушло первое письмо и форма организации не «не писать» (такие строки помечены и не считаются).
 function sentCounts(data) {
   const firstAt = Math.max(0, (data.header || []).indexOf(STAGE_TITLES[0]));
   const rows = data.rows || [];
+  const notes = data.row_notes || [];
   const sent = rows.filter((row) => row[firstAt] === YES).length;
-  return { sent, wait: rows.length - sent };
+  const wait = rows.filter((row, index) => row[firstAt] !== YES && !notes[index]).length;
+  return { sent, wait, blocked: notes.filter((note) => note).length };
 }
 
 // Таблица видна, только когда выбрана дата и за неё уже что-то собрано (или сейчас собирается).
 function render(data, running) {
   const c = data.counts;
-  const collected = c.ok + c.no_email + c.retry > 0 || running;
+  const skipped = c.form_skipped || 0;
+  const collected = c.ok + c.no_email + c.retry + skipped > 0 || running;
   $('progress').hidden = false;
   $('counts').hidden = !collected;
   if (collected) {
-    renderTable(data.header || [], data.rows || [], data.sent || {}, running);
+    renderTable(data.header || [], data.rows || [], data.sent || {}, running, data.row_notes || []);
     const counts = sentCounts(data);
     $('n-ok').textContent = c.ok;
     $('n-sent').textContent = counts.sent;
     $('n-wait').textContent = counts.wait;
     $('n-no').textContent = c.no_email;
     $('n-retry').textContent = c.retry;
+    $('form-box').hidden = !skipped;                       // сводка по формам: рядом с количеством организаций
+    $('n-form').textContent = skipped;
+    $('form-summary').textContent = data.form_summary || '';
+    const note = $('form-rows-note');
+    note.hidden = !counts.blocked;
+    note.textContent = counts.blocked ? 'В таблице строк с формой «не писать»: ' + counts.blocked
+      + '. Они проверены раньше, помечены «форма не соответствует» и в «ждут отправки» не входят.' : '';
   } else {
     $('table-wrap').hidden = true;
   }
@@ -345,6 +366,14 @@ function render(data, running) {
   log.scrollTop = log.scrollHeight;
   $('download').hidden = !data.has_table;
   $('download-note').hidden = !data.has_table;
+}
+
+// Правил форм нет (OUTREACH_OKVED_MAP не задан, файла нет или он не читается): фильтр отключён, это видно сразу.
+function showFormsNotice(notice) {
+  const box = $('forms-notice');
+  box.hidden = !notice;
+  box.textContent = notice ? 'Внимание: ' + notice + '. Запросы к API делаются по организациям любых форм (ТСН, МБУ, ПК…). '
+    + 'Путь к файлу okved-map.md задаёт OUTREACH_OKVED_MAP в local.env; после правки перезапустите сайт.' : '';
 }
 
 // ---- состояние выгрузки и отправки ----
@@ -415,7 +444,8 @@ async function poll() {
   sendEnabled = !!data.send_enabled;
   const running = data.state === 'running';
   const c = data.counts;
-  const collected = c.ok + c.no_email + c.retry > 0;
+  const collected = c.ok + c.no_email + c.retry + (c.form_skipped || 0) > 0;
+  showFormsNotice(data.forms_notice);
   const mine = day && data.date === day;                 // идущая или последняя выгрузка - за выбранную дату
   $('stop').hidden = !running;
   if (running) {

@@ -384,7 +384,7 @@ class LeadsWebTest(LeadsCase):
         data = json.loads(self.request("/api/leads/status?date=2026-10-09")[2])
         self.assertEqual(data["state"], "done")
         self.assertEqual(data["view_date"], "2026-10-09")
-        self.assertEqual(data["counts"], {"ok": 1, "no_email": 0, "retry": 0})
+        self.assertEqual(data["counts"], {"ok": 1, "no_email": 0, "retry": 0, "form_skipped": 0})
         self.assertTrue(data["has_table"])
         self.assertIn("[1/1] 7707083004: ok", data["log"])
         self.assertEqual(self.calls, [(datetime.date(2026, 10, 9), 5)])
@@ -441,7 +441,7 @@ class LeadsWebTest(LeadsCase):
         for query in ("", "?date="):                              # страницу открыли снова, дату не выбрали
             data = json.loads(self.request("/api/leads/status" + query)[2])
             self.assertEqual((data["rows"], data["sent"], data["has_table"], data["view_date"]), ([], {}, False, ""), query)
-            self.assertEqual(data["counts"], {"ok": 0, "no_email": 0, "retry": 0})
+            self.assertEqual(data["counts"], {"ok": 0, "no_email": 0, "retry": 0, "form_skipped": 0})
             self.assertEqual(data["header"][-3:], ["Первое письмо", "Дожим", "Закрывающее"])
 
     def test_another_date_shows_its_own_table_only(self):

@@ -17,7 +17,7 @@ import leads
 import xlsx_table
 from checko_api import CheckoApi
 from checko_updates import PastedPages
-from mailing import journal
+from mailing import forms, journal
 
 MIN_TOKEN_LENGTH = 12
 STATE_LABELS = {
@@ -40,11 +40,12 @@ class JobRunning(Exception):
 
 class LeadsJob:
     def __init__(self, token: str = "", run=leads.run, out_dir: Optional[str] = None,
-                 api_key: str = "", api=None):
+                 api_key: str = "", api=None, okved_map: Optional[str] = None):
         self.token = token if len(token or "") >= MIN_TOKEN_LENGTH else ""
         self._run = run
         self._api = api or (CheckoApi(api_key) if api_key else None)
         self._out_dir = out_dir or tempfile.gettempdir()
+        self._okved_map = okved_map          # путь к okved-map.md; None - брать OUTREACH_OKVED_MAP из окружения (local.env)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._lines = deque(maxlen=60)
@@ -100,12 +101,19 @@ class LeadsJob:
             self._thread = threading.Thread(target=self._work, args=(target, limit, self._out, text), daemon=True)
             self._thread.start()
 
+    def form_filter(self) -> forms.FormFilter:
+        """Правила форм (раздел «Формы» файла okved-map.md). Файл читается заново при каждом обращении: строка, которую
+        владелец добавил в таблицу, действует со следующего запуска или обновления страницы, перезапуск сайта не нужен."""
+        path = self._okved_map if self._okved_map is not None else os.environ.get("OUTREACH_OKVED_MAP", "")
+        return forms.load_filter(path)
+
     def _work(self, target, limit, out, text=""):
         extra = {"checko": PastedPages(text)} if text.strip() else {}
         try:
+            form_filter = self.form_filter()
             code = self._run(target, out, limit=limit, pause=API_PAUSE, log=self._lines.append,
-                             should_stop=self._stop.is_set,
-                             process=lambda company: leads.process_company_api(self._api, company), **extra)
+                             should_stop=self._stop.is_set, form_filter=form_filter,
+                             process=lambda company: leads.process_company_api(self._api, company, form_filter), **extra)
             state = "done" if code == 0 else "stopped"
             message = STATE_LABELS.get(code, f"Завершено с кодом {code}.")
         except Exception as exc:        # любая неожиданность не должна оставлять «идёт»
@@ -145,14 +153,17 @@ class LeadsJob:
         with self._lock:
             state, message = self._state, self._message
             target, limit = self._target, self._limit
-        counts = {leads.OK: 0, leads.NO_EMAIL: 0, leads.RETRY: 0}
-        rows, sent = [], {}
+        form_filter = self.form_filter()
+        counts = {leads.OK: 0, leads.NO_EMAIL: 0, leads.RETRY: 0, leads.FORM_SKIPPED: 0}
+        rows, notes, sent, summary = [], [], {}, ""
         out = self._path_for(day) if day else None
         if out:
             self._refresh(out, self._busy_with(day))
             saved = leads.load_state(leads.state_path(out))
             counts = {status: leads.count(saved, status) for status in counts}
             rows = leads.table_rows(saved, journal.sent_stages(self._out_dir))
+            notes = leads.table_notes(saved, form_filter)
+            summary = leads.form_summary(saved)
             emails = {row[EMAIL_AT].lower() for row in rows}
             # в ответ идут только адреса этой таблицы, а не всё, что когда-либо отправляли
             sent = {address: entry for address, entry in journal.sent_overview(self._out_dir).items()
@@ -166,6 +177,9 @@ class LeadsJob:
             "counts": counts,
             "header": leads.WEB_HEADER,
             "rows": rows,                      # таблица выбранной даты: страница показывает её по мере заполнения
+            "row_notes": notes,                # по строке rows: «форма не соответствует: ТСН» или "" (такие письма не ждут)
+            "form_summary": summary,           # пропущенные по форме без запроса к API: «ТСН 2, МБУ 1, ПК 1»
+            "forms_notice": form_filter.notice,   # правил форм нет, фильтр отключён: страница показывает предупреждение
             "sent": sent,                      # адрес -> последнее отправленное письмо (для текста и времени в строке)
             "log": list(self._lines),
             "has_table": bool(out and os.path.exists(out) and counts[leads.OK]),

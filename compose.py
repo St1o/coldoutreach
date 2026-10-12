@@ -39,7 +39,8 @@ from datetime import date, datetime, timedelta
 
 import random
 
-from mailing import config, journal
+from mailing import config, forms, journal
+from mailing.forms import DEFAULT_FORMS, KNOWN_FORMS, OTHER_FORM      # формы организаций: общие с /leads
 from mailing.agentmd import (
     EXCLUDE_ID, FALLBACK_ID, SUBJECT_SLOT, TIME_TAGS, ComposeError, Texts, _key, check_texts, okved_digits,
     parse_form_rules, parse_letters, parse_okved_map, parse_segment)
@@ -160,29 +161,10 @@ def fill(template: str, values: dict, slots: dict = None) -> str:
     return text
 
 
-# Сокращения форм организаций, которые программа узнаёт в начале названия (Checko пишет: ООО "ТЕККИН", МБУ МП "КЦМИ").
-# Первое слово названия, которого здесь нет, формой не считается: оно может быть частью самого названия.
-KNOWN_FORMS = frozenset("""
-    ООО ОАО ЗАО ПАО НАО АО ИП КФХ ПК СПК ТОО
-    МБУ МАУ МКУ МУП МУ ГБУ ГАУ ГКУ ГУП ГУ ФГБУ ФГАУ ФГКУ ФГУП ФБУ КГБУ КГАУ КГКУ ОГБУ БУ АУ КУ
-    МБОУ МАОУ МКОУ МБДОУ МАДОУ МКДОУ ГБОУ ГАОУ ГБПОУ ГАПОУ ФГБОУ ФГАОУ ГБДОУ МБУК МБУДО МАУДО МБУЗ ГБУЗ КГБУЗ
-    АНО АНОО НКО НП ТСЖ ТСН СНТ ГСК ЖСК ТОС РОО МОО ОО ЧУ ЧОУ НОУ НОЧУ ЧУДО АНПО
-""".split())
-OTHER_FORM = "другая"                              # название есть, но начинается не с известного сокращения
-DEFAULT_FORMS = frozenset({"ООО"})                 # пока агент не решил иначе: сегмент «только ООО» (решение владельца 2026-10-07)
-_FORM_WORD = re.compile(r"^[\s«\"“<(]*([А-ЯЁ]{2,8})(?![А-ЯЁа-яё])")
-_FULL_OOO = re.compile(r"^[\s«\"“<(]*общество\s+с\s+ограниченной\s+ответственностью", re.I)
-
-
 def org_form(name):
-    """Название компании -> форма организации: «ООО "ТЕККИН"» -> «ООО», «МБУ МП "КЦМИ"» -> «МБУ»; не из известных ->
-    «другая»; колонки с названием нет (None) -> None, форма не проверяется. Название нигде не сохраняется."""
-    if name is None:
-        return None
-    if _FULL_OOO.match(name):
-        return "ООО"
-    found = _FORM_WORD.match(name)
-    return found.group(1) if found and found.group(1) in KNOWN_FORMS else OTHER_FORM
+    """Название компании -> форма организации (ООО, МБУ…), см. mailing.forms.org_form. Здесь узнаётся только полное
+    название ООО, как раньше: полные названия других форм при сборке писем форму не определяют (full_names=False)."""
+    return forms.org_form(name, full_names=False)
 
 
 def okved_class(code: str):
