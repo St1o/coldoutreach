@@ -1,7 +1,9 @@
 """Отправка по SMTP mail.ru: письмо, защищённое соединение, одно соединение на весь запуск."""
 import os
 import smtplib
+import socket
 import ssl
+import time
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 
@@ -10,6 +12,8 @@ from .table import Letter
 
 SMTP_HOST = "smtp.mail.ru"
 SMTP_PORT = 465                 # SSL; на 587 используется STARTTLS
+CONNECT_ATTEMPTS = 3            # попыток установить соединение подряд, когда его оборвали до логина (рассылка)
+CONNECT_PAUSE = 8.0             # пауза перед второй попыткой, перед третьей вдвое дольше
 
 
 def build_message(letter: Letter, sender: str, from_name: str = "", unsubscribe: bool = False) -> EmailMessage:
@@ -50,14 +54,41 @@ def default_connect(host: str, port: int, timeout: float):
     return server
 
 
+def is_dropped_connection(exc) -> bool:
+    """Соединение оборвано при установке (до логина и до письма): повтор безопасен, письмо не могло уйти.
+    Неверный сертификат сюда не входит: его повтор не лечит и скрывать его нельзя."""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False
+    return isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError, socket.timeout, smtplib.SMTPServerDisconnected))
+
+
 class MailruSender:
-    """Одно соединение с SMTP mail.ru на весь запуск. Перед отправкой проверяет, что оно живо."""
+    """Одно соединение с SMTP mail.ru на весь запуск. Перед отправкой проверяет, что оно живо.
+
+    connect_attempts > 1: оборванную при установке связь (is_dropped_connection) пробуем открыть ещё раз с паузой
+    retry_pause, потом вдвое дольше; об этом сообщает notify(текст). Логин и само письмо не повторяются никогда."""
 
     def __init__(self, user: str, password: str, host: str = SMTP_HOST, port: int = SMTP_PORT,
-                 connect=default_connect, timeout: float = 60.0):
+                 connect=default_connect, timeout: float = 60.0, connect_attempts: int = 1,
+                 retry_pause: float = CONNECT_PAUSE, sleep=time.sleep, notify=None):
         self.user, self._password = user, password
         self._host, self._port, self._connect, self._timeout = host, port, connect, timeout
+        self._attempts, self._retry_pause, self._sleep, self._notify = max(1, connect_attempts), retry_pause, sleep, notify
         self._server = None
+
+    def _open(self):
+        pause = self._retry_pause
+        for attempt in range(1, self._attempts + 1):
+            try:
+                return self._connect(self._host, self._port, self._timeout)
+            except Exception as exc:
+                if attempt == self._attempts or not is_dropped_connection(exc):
+                    raise
+                if self._notify:
+                    self._notify(f"Соединение с {self._host} оборвано при установке шифрования ({reply_text(exc)}). "
+                                 f"Письмо не уходило. Повтор через {pause:.0f} с, попытка {attempt + 1} из {self._attempts}.")
+                self._sleep(pause)
+                pause *= 2
 
     def _alive(self) -> bool:
         try:
@@ -69,7 +100,7 @@ class MailruSender:
         if self._server is not None and not self._alive():
             self.close()
         if self._server is None:
-            server = self._connect(self._host, self._port, self._timeout)
+            server = self._open()
             try:
                 server.login(self.user, self._password)
             except Exception:

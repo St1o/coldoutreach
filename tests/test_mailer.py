@@ -1,6 +1,7 @@
 import json
 import os
 import smtplib
+import ssl
 import tempfile
 import time
 import unittest
@@ -761,6 +762,89 @@ class PortAndDroppedConnectionTest(RunTest):
             self.assertIn(word, text)
         self.assertNotIn("лимит отправки", text)                 # это не про лимит
         self.assertEqual(journal.load_state(journal.state_path(self.path)), {})
+
+
+class ConnectRetryTest(unittest.TestCase):
+    """Оборванное при установке шифрования соединение (до логина) открываем ещё раз: письмо не могло уйти, дубля не будет."""
+
+    DROP = ssl.SSLEOFError(8, "EOF occurred in violation of protocol (_ssl.c:997)")
+
+    def sender(self, errors, attempts=3, server=None):
+        self.server, self.pauses, self.notes, self.connects = server or FakeServer(), [], [], 0
+        queue = list(errors)
+
+        def connect(*args):
+            self.connects += 1
+            if queue:
+                raise queue.pop(0)
+            return self.server
+
+        return MailruSender(USER, SECRET, connect=connect, connect_attempts=attempts, sleep=self.pauses.append,
+                            notify=self.notes.append)
+
+    def send(self, sender):
+        sender.send(build_message(Letter("a@b.ru", "Т", "Х"), USER))
+
+    def test_a_dropped_connection_is_retried_with_growing_pauses_and_the_letter_goes_once(self):
+        sender = self.sender([self.DROP, ConnectionResetError("reset")])
+        self.send(sender)
+        self.assertEqual(self.connects, 3)
+        self.assertEqual(self.pauses, [8.0, 16.0])
+        self.assertEqual(len(self.server.sent), 1)
+        self.assertEqual(len(self.server.logins), 1)
+        self.assertEqual(len(self.notes), 2)
+        self.assertIn("Письмо не уходило", self.notes[0])
+        self.assertNotIn(SECRET, " ".join(self.notes))
+
+    def test_after_the_last_attempt_the_original_error_reaches_the_caller(self):
+        sender = self.sender([self.DROP, self.DROP, self.DROP, self.DROP])
+        with self.assertRaises(ssl.SSLError):
+            self.send(sender)
+        self.assertEqual(self.connects, 3)
+        self.assertEqual(self.server.sent, [])
+
+    def test_without_attempts_there_is_no_retry(self):
+        sender = self.sender([self.DROP], attempts=1)
+        with self.assertRaises(ssl.SSLError):
+            self.send(sender)
+        self.assertEqual((self.connects, self.pauses), (1, []))
+
+    def test_a_bad_certificate_is_never_retried(self):
+        error = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        sender = self.sender([error])
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            self.send(sender)
+        self.assertEqual((self.connects, self.pauses), (1, []))
+
+    def test_a_server_refusal_is_not_a_dropped_connection(self):
+        sender = self.sender([smtplib.SMTPConnectError(421, b"too many connections")])
+        with self.assertRaises(smtplib.SMTPConnectError):
+            self.send(sender)
+        self.assertEqual(self.connects, 1)
+
+    def test_a_dropped_connection_while_sending_is_not_retried(self):
+        sender = self.sender([], server=FakeServer(fail={"a@b.ru": self.DROP}))
+        with self.assertRaises(ssl.SSLError):
+            self.send(sender)
+        self.assertEqual((self.connects, self.pauses), (1, []))
+
+    def test_mailer_run_opens_its_connections_with_retries_and_logs_each_retry(self):
+        from unittest import mock
+        built, logs = [], []
+
+        def factory(user, password, port=465, **kw):
+            built.append(kw)
+            return self.sender([self.DROP])
+
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        with mock.patch.object(mailer, "MailruSender", factory):
+            code = run(t.path, send=True, user=USER, password=SECRET, pause=0, log=logs.append, copiers={})
+        self.assertEqual(code, 0, logs)
+        self.assertEqual(built[0]["connect_attempts"], smtpmod.CONNECT_ATTEMPTS)
+        built[0]["notify"]("повтор")
+        self.assertIn("повтор", logs)
+        self.assertEqual(len(self.server.sent), 1)
 
 
 if __name__ == "__main__":

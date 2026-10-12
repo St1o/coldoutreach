@@ -35,7 +35,7 @@ from mailing.config import (
     ENV_FILE, SETTINGS_FILE, DEFAULT_DAILY_LIMIT, check_email, is_stopped, load_env_file, load_settings, mask_email,
     read_stoplist, redact, resolve_daily_limit, resolve_port)
 from mailing.lock import Locked, SendLock, lock_holder
-from mailing.smtp import SMTP_PORT, MailruSender, build_message, reply_text
+from mailing.smtp import CONNECT_ATTEMPTS, SMTP_PORT, MailruSender, build_message, reply_text
 from mailing.table import LettersError, read_letters
 
 LOG_NAME = "mailer.log"          # журнал фоновой отправки (адреса в нём скрыты)
@@ -180,7 +180,9 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             if not box.ready:
                 log(f"{box.label}: не заданы адрес и «пароль для внешних приложений» (см. local.env.example).")
                 return 1
-            senders[box.id] = MailruSender(box.user, box.password, port=port)
+            tag = f" ({box.label})" if multi else ""
+            senders[box.id] = MailruSender(box.user, box.password, port=port, connect_attempts=CONNECT_ATTEMPTS, sleep=sleep,
+                                           notify=lambda text, tag=tag: log(text + tag))
     if copiers is None:
         copiers = sentcopy.make_savers(slots) if built_here else {}
     names = {box.id: box.from_name for box in slots}
@@ -248,7 +250,8 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                 continue
             except ssl.SSLError as exc:
                 log(f"Не удалось установить защищённое соединение с smtp.mail.ru{note} ({shown(reply_text(exc))}). Это не пароль и не "
-                    "лимит: чаще всего мешает VPN, прокси или антивирус с проверкой HTTPS, реже провайдер. Остановлено. "
+                    "лимит: чаще всего мешает VPN, прокси или антивирус с проверкой HTTPS, реже провайдер. Остановлено (если связь "
+                    "оборвалась при подключении, программа уже повторила попытку несколько раз). "
                     "Запустите check_cert.py (правой кнопкой, Run 'check_cert') и пришлите вывод; письмо останется в очереди.")
                 code = 3
                 break
