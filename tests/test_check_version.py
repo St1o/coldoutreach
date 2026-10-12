@@ -13,6 +13,11 @@ class FeaturesTest(unittest.TestCase):
         missing = [name for name, ok, _ in check_version.features() if not ok]
         self.assertEqual(missing, [])
 
+    def test_the_copy_to_the_sent_folder_is_one_of_the_checked_features(self):
+        found = [(name, ok) for name, ok, _ in check_version.features() if "Отправленные" in name]
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0][1])
+
     def test_the_numbers_of_the_warmup_are_printed(self):
         details = " ".join(detail for _, _, detail in check_version.features())
         self.assertIn("первый день 7", details)

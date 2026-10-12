@@ -197,6 +197,13 @@ function rememberPassword(on) {
     else localStorage.removeItem(STORE);
   } catch (e) { /* хранилище недоступно - просто не запоминаем */ }
 }
+// Копия в «Отправленные» ящика-отправителя: письмо уже ушло, её сбой отправку не отменяет
+function copyText(copy) {
+  if (!copy || copy.state === 'off') return 'копия в Отправленные: выключена (SAVE_SENT_COPY=0 в local.env)';
+  return copy.state === 'saved' ? 'копия в Отправленные: сохранена'
+                                : 'копия в Отправленные: не сохранена (' + (copy.reason || 'причина неизвестна') + ')';
+}
+
 function setStatus(text, kind) {
   const el = $('status');
   el.textContent = text;
@@ -380,7 +387,7 @@ $('letter').addEventListener('submit', async (event) => {
     const result = await api('/api/mail/send', { to: $('to').value, subject: $('subject').value, body: $('body').value,
                                                  mailbox: $('from-box').value || '' });
     setStatus('Отправлено на ' + result.to + ' с ' + result.from + '.\n' + result.message
-              + '\nMessage-ID: ' + result.message_id, 'ok');
+              + '\nMessage-ID: ' + result.message_id + '\n' + copyText(result.sent_copy), 'ok');
   } catch (error) {
     setStatus('Не отправлено: ' + error.message, 'error');
   }

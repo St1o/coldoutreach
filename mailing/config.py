@@ -11,6 +11,7 @@ ENV_FILE = os.path.join(ROOT, "local.env")
 SETTINGS_FILE = os.path.join(ROOT, "settings.json")                       # пишет страница /mail
 DEFAULT_DAILY_LIMIT = 40
 SMTP_PORTS = (465, 587)                                                    # 465 - SSL сразу, 587 - STARTTLS (запасной путь)
+IMAP_HOST, IMAP_PORT = "imap.mail.ru", 993                                 # копия письма в «Отправленные» (mailing/sentcopy.py)
 DAILY_LIMIT_KEY = "daily_limit_per_mailbox"
 DAILY_LIMIT_MIN, DAILY_LIMIT_MAX = 1, 50          # лимит с /mail: выше 50 не ставится; предел недели прогрева задан в mailboxes.py
 _EMAIL_RE = re.compile(r"^[^@\s<>,;\"'()\[\]]+@[^@\s<>,;\"'()\[\]]+\.[^@\s<>,;\"'()\[\]]+$")
@@ -130,3 +131,26 @@ def resolve_port(cli_value=None, environ=None) -> int:
     if number not in SMTP_PORTS:
         raise ValueError("Порт SMTP: 465 или 587 (MAILRU_PORT в local.env или ключ --port).")
     return number
+
+
+def resolve_sent_copy(environ=None) -> bool:
+    """Сохранять ли копию отправленного письма в «Отправленные»: SAVE_SENT_COPY в local.env, по умолчанию да; 0 - выключить."""
+    raw = (environ if environ is not None else os.environ).get("SAVE_SENT_COPY", "")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off", "нет")
+
+
+def resolve_imap(environ=None):
+    """(хост, порт) IMAP mail.ru: MAILRU_IMAP_HOST и MAILRU_IMAP_PORT из local.env, иначе imap.mail.ru и 993.
+    Неверное значение - ValueError с понятным текстом (отправку оно не останавливает: см. mailing/sentcopy.py)."""
+    environ = environ if environ is not None else os.environ
+    host = str(environ.get("MAILRU_IMAP_HOST", "")).strip() or IMAP_HOST
+    if re.search(r"[\s/]", host):
+        raise ValueError("MAILRU_IMAP_HOST в local.env должен быть именем сервера, например imap.mail.ru.")
+    raw = str(environ.get("MAILRU_IMAP_PORT", "")).strip()
+    try:
+        port = int(raw) if raw else IMAP_PORT
+    except ValueError:
+        port = 0
+    if not 0 < port < 65536:
+        raise ValueError("MAILRU_IMAP_PORT в local.env должен быть числом, например 993.")
+    return host, port

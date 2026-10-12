@@ -992,6 +992,7 @@ class MailWebTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual([m["To"] for m in self.outbox], ["a@b.ru"])
         self.assertIn("Message-ID", self.outbox[0])
+        self.assertEqual(data["sent_copy"]["state"], "off")              # подставной отправитель: настоящий IMAP не трогаем
 
     def test_errors_reach_the_page_with_a_reason(self):
         self.start(configured=False)

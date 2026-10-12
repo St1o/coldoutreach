@@ -14,7 +14,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from mailing import config as mailcfg, mailboxes as boxes, smtp
+from mailing import config as mailcfg, mailboxes as boxes, sentcopy, smtp
 from mailing import table as lettertable
 from letter_template import DEFAULT_OFFER, render_letter
 
@@ -40,7 +40,7 @@ class MailError(Exception):
 class MailService:
     def __init__(self, user: str = "", password: str = "", from_name: str = "", example=None,
                  max_per_hour: int = 10, sender_factory=None, clock=time.monotonic,
-                 port: int = smtp.SMTP_PORT, mailboxes=None):
+                 port: int = smtp.SMTP_PORT, mailboxes=None, copy_factory=None):
         """mailboxes - все подключённые ящики (mailing.mailboxes.load_mailboxes): с каждого можно отправить пробное
         письмо. Не задан - один ящик из user и password, как раньше."""
         self.user = (user or "").strip()
@@ -55,6 +55,7 @@ class MailService:
         if mailboxes is not None and first is not None:
             self.user, self._password = first.user, first.password
         self._custom_factory = sender_factory             # подставной отправитель для тестов, один на все ящики
+        self._copy_factory = copy_factory                 # подставной копировщик в «Отправленные»: box -> объект с save/close или None
         self._clock = clock
         self._busy = threading.Lock()
         self._sent = deque()                  # моменты удачных отправок за последний час
@@ -81,6 +82,32 @@ class MailService:
         if self._custom_factory:
             return self._custom_factory()
         return smtp.MailruSender(box.user, box.password, port=self.port, timeout=CONNECT_TIMEOUT)
+
+    def _copier_for(self, box):
+        if self._copy_factory:
+            return self._copy_factory(box)
+        if self._custom_factory:                          # подставной отправитель (тесты): настоящий IMAP не трогаем
+            return None
+        return sentcopy.make_saver(box.user, box.password, timeout=CONNECT_TIMEOUT)
+
+    def _save_copy(self, box, message) -> dict:
+        """Копия принятого письма в «Отправленные» ящика-отправителя. Письмо уже ушло: сбой копии ответ не портит и
+        ошибкой страницы не становится, он только описан в поле sent_copy (state: saved, failed или off)."""
+        saver = None
+        try:
+            saver = self._copier_for(box)
+            if saver is None:
+                return {"state": "off", "reason": ""}
+            saved, reason = saver.save(message)
+            return {"state": "saved", "reason": ""} if saved else {"state": "failed", "reason": mailcfg.redact(reason)}
+        except Exception as exc:
+            return {"state": "failed", "reason": type(exc).__name__}
+        finally:
+            if saver is not None:
+                try:
+                    saver.close()
+                except Exception:
+                    pass
 
     def defaults(self) -> dict:
         """Готовый пример для формы. Адрес получателя по умолчанию - сам ящик отправителя:
@@ -158,9 +185,10 @@ class MailService:
             finally:
                 sender.close()
             self._sent.append(self._clock())
+            copy = self._save_copy(box, message)
         finally:
             self._busy.release()
         moment = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M:%S")
-        return {"ok": True, "to": to, "from": box.user, "message_id": message["Message-ID"],
+        return {"ok": True, "to": to, "from": box.user, "message_id": message["Message-ID"], "sent_copy": copy,
                 "message": f"Сервер mail.ru принял письмо в {moment} (МСК). Проверьте входящие у "
                            f"получателя и папку «Спам»: «принято» ещё не значит «доставлено во входящие»."}

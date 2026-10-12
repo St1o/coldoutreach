@@ -29,6 +29,7 @@
 | Отправка: цикл, раздача писем по ящикам, паузы, коды выхода, `--background`, `--status`, CLI | `mailer.py` (7000) |
 | Ящики из `local.env` (`load_mailboxes`), прогрев (`warmup_quota`, `mailbox_state`), выбор ящиков (`select`), раздача писем по очереди (`assign`), дата первого письма (`set_first_message`) | `mailing/mailboxes.py` (2800) |
 | SMTP, письмо, List-Unsubscribe, проверка сертификата | `mailing/smtp.py` (1300) |
+| Копия отправленного письма в «Отправленные» по IMAP после ответа SMTP (`SentFolderSaver`, поиск папки по `\Sent`, `make_savers`, итог запуска для `--status`); сбой копии никогда не меняет отправку, журнал и код выхода; настройки `SAVE_SENT_COPY`, `MAILRU_IMAP_HOST`, `MAILRU_IMAP_PORT` (`config.resolve_sent_copy`, `resolve_imap`); в `mailer.run` параметр `copiers`, в `mail_service` поле `sent_copy` | `mailing/sentcopy.py` (3000) |
 | Таблица писем (колонки, проверки строк) | `mailing/table.py` (1000) |
 | Журнал отправки, дневной подсчёт по ящикам (`sent_last_24h`, `sent_on_day`), какие этапы ушли (`sent_stages`), ящик прошлого этапа (`previous_mailboxes`) | `mailing/journal.py` (1500) |
 | Замок «одна отправка на папку» | `mailing/lock.py` (1100) |
