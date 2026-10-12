@@ -252,5 +252,16 @@ class SentCopyTest(unittest.TestCase):
         self.assertNotIn(USER, result["sent_copy"]["reason"])
         self.assertEqual(len(self.sender.sent), 1)
 
+    def test_the_copy_goes_to_the_mailbox_the_test_letter_was_sent_from(self):
+        from mailing.mailboxes import Mailbox
+        chosen = []
+        sender = FakeSender()
+        service = MailService(mailboxes=[Mailbox("1", "one@mail.ru", "PW-ONE"), Mailbox("2", "two@mail.ru", "PW-TWO")],
+                              sender_factory=lambda: sender, copy_factory=lambda box: chosen.append(box.id) or FakeCopier())
+        service.send("a@b.ru", "Т", "Х", mailbox="2")
+        service.send("a@b.ru", "Т", "Х")
+        self.assertEqual(chosen, ["2", "1"])
+
+
 if __name__ == "__main__":
     unittest.main()

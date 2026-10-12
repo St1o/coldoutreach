@@ -15,6 +15,7 @@ from unittest import mock
 import mailer
 from mailing import config as cfg, journal, sentcopy
 from mailing import smtp as smtpmod
+from mailing.mailboxes import Mailbox
 from mailing.smtp import MailruSender, build_message
 from mailing.table import Letter
 from tests.test_mailer import FakeServer, TempTable, refused, table
@@ -441,6 +442,58 @@ class SettingsTest(BatchCase):
         self.assertEqual(len(server.sent), 2)
         self.assertEqual((connector.calls, connector.appended), ([], []))
         self.assertNotIn("Отправленные", text)
+
+
+
+class TwoMailboxesTest(unittest.TestCase):
+    """Два ящика: у каждого своё IMAP-соединение со своим логином, и копия письма лежит в «Отправленные» ящика-отправителя."""
+    FIRST = Mailbox("1", "first@mail.ru", "PASSWORD-ONE-111", "Пётр")
+    SECOND = Mailbox("2", "second@mail.ru", "PASSWORD-TWO-222", "Пётр")
+
+    def check_copies(self, connector, servers):
+        self.assertEqual(len(connector.connections), 2)                       # по соединению на ящик
+        by_login = {imap.logins[0]: imap for imap in connector.connections}
+        self.assertEqual(set(by_login), {(self.FIRST.user, self.FIRST.password), (self.SECOND.user, self.SECOND.password)})
+        for box, expected in ((self.FIRST, ["u0@x.ru", "u2@x.ru"]), (self.SECOND, ["u1@x.ru", "u3@x.ru"])):
+            imap = by_login[(box.user, box.password)]
+            copies = [message_from_bytes(item[3], policy=policy.default) for item in imap.appended]
+            self.assertEqual([c["To"] for c in copies], expected)             # копии лишь тех писем, что ушли с этого ящика
+            self.assertTrue(all(box.user in c["From"] for c in copies))
+            self.assertEqual([c["Message-ID"] for c in copies], [m["Message-ID"] for m in servers[box.user].sent])
+            self.assertTrue(imap.logged_out)
+
+    def test_run_copies_each_letter_into_the_sent_folder_of_the_mailbox_that_sent_it(self):
+        source = TempTable(table(*[f"u{i}@x.ru;Тема {i};Текст" for i in range(4)]), "letters_1.csv")
+        self.addCleanup(source.close)
+        servers = {box.user: FakeServer() for box in (self.FIRST, self.SECOND)}
+        connector, boxes = Connector(), [self.FIRST, self.SECOND]
+        code = mailer.run(source.path, send=True, limit=0, pause=0, log=[].append, sleep=lambda s: None, mailboxes=boxes,
+                          senders={box.id: MailruSender(box.user, box.password, connect=lambda *a, u=box.user: servers[u])
+                                   for box in boxes},
+                          copiers=sentcopy.make_savers(boxes, {}, connector), daily_limit=40,
+                          settings_path=os.path.join(os.path.dirname(source.path), "нет.json"))
+        self.assertEqual(code, 0)
+        self.check_copies(connector, servers)
+
+    def test_main_builds_a_copier_for_every_connected_mailbox(self):
+        source = TempTable(table(*[f"u{i}@x.ru;Тема {i};Текст" for i in range(4)]), "letters_1.csv")
+        self.addCleanup(source.close)
+        servers = {box.user: FakeServer() for box in (self.FIRST, self.SECOND)}
+        connector = Connector()
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("MAILRU_", "MAIL_"))}
+        env.update(MAILRU_USER=self.FIRST.user, MAILRU_APP_PASSWORD=self.FIRST.password,
+                   MAILRU_USER_2=self.SECOND.user, MAILRU_APP_PASSWORD_2=self.SECOND.password, SAVE_SENT_COPY="1")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(mailer, "MailruSender", lambda user, password, port=465, **kw:
+                                  MailruSender(user, password, connect=lambda *a: servers[user])), \
+                mock.patch.object(sentcopy, "default_connect", connector), contextlib.redirect_stdout(out):
+            code = mailer.main([source.path, "--send", "--limit", "0", "--pause", "0", "--env", os.devnull,
+                                "--settings", os.devnull, "--mask-addresses"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.check_copies(connector, servers)
+        for secret in (self.FIRST.password, self.SECOND.password, self.FIRST.user, self.SECOND.user):
+            self.assertNotIn(secret, out.getvalue())
 
 
 if __name__ == "__main__":
