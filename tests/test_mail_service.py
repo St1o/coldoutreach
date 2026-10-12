@@ -1,3 +1,4 @@
+import imaplib
 import os
 import smtplib
 import ssl
@@ -170,6 +171,96 @@ class MailServiceTest(unittest.TestCase):
         data = self.make(example={"to": "x@y.ru", "director": "петров сергей николаевич"}).defaults()
         self.assertEqual(data["to"], "x@y.ru")
         self.assertTrue(data["body"].startswith("Добрый день, Сергей Николаевич!"))
+
+
+class FakeCopier:
+    """Подставная копия в «Отправленные»: запоминает письма, умеет отказывать или падать."""
+
+    def __init__(self, result=(True, ""), error=None):
+        self.result, self.error, self.saved, self.closed = result, error, [], False
+
+    def save(self, msg):
+        if self.error:
+            raise self.error
+        self.saved.append(msg)
+        return self.result
+
+    def close(self):
+        self.closed = True
+
+
+class SentCopyTest(unittest.TestCase):
+    """Копия пробного письма в «Отправленные»: письмо уже ушло, поэтому сбой копии ответ не портит."""
+
+    def make(self, copier=None, sender_error=None, **kw):
+        self.sender, self.copier = FakeSender(sender_error), copier or FakeCopier()
+        return MailService(USER, SECRET, sender_factory=lambda: self.sender, copy_factory=lambda box: self.copier, **kw)
+
+    def test_a_saved_copy_is_reported_and_is_the_message_that_was_sent(self):
+        result = self.make().send("a@b.ru", "Тема", "Текст")
+        self.assertEqual(result["sent_copy"], {"state": "saved", "reason": ""})
+        self.assertIs(self.copier.saved[0], self.sender.sent[0])         # то же письмо: те же Date и Message-ID
+        self.assertEqual(self.copier.saved[0]["Message-ID"], result["message_id"])
+        self.assertTrue(self.copier.closed)
+
+    def test_a_failed_copy_is_a_note_not_an_error(self):
+        service = self.make(FakeCopier((False, "нет папки «Отправленные»")), max_per_hour=1)
+        result = service.send("a@b.ru", "Тема", "Текст")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent_copy"], {"state": "failed", "reason": "нет папки «Отправленные»"})
+        self.assertEqual(len(self.sender.sent), 1)                       # письмо не отправлено повторно
+        with self.assertRaises(MailError) as ctx:
+            service.send("c@d.ru", "Т", "Х")
+        self.assertEqual(ctx.exception.status, 429)                      # отправка засчитана в лимит часа
+
+    def test_a_copier_that_raises_is_a_failed_copy_too(self):
+        result = self.make(FakeCopier(error=RuntimeError("boom"))).send("a@b.ru", "Т", "Х")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent_copy"], {"state": "failed", "reason": "RuntimeError"})
+        self.assertEqual(len(self.sender.sent), 1)
+
+    def test_no_copy_when_the_letter_was_not_accepted(self):
+        service = self.make(sender_error=smtplib.SMTPServerDisconnected("closed"))
+        with self.assertRaises(MailError):
+            service.send("a@b.ru", "Т", "Х")
+        self.assertEqual(self.copier.saved, [])
+
+    def test_without_a_copier_the_copy_is_off_and_nothing_connects(self):
+        sender = FakeSender()
+        service = MailService(USER, SECRET, sender_factory=lambda: sender)
+        self.assertEqual(service.send("a@b.ru", "Т", "Х")["sent_copy"], {"state": "off", "reason": ""})
+
+    def test_with_the_real_saver_the_copy_has_the_same_message_id_and_the_seen_flag_and_hides_secrets(self):
+        from mailing import sentcopy
+        from tests.test_sentcopy import Connector
+
+        def service_with(connector):
+            self.sender = FakeSender()
+            return MailService(USER, SECRET, sender_factory=lambda: self.sender,
+                               copy_factory=lambda box: sentcopy.SentFolderSaver(box.user, box.password, connect=connector))
+
+        connector = Connector()
+        result = service_with(connector).send("a@b.ru", "Тема", "Текст")
+        self.assertEqual(result["sent_copy"]["state"], "saved")
+        (_, flags, _, data), = connector.appended
+        self.assertEqual(flags, "\\Seen")
+        self.assertIn(result["message_id"].encode(), data)
+        broken = Connector(login_error=imaplib.IMAP4.error(f"bad password {SECRET} for {USER}".encode()))
+        result = service_with(broken).send("c@d.ru", "Т", "Х")
+        self.assertEqual(result["sent_copy"]["state"], "failed")
+        self.assertNotIn(SECRET, str(result))
+        self.assertNotIn(USER, result["sent_copy"]["reason"])
+        self.assertEqual(len(self.sender.sent), 1)
+
+    def test_the_copy_goes_to_the_mailbox_the_test_letter_was_sent_from(self):
+        from mailing.mailboxes import Mailbox
+        chosen = []
+        sender = FakeSender()
+        service = MailService(mailboxes=[Mailbox("1", "one@mail.ru", "PW-ONE"), Mailbox("2", "two@mail.ru", "PW-TWO")],
+                              sender_factory=lambda: sender, copy_factory=lambda box: chosen.append(box.id) or FakeCopier())
+        service.send("a@b.ru", "Т", "Х", mailbox="2")
+        service.send("a@b.ru", "Т", "Х")
+        self.assertEqual(chosen, ["2", "1"])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@
 Доступ к ящикам: MAILRU_USER и MAILRU_APP_PASSWORD (первый ящик), MAILRU_USER_2 и MAILRU_APP_PASSWORD_2 (второй) и т. д.
 из окружения или из local.env рядом с программой. Письма идут по очереди с подключённых ящиков, каждому по его квоте на
 сегодня (прогрев: 7 писем в первый день, потом на 3 больше, не больше лимита в сутки).
+После каждого принятого письма его копия кладётся в «Отправленные» того же ящика по IMAP (SAVE_SENT_COPY=0 в local.env выключает);
+сбой копии письмо не отменяет: отправка, журнал и код выхода от него не зависят.
 Защита: без --send ничего не уходит; --limit за запуск, --pause (со случайной добавкой --jitter) между письмами,
 --daily-limit в сутки на ящик; журнал <таблица>.sent.json (повторно не шлём); stoplist.txt; List-Unsubscribe; одна отправка
 на папку (два ящика работают в одном процессе, по очереди); при отказе сервера или лимите сразу остановка.
@@ -28,7 +30,7 @@ import sys
 import time
 from collections import Counter
 
-from mailing import journal, mailboxes as boxes
+from mailing import journal, mailboxes as boxes, sentcopy
 from mailing.config import (
     ENV_FILE, SETTINGS_FILE, DEFAULT_DAILY_LIMIT, check_email, is_stopped, load_env_file, load_settings, mask_email,
     read_stoplist, redact, resolve_daily_limit, resolve_port)
@@ -66,6 +68,7 @@ def status_lines(path: str, daily_limit: int, now=None, mailboxes=None, settings
              f"ещё не отправлялось: {pending}.",
              f"За последние 24 часа по папке отправлено {used}" + (f" из {daily_limit}." if daily_limit else "."),
              f"Сейчас идёт отправка (процесс {holder})." if holder else "Сейчас отправка не идёт."]
+    lines.append(sentcopy.status_line(folder))
     if mailboxes:
         lines.append("Ящики на сегодня:")
         lines.extend("  " + line for line in mailbox_lines(folder, mailboxes, daily_limit, settings_path, now))
@@ -83,7 +86,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
         password: str = "", from_name: str = "", port: int = SMTP_PORT, sender=None, log=print,
         sleep=time.sleep, max_temp_errors: int = 3, stoplist=frozenset(), daily_limit: int = 0,
         unsubscribe: bool = False, now=None, mask: bool = False, mailboxes=None, senders=None, configured=None,
-        jitter: float = 0.0, rng=random, settings_path: str = "") -> int:
+        jitter: float = 0.0, rng=random, settings_path: str = "", copiers=None) -> int:
     """Возвращает код выхода: 0 - готово, 1 - ошибка в таблице или настройках,
     2 - mail.ru не принял вход (логин/пароль), 3 - mail.ru отказал или ограничил отправку,
     5 - несколько временных отказов по получателям подряд. mask - в сообщениях адреса скрыты (n***@mail.ru).
@@ -91,7 +94,11 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
     Без mailboxes работает один ящик (sender или user/password), без прогрева: только лимит в сутки.
     С mailboxes (список mailing.mailboxes.Mailbox, выбранные для этой отправки) письма идут по очереди с этих ящиков,
     каждому по его квоте на сегодня (прогрев и лимит в сутки); senders - {номер ящика: объект отправки}, иначе они
-    создаются по паролям; configured - все подключённые ящики (чтобы понять, чей «свой» ящик у дожима)."""
+    создаются по паролям; configured - все подключённые ящики (чтобы понять, чей «свой» ящик у дожима).
+
+    copiers - {номер ящика: mailing.sentcopy.SentFolderSaver}: после принятого письма его копия кладётся в «Отправленные».
+    Не задан - копировщики создаются по настройкам local.env, но только если отправителей создаёт сама run (с подставными
+    senders копий нет). Сбой копии ничего не меняет: письмо не повторяется, журнал и код выхода те же."""
     who = mask_email if mask else (lambda address: address)
     shown = redact if mask else (lambda text: text)
     try:
@@ -158,6 +165,7 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             log("Квота ящиков на сегодня исчерпана: остаток уйдёт в следующие дни той же командой.")
         log("Отправлять нечего.")
         return 0
+    built_here = senders is None
     if senders is None:
         senders = {}
         if legacy:
@@ -173,6 +181,8 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
                 log(f"{box.label}: не заданы адрес и «пароль для внешних приложений» (см. local.env.example).")
                 return 1
             senders[box.id] = MailruSender(box.user, box.password, port=port)
+    if copiers is None:
+        copiers = sentcopy.make_savers(slots) if built_here else {}
     names = {box.id: box.from_name for box in slots}
 
     draw = getattr(rng, "random", rng)           # rng - либо объект с .random() (random, random.Random), либо функция без аргументов
@@ -180,14 +190,38 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
     def pause_for() -> float:
         return pause * (1 + draw() * jitter) if jitter else pause           # ровная пауза похожа на программу
 
+    copies, copy_started = Counter(), journal.now_iso()
+    last_copy_reason = ""
+
+    def store_copy(number, own, message):
+        """Копия принятого письма в «Отправленные». Письмо уже ушло и записано в журнал: что бы ни случилось, это только строка в журнале."""
+        nonlocal last_copy_reason
+        saver = copiers.get(own)
+        if saver is None:
+            return
+        try:
+            ok, reason = saver.save(message)
+        except Exception as exc:                      # копировщик не должен бросать, но отправку это не остановит
+            ok, reason = False, type(exc).__name__
+        if ok:
+            copies["saved"] += 1
+            log(f"[{number}/{len(plan)}] копия в Отправленные: ок")
+        else:
+            copies["failed"] += 1
+            last_copy_reason = redact(reason)          # в журнал и в файл итога причина идёт без адресов, как бы ни была запущена отправка
+            log(f"[{number}/{len(plan)}] копия в Отправленные не сохранена ({last_copy_reason})")
+        sentcopy.write_report(folder, {"started": copy_started, "updated": journal.now_iso(), "saved": copies["saved"],
+                                       "failed": copies["failed"], "last_reason": last_copy_reason})
+
     code, temp_in_a_row, done, done_by = 0, 0, 0, Counter()
     try:
         for number, (letter, own) in enumerate(plan, 1):
             if number > 1:
                 sleep(pause_for())                  # пауза между любыми двумя письмами: репутация ящиков важнее скорости
             current, note = senders[own], f" ({labels[own]})" if multi else ""
+            message = build_message(letter, current.user, names[own], unsubscribe)
             try:
-                current.send(build_message(letter, current.user, names[own], unsubscribe))
+                current.send(message)
             except smtplib.SMTPAuthenticationError as exc:
                 log(f"mail.ru не принял логин/пароль{note} ({shown(reply_text(exc))}). Нужен «пароль для внешних приложений», "
                     "а не обычный пароль от ящика. Остановлено.")
@@ -231,14 +265,19 @@ def run(path: str, send: bool = False, limit: int = 20, pause: float = 30.0, use
             done_by[own] += 1
             temp_in_a_row = 0
             log(f"[{number}/{len(plan)}] {who(letter.email)}: отправлено{note}")
+            store_copy(number, own, message)
     finally:
         for current in senders.values():
             current.close()
+        for saver in copiers.values():
+            saver.close()
 
     sent_total = sum(1 for entry in state.values() if entry["status"] == journal.SENT)
     log(f"Готово. Отправлено в этом запуске: {done}; всего по журналу {state_file}: {sent_total}.")
     if multi and done:
         log("По ящикам: " + ", ".join(f"{labels[own]} - {done_by[own]}" for own in labels if done_by[own]) + ".")
+    if copies:
+        log(f"Копии в «Отправленные»: сохранено {copies['saved']}, не сохранено {copies['failed']}.")
     return code
 
 def start_background(args, argv, user: str, password: str, selected=None) -> int:
@@ -365,8 +404,10 @@ def main(argv=None) -> int:
         if not args.status:
             print("Ошибка: вместо таблицы папку можно указать только вместе с --status.")
             return 1
-        print("\n".join(mailbox_lines(os.path.abspath(args.letters), ready, daily_limit, args.settings)
-                        or ["Ящики не подключены: впишите MAILRU_USER и MAILRU_APP_PASSWORD в local.env."]))
+        folder = os.path.abspath(args.letters)
+        print("\n".join((mailbox_lines(folder, ready, daily_limit, args.settings)
+                         or ["Ящики не подключены: впишите MAILRU_USER и MAILRU_APP_PASSWORD в local.env."])
+                        + [sentcopy.status_line(folder)]))
         return 0
 
     stop_path = args.stoplist or os.path.join(os.path.dirname(os.path.abspath(args.letters)), "stoplist.txt")

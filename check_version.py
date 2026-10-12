@@ -2,7 +2,8 @@
 
 Только чтение: ничего не меняет, адреса и пароли не печатает (local.env программа читает сама, как mailer.py, но выводит только
 число ящиков). Печатает ветку и коммит git, чистая ли папка, не отстаёт ли ветка от origin (по последнему fetch), есть ли нужные
-возможности (ключи --mailboxes, --mailbox, --jitter, --status, прогрев с недельными пределами, дата первого письма в local.env)
+возможности (ключи --mailboxes, --mailbox, --jitter, --status, прогрев с недельными пределами, дата первого письма в local.env,
+копия отправленного письма в «Отправленные»)
 и их числа. Итог: «ВЕРСИЯ ОК» (код 0) или список того, чего не хватает (код 1: тогда отправлять нельзя, сообщите владельцу).
 """
 import contextlib
@@ -63,6 +64,10 @@ def features() -> list:
                    f"первый день {getattr(mailboxes, 'WARMUP_FIRST_DAY', '?')}, шаг +{getattr(mailboxes, 'WARMUP_STEP', '?')}, "
                    f"недели {getattr(mailboxes, 'WARMUP_WEEK_CAPS', '?')}, дальше {getattr(mailboxes, 'WARMUP_CAP_LATER', '?')}; "
                    f"потолок /mail 1..{config.DAILY_LIMIT_MAX}; разброс паузы x(1+{getattr(mailer, 'DEFAULT_JITTER', '?')})"))
+    from mailing import sentcopy
+    result.append(("копия отправленного письма в «Отправленные» (mailing.sentcopy, SAVE_SENT_COPY)",
+                   hasattr(sentcopy, "SentFolderSaver") and hasattr(config, "resolve_sent_copy") and "copiers" in params,
+                   "сейчас включена" if config.resolve_sent_copy() else "сейчас выключена (SAVE_SENT_COPY=0)"))
     import send_service
     result.append(("send_service.mailbox_infos (квоты на страницах)", hasattr(send_service.SendService, "mailbox_infos"), ""))
     import compose
