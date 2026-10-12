@@ -75,6 +75,13 @@ def first_sent_day(directory: str, mailbox=None):
     return min(days) if days else None
 
 
+def sent_count(directory: str, stage: int) -> int:
+    """Сколько писем этапа принято сервером по журналу letters_<этап>.sent.json в папке. Отказы по адресу и письма,
+    которые собраны, но не отправлены, не считаются. От этого числа compose.py продолжает номера вариантов фраз."""
+    entries = load_state(os.path.join(directory, f"letters_{stage}.sent.json"))
+    return sum(1 for entry in entries.values() if entry.get("status") == SENT)
+
+
 def stage_of(letters_path: str) -> int:
     """Номер этапа по имени таблицы letters_2.csv -> 2; 0, если имя другое (letters.csv, letters_test.csv)."""
     found = re.fullmatch(r"letters_(\d+)\.csv", os.path.basename(letters_path))

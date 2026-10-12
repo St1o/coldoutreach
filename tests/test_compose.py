@@ -101,6 +101,11 @@ LETTERS = """# Письма
 ```
 """
 
+# Те же письма, но приветствие первого письма берётся из пяти вариантов (по кругу, общий счёт на все группы).
+GREETINGS = ["Здравствуйте!", "Добрый день!", "Приветствуем вас!", "Рады знакомству!", "Доброго времени суток!"]
+LETTERS_WITH_GREETINGS = (LETTERS.replace("Здравствуйте!", "{{приветствие}}", 1)
+                          + "\n## Варианты фраз\n\n### приветствие\n" + "".join(f"- {text}\n" for text in GREETINGS))
+
 HEADER = ["Название", "ФИО директора", "Почта", "ОКВЭД (код)", "ОКВЭД (название)", "Источник почты"]
 NAMES = ["Иванов Иван Иванович", "ООО СЕКРЕТНАЯ ФИРМА"]          # этого в письмах быть не должно
 
@@ -436,6 +441,38 @@ class MainTest(unittest.TestCase):
         letters, problems = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
         self.assertEqual((len(letters), problems), (2, []))
         self.assertIn("python mailer.py", self.output())
+
+    def greetings(self):
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
+        return [letter.body.split("\n")[0] for letter in letters]
+
+    def use_greetings(self, count=5):
+        with open(self.letters, "w", encoding="utf-8") as fh:
+            fh.write(LETTERS_WITH_GREETINGS)
+        self.write_leads([HEADER] + [lead(f"p{n}@x.ru", "47.91") for n in range(count)])
+
+    def test_the_next_run_continues_the_numbers_after_the_letters_that_went_out(self):
+        self.use_greetings()
+        self.assertEqual(self.go("--min-unique", "0"), 0)                   # эталон: все пять писем одной сборкой
+        whole = self.greetings()
+        self.assertEqual(len(set(whole)), 5)
+        self.assertEqual(self.go("--min-unique", "0", "--limit", "2"), 0)
+        self.assertEqual(self.greetings(), whole[:2])
+        journal.save_state(compose.journal_path(self.work, 1), dict([sent("p0@x.ru", date(2026, 10, 5)), sent("p1@x.ru", date(2026, 10, 5))]))
+        self.assertEqual(self.go("--min-unique", "0"), 0)                   # p0 и p1 ушли: идём дальше с третьего номера
+        self.assertEqual(self.sent_letters(), ["p2@x.ru", "p3@x.ru", "p4@x.ru"])
+        self.assertEqual(self.greetings(), whole[2:])
+
+    def test_letters_that_were_only_composed_do_not_move_the_numbers(self):
+        self.use_greetings(3)
+        self.assertEqual(self.go("--min-unique", "0"), 0)
+        first = self.greetings()
+        self.assertEqual(self.go("--min-unique", "0"), 0)                   # письма не отправляли: те же номера
+        self.assertEqual(self.greetings(), first)
+        journal.save_state(compose.journal_path(self.work, 1), dict([sent("p0@x.ru", date(2026, 10, 5), status="rejected")]))
+        self.assertEqual(self.go("--min-unique", "0"), 0)                   # отказ сервера по адресу номера не занимает:
+        self.assertEqual(self.sent_letters(), ["p1@x.ru", "p2@x.ru"])       # p1 и p2 получают номера 0 и 1, как p0 и p1 раньше
+        self.assertEqual(self.greetings(), first[:2])
 
     def test_link_and_signature_may_come_from_local_env(self):
         env = os.path.join(self.dir.name, "local.env")

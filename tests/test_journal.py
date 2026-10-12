@@ -18,6 +18,19 @@ class JournalCase(unittest.TestCase):
         return {"status": status, "time": when, "note": "", "subject": "Тема"}
 
 
+class SentCountTest(JournalCase):
+    def test_an_empty_folder_or_a_missing_journal_has_none(self):
+        self.assertEqual(journal.sent_count(self.tmp.name, 1), 0)
+        self.assertEqual(journal.sent_count(os.path.join(self.tmp.name, "нет такой папки"), 2), 0)
+
+    def test_only_letters_accepted_by_the_server_are_counted_per_stage(self):
+        self.save("letters_1.sent.json", {"a@x.ru": self.entry(journal.SENT), "b@x.ru": self.entry(journal.SENT),
+                                          "c@x.ru": self.entry(journal.REJECTED)})
+        self.save("letters_2.sent.json", {"a@x.ru": self.entry(journal.SENT)})
+        self.save("letters_test.sent.json", {"me@x.ru": self.entry(journal.SENT)})
+        self.assertEqual([journal.sent_count(self.tmp.name, stage) for stage in (1, 2, 3)], [2, 1, 0])
+
+
 class SentOverviewTest(JournalCase):
     def test_empty_folder_has_nothing(self):
         self.assertEqual(journal.sent_overview(self.tmp.name), {})

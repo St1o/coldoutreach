@@ -19,8 +19,12 @@ OUTREACH_SEGMENT (ключи командной строки главнее).
 
 Варианты фраз (необязательно): раздел «## Варианты фраз» файла писем («### место» и строки «- вариант»); в шаблонах это
 {{приветствие}}, {{призыв_1}} и т. п. Программа подставляет варианты по кругу (соседние письма разные), приветствие - по
-часу сборки письма (пометки «утро:», «день:», «вечер:»), место «тема» раздаёт темы. Базовая проверка на повторы:
-средняя разница между письмами одной группы не меньше --min-unique (по умолчанию 25%), иначе письма не собираются.
+часу сборки письма (пометки «утро:», «день:», «вечер:»), место «тема» раздаёт темы. Номер письма для кругов один на все
+группы этапа и продолжается между партиями: он начинается с числа уже отправленных писем этапа по журналу
+letters_<этап>.sent.json (собранные, но не отправленные номеров не занимают). Проверка на повторы идёт по каждому письму:
+его наименьшая разница с любым другим письмом сборки (не только своей группы) не меньше --min-unique по тексту (тройки слов
+без ссылки) и не меньше --min-unique-subject по теме (набор слов; на этапе 1 и только при месте «тема»), по умолчанию 25%.
+Иначе письма не собираются, в сообщении названы номера пары и числа (адресов нет). Наименьшие числа выводятся в итоге сборки.
 
 Карта ОКВЭД (необязательно): файл okved-map.md агента рядом с файлом сегмента (или --okved-map, OUTREACH_OKVED_MAP).
 Агент решает по смыслу, к какой группе относится каждый код ОКВЭД (или «не писать»); решение по коду главнее таблицы
@@ -36,8 +40,6 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-
-import random
 
 from mailing import config, forms, journal
 from mailing.forms import DEFAULT_FORMS, KNOWN_FORMS, OTHER_FORM      # формы организаций: общие с /leads
@@ -64,7 +66,9 @@ PUBLIC_DOMAINS = frozenset("""
     autorambler.ru myrambler.ru lenta.ru gmail.com googlemail.com outlook.com hotmail.com live.com msn.com icloud.com
     me.com yahoo.com yahoo.ru ukr.net mail.ua tut.by qip.ru pochta.ru
 """.split())
-MIN_UNIQUE = 25.0           # средняя разница между письмами одной группы, % (--min-unique; 0 - не проверять)
+MIN_UNIQUE = 25.0           # наименьшая разница письма с любым другим письмом сборки по тексту, % (--min-unique; 0 - не проверять)
+MIN_UNIQUE_SUBJECT = 25.0   # то же по теме, % (--min-unique-subject; 0 - не проверять)
+MAX_WEAK_SHOWN = 5          # сколько пар названо в сообщении, если письма слишком похожи
 _LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle)/\S*")
 _EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 
@@ -175,10 +179,13 @@ def okved_class(code: str):
 
 class Composer:
     def __init__(self, groups: list, texts: Texts, link: str, signature: str, include_unwritten: bool = False,
-                 okved_map: dict = None, form_rules: dict = None, now: datetime = None):
+                 okved_map: dict = None, form_rules: dict = None, now: datetime = None, folder: str = ""):
         check_variants(texts.variants)
         self.now = now or datetime.now()               # время суток для приветствий: по часу сборки письма
-        self._counts = Counter()                       # (этап, группа) -> сколько писем уже собрано: варианты идут по кругу
+        # этап -> номер следующего письма: один счётчик на все группы, варианты и темы идут по нему по кругу. Он
+        # продолжается между партиями: стартует с числа уже отправленных писем этапа по журналу папки данных
+        # (собранные, но не отправленные номеров не занимают).
+        self._counts = Counter({stage: journal.sent_count(folder, stage) for stage in (1, 2, 3)} if folder else {})
         self.groups = {group.id: group for group in groups}
         self.okved_map = okved_map or {}
         self.form_rules = form_rules or {}             # форма -> писать (True) или не писать (False), решение агента
@@ -219,21 +226,23 @@ class Composer:
         """Блок боли для письма 1 написан (или это запасная группа)."""
         return group_id == FALLBACK_ID or _key(self.groups[group_id].name) in self.texts.pain1
 
-    def pick_variant(self, slot: str, stage: int, group_id: str) -> str:
-        """Вариант фразы для места: по кругу среди подходящих по времени суток. Письма одной группы и этапа идут подряд,
-        поэтому соседние письма получают разные варианты; одно и то же письмо при той же сборке получает тот же вариант."""
+    def pick_variant(self, slot: str, stage: int) -> str:
+        """Вариант фразы для места: по кругу среди подходящих по времени суток. Номер письма общий для всех групп этапа,
+        поэтому соседние письма (в том числе разных групп) получают разные варианты; одно и то же письмо при той же
+        сборке получает тот же вариант."""
         period = day_period(self.now.hour)
         options = [text for tag, text in self.texts.variants[slot] if tag in ("", period)]
-        return options[(self._counts[(stage, group_id)] + sum(map(ord, slot))) % len(options)]
+        return options[(self._counts[stage] + sum(map(ord, slot))) % len(options)]
 
     def subject_variant(self, group_id: str):
         """Тема из места «тема» раздела вариантов (по кругу); места нет - None, тогда тема одна, рекомендованная.
-        {{группа_кратко}} в теме заменяется названием вида деятельности; у запасной группы берутся темы без неё."""
+        {{группа_кратко}} в теме заменяется названием вида деятельности; у запасной группы берутся темы без неё
+        (список короче, но номер письма общий для всех групп)."""
         if SUBJECT_SLOT not in self.texts.variants:
             return None
         short = self.groups[group_id].short
         options = [text for _, text in self.texts.variants[SUBJECT_SLOT] if short or "{{" + SUBJECT_WORDS + "}}" not in text]
-        text = options[(self._counts[(1, group_id)] + sum(map(ord, SUBJECT_SLOT))) % len(options)]
+        text = options[(self._counts[1] + sum(map(ord, SUBJECT_SLOT))) % len(options)]
         return text.replace("{{" + SUBJECT_WORDS + "}}", short)
 
     def letter_text(self, stage: int, group_id: str) -> str:
@@ -244,7 +253,7 @@ class Composer:
         # Запасная группа и группа без своего блока боли: свой шаблон письма, если агент его написал
         own = group_id == FALLBACK_ID or not self.is_written(group_id)
         template = (self.texts.fallback_templates.get(stage) if own else None) or self.texts.templates[stage]
-        slots = {name.casefold(): self.pick_variant(name.casefold(), stage, group_id)
+        slots = {name.casefold(): self.pick_variant(name.casefold(), stage)
                  for name in {m.group(1) for m in _PLACEHOLDER.finditer(template)} if name.casefold() in self.texts.variants}
         text = fill(template, {
             "группа_словами": group.words,
@@ -253,7 +262,7 @@ class Composer:
             "ссылка_на_опрос": self.link,
             "подпись": self.signature,
         }, slots)
-        self._counts[(stage, group_id)] += 1
+        self._counts[stage] += 1
         return text
 
 
@@ -523,27 +532,53 @@ def _shingles(text: str, size: int = 3) -> set:
     return {tuple(words[i:i + size]) for i in range(max(1, len(words) - size + 1))}
 
 
-def uniqueness_by_group(letters: list, max_pairs: int = 500) -> dict:
-    """Базовая проверка на повторы: группа -> (средняя разница между письмами, наименьшая разница, число пар), в процентах.
-    Разница двух писем = 100% минус доля общих троек слов (коэффициент Жаккара). Сравниваются письма одной группы:
-    у разных групп свои тексты. Группы из одного письма пропускаются. Пар много - берётся одна и та же выборка."""
-    by_group = {}
-    for letter in letters:
-        by_group.setdefault(letter[3], []).append(_shingles(letter[2]))
-    report = {}
-    for group_id, sets in by_group.items():
-        count = len(sets)
-        if count < 2:
-            continue
-        all_pairs = count * (count - 1) // 2
-        if all_pairs <= max_pairs:
-            pairs = [(i, j) for i in range(count) for j in range(i + 1, count)]
-        else:
-            rng = random.Random(0)
-            pairs = [tuple(sorted(rng.sample(range(count), 2))) for _ in range(max_pairs)]
-        diffs = [100.0 * (1 - len(sets[i] & sets[j]) / len(sets[i] | sets[j])) for i, j in pairs]
-        report[group_id] = (sum(diffs) / len(diffs), min(diffs), len(diffs))
-    return report
+def _subject_words(subject: str) -> frozenset:
+    return frozenset(re.findall(r"\w+", subject.casefold()))
+
+
+def _closest(sets: list) -> list:
+    """Для каждого набора: (наименьшая разница с любым другим набором, %, номер этого набора с нуля). Разница двух
+    наборов = 100% минус доля общих элементов (коэффициент Жаккара). Одинаковые наборы (разница 0) находятся сразу, попарно
+    сравниваются только разные. Набор в единственном числе сравнивать не с чем: (None, None)."""
+    members = {}
+    for number, items in enumerate(sets):
+        members.setdefault(items, []).append(number)
+    firsts = [numbers[0] for numbers in members.values()]        # по одному набору от каждой группы одинаковых
+    best = {}
+    for at, i in enumerate(firsts):
+        for j in firsts[at + 1:]:
+            common = len(sets[i] & sets[j])
+            union = len(sets[i]) + len(sets[j]) - common
+            diff = 100.0 * (1 - common / union) if union else 0.0
+            for one, other in ((i, j), (j, i)):
+                if one not in best or diff < best[one][0]:
+                    best[one] = (diff, other)
+    result = []
+    for number, items in enumerate(sets):
+        twins = [other for other in members[items] if other != number]
+        result.append((0.0, twins[0]) if twins else best.get(number, (None, None)))
+    return result
+
+
+def uniqueness_by_letter(letters: list) -> list:
+    """Проверка на повторы по каждому письму сборки: для письма с номером i (с нуля, по порядку) -> (разница по тексту,
+    письмо, с которым она наименьшая, разница по теме, письмо для неё). Разница - в процентах: по тексту это 100% минус
+    коэффициент Жаккара троек слов без ссылки, по теме - то же по набору слов. Письмо сравнивается со всеми остальными
+    письмами сборки (не только своей группы). Единственное письмо: (None, None, None, None)."""
+    texts = _closest([frozenset(_shingles(letter[2])) for letter in letters])
+    subjects = _closest([_subject_words(letter[1]) for letter in letters])
+    return [(t[0], t[1], s[0], s[1]) for t, s in zip(texts, subjects)]
+
+
+def weak_pairs(report: list, column: int, threshold: float) -> list:
+    """Письма отчёта uniqueness_by_letter, у которых разница ниже порога, -> пары [(разница, меньший номер, больший номер)],
+    самые похожие первыми. Пара письма и его ближайшего без повторов (A-B и B-A - одна пара). Колонка: 0 - текст, 2 - тема."""
+    pairs = {}
+    for number, row in enumerate(report):
+        diff, other = row[column], row[column + 1]
+        if diff is not None and diff < threshold:
+            pairs[tuple(sorted((number, other)))] = diff
+    return sorted(((diff, a, b) for (a, b), diff in pairs.items()), key=lambda item: (item[0], item[1], item[2]))
 
 
 def write_letters(path: str, letters: list) -> None:
@@ -604,9 +639,13 @@ def main(argv=None, today=None, log=print) -> int:
                         help="группам, для которых блок боли ещё не написан, подставить запасной вариант "
                              "(по умолчанию такие письма не собираются)")
     parser.add_argument("--min-unique", type=float, default=MIN_UNIQUE,
-                        help="базовая проверка на повторы: средняя разница между письмами одной группы, не меньше этого "
-                             f"процента (по умолчанию {MIN_UNIQUE:g}; 0 - не проверять). Меньше - письма не собираются: "
-                             "нужны варианты формулировок в файле писем (раздел «Варианты фраз»)")
+                        help="проверка на повторы по каждому письму: его наименьшая разница по тексту (тройки слов без ссылки) "
+                             f"с любым другим письмом сборки, не меньше этого процента (по умолчанию {MIN_UNIQUE:g}; 0 - не "
+                             "проверять). Меньше - письма не собираются: нужны варианты формулировок в файле писем "
+                             "(раздел «Варианты фраз»)")
+    parser.add_argument("--min-unique-subject", type=float, default=MIN_UNIQUE_SUBJECT,
+                        help="то же по теме (набор слов), этап 1 и файл писем с местом «тема» "
+                             f"(по умолчанию {MIN_UNIQUE_SUBJECT:g}; 0 - не проверять)")
     parser.add_argument("--preview", action="store_true", help="показать по одному примеру письма на группу")
     parser.add_argument("--test-to", default="",
                         help="адреса через запятую: собрать letters_test.csv с пробными письмами им (таблица не читается)")
@@ -643,7 +682,7 @@ def main(argv=None, today=None, log=print) -> int:
             okved_map, form_rules = parse_okved_map(map_text, groups), parse_form_rules(map_text)
         composer = Composer(groups, texts, args.link or os.environ.get("SURVEY_LINK", ""),
                             args.signature or os.environ.get("MAIL_SIGNATURE", ""), args.include_unwritten, okved_map,
-                            form_rules)
+                            form_rules, folder=folder)
         subject = pick_subject(texts, args.subject)
 
         stop_path = args.stoplist or os.path.join(folder, "stoplist.txt")
@@ -713,19 +752,38 @@ def main(argv=None, today=None, log=print) -> int:
         fallback = Counter(letter[3] for letter in result.letters if not composer.is_written(letter[3]))
         for group_id, number in sorted(fallback.items()):
             log(f"  запасной вариант текста: для группы {group_id} «{names[group_id]}» блок боли ещё не написан - писем {number}")
-    if not args.test_to and args.min_unique > 0:
-        report = uniqueness_by_group(result.letters)
-        for group_id, (mean, lowest, pairs) in sorted(report.items()):
-            log(f"  уникальность писем группы {group_id}: в среднем {mean:.0f}% отличий, наименьшее {lowest:.0f}% "
-                f"(сравнено пар: {pairs}; порог {args.min_unique:g}%)")
-        if not composer.texts.variants and any(number > 1 for number in per_group.values()):
+    if not args.test_to and len(result.letters) > 1 and (args.min_unique > 0 or args.min_unique_subject > 0):
+        by_subject = args.stage == 1 and SUBJECT_SLOT in composer.texts.variants       # на этапах 2-3 тема из журнала
+        report = uniqueness_by_letter(result.letters)
+        checks = [("тексту", 0, args.min_unique)] + ([("теме", 2, args.min_unique_subject)] if by_subject else [])
+        parts = []
+        for label, column, threshold in checks:
+            lowest = weak_pairs(report, column, float("inf"))
+            if lowest:
+                diff, one, other = lowest[0]
+                parts.append(f"по {label} {diff:.0f}% (письма {one + 1} и {other + 1}; "
+                             + (f"порог {threshold:g}%)" if threshold > 0 else "без порога)"))
+        if parts:
+            log("  уникальность: наименьшая разница письма с любым другим письмом сборки " + ", ".join(parts) + ".")
+        if args.min_unique > 0 and not composer.texts.variants and any(number > 1 for number in per_group.values()):
             log("  внимание: в файле писем нет раздела «Варианты фраз», письма одной группы одинаковые (спам-признак). "
                 "Попросите агента outreach-write добавить варианты.")
-        weak = sorted(group_id for group_id, (mean, _, _) in report.items() if mean < args.min_unique)
-        if weak and composer.texts.variants:
-            log(f"Ошибка: письма группы {', '.join(weak)} слишком похожи друг на друга (порог {args.min_unique:g}% отличий): "
-                "почтовые сервисы считают такую рассылку спамом. Файл писем не создан. Нужно больше вариантов формулировок "
-                "(агент outreach-write, раздел «Варианты фраз»).")
+        failed = []
+        for label, column, threshold in checks:
+            weak = weak_pairs(report, column, threshold) if threshold > 0 else []
+            if weak and composer.texts.variants:                  # без раздела вариантов остаётся одно предупреждение
+                shown = "; ".join(f"{one + 1} и {other + 1} - {diff:.0f}%" for diff, one, other in weak[:MAX_WEAK_SHOWN])
+                more = f"; ещё пар: {len(weak) - MAX_WEAK_SHOWN}" if len(weak) > MAX_WEAK_SHOWN else ""
+                letters_below = sum(1 for row in report if row[column] is not None and row[column] < threshold)
+                failed.append(f"  по {label} (порог {threshold:g}%) ниже порога писем {letters_below}; пары (номера по порядку "
+                              f"в сборке): {shown}{more}")
+        if failed:
+            log("Ошибка: письма слишком похожи друг на друга (разница письма с другим письмом сборки ниже порога): "
+                "почтовые сервисы считают такую рассылку спамом. Файл писем не создан.")
+            for line in failed:
+                log(line)
+            log("Нужно больше вариантов формулировок и тем (агент outreach-write, раздел «Варианты фраз») или меньше писем "
+                "в партии (--limit).")
             return 1
     if args.preview:
         shown = set()
