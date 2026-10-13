@@ -2,7 +2,7 @@
 import json
 import os
 import re
-from datetime import timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # корень проекта, рядом с mailer.py
@@ -21,13 +21,35 @@ def check_email(address: str) -> bool:
     return bool(_EMAIL_RE.match(address))
 
 
-def read_stoplist(path: str) -> frozenset:
+_STOP_UNTIL = re.compile(r"(?:^|\s)до\s+(\S+)\s*$")           # «@yandex.ru @ya.ru до 2026-10-16» в конце строки
+_STOP_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def read_stoplist(path: str, today: date = None) -> frozenset:
     """Стоп-лист: адреса и домены целиком (@example.ru). Можно по одному в строке, можно несколько в строке через запятую,
-    точку с запятой или пробел; пустые строки и всё после # пропускаются."""
+    точку с запятой или пробел; пустые строки и всё после # пропускаются.
+    Срок: строка, оканчивающаяся на «до ГГГГ-ММ-ДД» (например «@yandex.ru до 2026-10-16»), действует по эту дату включительно
+    (по Москве), со следующего дня её записи пропадают сами; файл при этом не меняется. Строки без срока действуют всегда.
+    Непонятная дата после «до» - ValueError с номером строки: лучше остановиться, чем молча снять запрет или не понять срок."""
+    today = today or datetime.now(MSK).date()
     entries = set()
     with open(path, encoding="utf-8-sig") as fh:
-        for line in fh:
-            entries.update(part for part in re.split(r"[,;\s]+", line.split("#", 1)[0].lower()) if part)
+        for number, line in enumerate(fh, 1):
+            text = line.split("#", 1)[0].lower()
+            until = _STOP_UNTIL.search(text)
+            if until:
+                token = until.group(1)
+                try:
+                    last_day = date.fromisoformat(token) if _STOP_DAY.match(token) else None
+                except ValueError:
+                    last_day = None
+                if last_day is None:
+                    raise ValueError(f"в строке {number} после слова «до» нужна дата в виде ГГГГ-ММ-ДД "
+                                     "(например «@yandex.ru до 2026-10-16»)")
+                if today > last_day:
+                    continue                                     # срок вышел: записи этой строки больше не действуют
+                text = text[:until.start()]
+            entries.update(part for part in re.split(r"[,;\s]+", text) if part)
     return frozenset(entries)
 
 
