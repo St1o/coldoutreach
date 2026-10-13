@@ -1,11 +1,18 @@
+import contextlib
+import email
+import email.header
+import email.policy
+import io
 import json
 import os
+import random
+import re
 import smtplib
 import ssl
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import mailer
 from mailer import run
@@ -117,6 +124,80 @@ class BuildMessageTest(unittest.TestCase):
         raw = msg.as_bytes()
         raw.decode("ascii")                                    # на проводе только ASCII (base64 + RFC 2047)
         self.assertEqual(msg.get_content().strip(), "Добрый день!\nКак дела?")
+
+
+class SubjectTest(unittest.TestCase):
+    """Тема не теряет пробелы при переносе: Python 3.10-3.12 переносил её по пробелу и склеивал слова."""
+
+    @staticmethod
+    def on_the_wire(subject):
+        """Тема так, как её увидит получатель: письмо уходит тем же путём, что в smtplib (send_message), и читается обратно."""
+        class Capture(smtplib.SMTP):
+            def ehlo_or_helo_if_needed(self):
+                pass
+
+            def sendmail(self, from_addr, to_addrs, msg, *args, **kwargs):
+                self.wire = msg
+
+        server = Capture()
+        server.send_message(build_message(Letter("a@b.ru", subject, "Текст"), USER, unsubscribe=True))
+        modern = str(email.message_from_bytes(server.wire, policy=email.policy.default)["Subject"])
+        old = email.message_from_bytes(server.wire)["Subject"]             # старый разбор: перенос строки снимаем сами
+        old = re.sub(r"\r?\n", "", old)
+        old = str(email.header.make_header(email.header.decode_header(old[1:] if old.startswith(" ") else old)))
+        if subject.isascii():           # длинную ASCII-тему библиотека переносит после «Subject:»: лишний пробел в начале не в теме
+            modern = modern.strip()
+        assert modern == old, (modern, old)                                 # оба способа чтения дают одну тему
+        return modern, server.wire
+
+    def subjects(self):
+        """Темы разной длины и с разной длиной слов: на старых Python какие-то из них переносились ровно по пробелу."""
+        found = []
+        for word in ("рутина", "команду", "в", "процессов", "автоматизация", "ё", "Hello", "ИТ"):
+            for count in range(1, 16):
+                found.append(" ".join([word] * count))
+                found.append("Как освободить " + " ".join([word] * count) + " от рутины")
+        random.seed(2026)
+        words = "Как освободить команду разработчиков от рутины Заявки документы без ручной работы вашей компании ИТ 2026 «да»".split()
+        found += [" ".join(random.choice(words) for _ in range(random.randint(1, 12))) for _ in range(600)]
+        return found
+
+    def test_no_space_is_lost_on_folding(self):
+        for subject in self.subjects():
+            shown, _ = self.on_the_wire(subject)
+            self.assertEqual(shown, subject)
+
+    def test_header_lines_are_short_and_ascii(self):
+        for subject in self.subjects()[:300]:
+            _, wire = self.on_the_wire(subject)
+            head = wire.split(b"\r\n\r\n")[0].decode("ascii")                  # заголовки целиком только ASCII
+            self.assertTrue(all(len(line) <= 78 for line in head.split("\r\n")), subject)
+            self.assertNotIn("\n", head.replace("\r\n", ""))                    # переносы строк только CRLF
+
+    def test_edge_subjects(self):
+        for subject in ("Ё", " пробел в начале", "пробел в конце ", "два  пробела подряд", "Слово" * 40, "ёж " * 60,
+                        "Смесь Latin и русского слов тест, 12 штук: «да»!", "😀 эмодзи в теме"):
+            self.assertEqual(self.on_the_wire(subject)[0], subject)
+
+    def test_ascii_subject_is_left_as_it_was(self):
+        msg = build_message(Letter("a@b.ru", "Hello world", "Text"), USER)
+        self.assertEqual(msg["Subject"], "Hello world")
+        self.assertIn(b"Subject: Hello world", msg.as_bytes())
+        self.assertEqual(self.on_the_wire("Quarterly offer for your company, please read")[0],
+                         "Quarterly offer for your company, please read")
+
+    def test_other_headers_still_work(self):
+        msg = build_message(Letter("a@b.ru", "Что можно ускорить в вашей компании", "Текст"), USER, "Пётр Иванов", True)
+        raw = msg.as_bytes().decode("ascii")
+        self.assertEqual(str(msg["From"]).split("<")[-1], USER + ">")
+        self.assertIn(f"List-Unsubscribe: <mailto:{USER}?subject=unsubscribe>", raw)
+        self.assertIn("Message-ID:", raw)
+        self.assertEqual(msg.get_content().strip(), "Текст")
+
+    def test_line_breaks_in_the_subject_are_refused(self):
+        for subject in ("Тема\nвторая строка", "Subject\r\nBcc: x@y.ru", "Тема\rX"):
+            with self.assertRaises(ValueError):
+                build_message(Letter("a@b.ru", subject, "Текст"), USER)
 
 
 class RunTest(unittest.TestCase):
@@ -321,6 +402,48 @@ class StoplistTest(unittest.TestCase):
         self.assertTrue(cfg.is_stopped("BAD@mail.ru", stop))
         self.assertTrue(cfg.is_stopped("anyone@Registrar.ru", stop))
         self.assertFalse(cfg.is_stopped("good@mail.ru", stop))
+
+    def write_stoplist(self, text):
+        with open(self.path("stoplist.txt"), "w", encoding="utf-8-sig") as fh:
+            fh.write(text)
+        return self.path("stoplist.txt")
+
+    def test_entries_with_a_deadline_work_through_that_day_and_then_drop_out(self):
+        path = self.write_stoplist("# отписались\nbad@x.ru\n@Yandex.ru, @ya.ru  до 2026-10-16   # решение владельца\n"
+                                   "Other@X.ru ДО 2026-10-12\n")
+        before = cfg.read_stoplist(path, today=date(2026, 10, 13))
+        self.assertEqual(before, {"bad@x.ru", "@yandex.ru", "@ya.ru"})                  # «до» не попало в записи, other@x.ru вышел
+        self.assertTrue(cfg.is_stopped("Someone@YANDEX.ru", before))
+        self.assertEqual(cfg.read_stoplist(path, today=date(2026, 10, 16)), before)     # сам последний день ещё действует
+        self.assertEqual(cfg.read_stoplist(path, today=date(2026, 10, 17)), {"bad@x.ru"})
+        self.assertEqual(cfg.read_stoplist(path, today=date(2026, 10, 11)), before | {"other@x.ru"})
+        with open(path, encoding="utf-8-sig") as fh:
+            self.assertIn("до 2026-10-16", fh.read())                                    # файл программа не меняет
+
+    def test_deadline_defaults_to_todays_date_in_moscow(self):
+        path = self.write_stoplist("@old.ru до 2000-01-01\n@far.ru до 2999-12-31\n")
+        self.assertEqual(cfg.read_stoplist(path), {"@far.ru"})
+
+    def test_unclear_deadline_is_an_error_with_the_line_number(self):
+        for line in ("@yandex.ru до 16.10.2026", "@yandex.ru до завтра", "@yandex.ru до 2026-13-45", "@yandex.ru до 20261016"):
+            path = self.write_stoplist("ok@x.ru\n" + line + "\n")
+            with self.assertRaises(ValueError) as caught:
+                cfg.read_stoplist(path)
+            self.assertIn("строке 2", str(caught.exception))
+            self.assertNotIn(line.split()[-1], str(caught.exception))                   # введённый текст в сообщение не попадает
+        self.assertEqual(cfg.read_stoplist(self.write_stoplist("a@x.ru до\n")), {"a@x.ru", "до"})     # без даты это просто слова, как раньше
+
+    def test_main_stops_on_an_unclear_deadline_instead_of_ignoring_the_line(self):
+        t = TempTable(table("a@b.ru;Т;Х"))
+        self.addCleanup(t.close)
+        with open(os.path.join(os.path.dirname(t.path), "stoplist.txt"), "w", encoding="utf-8") as fh:
+            fh.write("@yandex.ru до послезавтра\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = mailer.main([t.path, "--send", "--env", os.path.join(self.dir.name, "нет.env")])
+        self.assertEqual(code, 1)
+        self.assertIn("не удалось прочитать стоп-лист", out.getvalue())
+        self.assertIn("строке 1", out.getvalue())
 
     def test_stopped_addresses_are_skipped_but_not_marked_as_handled(self):
         logs, server = [], FakeServer()

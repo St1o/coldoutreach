@@ -1,5 +1,7 @@
 """Отправка по SMTP mail.ru: письмо, защищённое соединение, одно соединение на весь запуск."""
+import base64
 import os
+import re
 import smtplib
 import socket
 import ssl
@@ -14,13 +16,43 @@ SMTP_HOST = "smtp.mail.ru"
 SMTP_PORT = 465                 # SSL; на 587 используется STARTTLS
 CONNECT_ATTEMPTS = 3            # попыток установить соединение подряд, когда его оборвали до логина (рассылка)
 CONNECT_PAUSE = 8.0             # пауза перед второй попыткой, перед третьей вдвое дольше
+SUBJECT_WORD_MAX = 69           # знаков в одном куске темы (RFC 2047): вместе с «Subject: » строка не длиннее 78
+
+
+def _subject_word(text: str) -> str:
+    return "=?utf-8?b?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
+
+
+def encode_subject(subject: str) -> str:
+    """Тема для заголовка Subject, русский текст кусками по RFC 2047, не длиннее SUBJECT_WORD_MAX знаков каждый.
+    Пробел после слова остаётся внутри куска: пробел между соседними кусками почтовые программы при чтении выбрасывают.
+    Стандартная библиотека Python 3.10-3.12 переносит тему именно по пробелу и теряет его («командуразработчиков»),
+    поэтому тему сворачиваем сами; ASCII-тема остаётся как есть."""
+    if "\r" in subject or "\n" in subject:
+        raise ValueError("Header values may not contain linefeed or carriage return characters")
+    if subject.isascii():
+        return subject
+    pieces, current = [], ""
+    for token in re.findall(r"\S+\s*|\s+", subject):                  # слово вместе с пробелами после него
+        for part in ([token] if len(_subject_word(token)) <= SUBJECT_WORD_MAX else list(token)):   # длинное слово - по буквам
+            if current and len(_subject_word(current + part)) > SUBJECT_WORD_MAX:
+                pieces.append(current)
+                current = part
+            else:
+                current += part
+    pieces.append(current)
+    return "\n ".join(_subject_word(piece) for piece in pieces)
 
 
 def build_message(letter: Letter, sender: str, from_name: str = "", unsubscribe: bool = False) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = formataddr((from_name, sender)) if from_name else sender
     msg["To"] = letter.email
-    msg["Subject"] = letter.subject
+    if letter.subject.isascii():
+        msg["Subject"] = letter.subject
+    else:                       # готовую строку заголовка библиотека не пересобирает (иначе снова потеряет пробел)
+        msg.policy = msg.policy.clone(refold_source="none")
+        msg.set_raw("Subject", encode_subject(letter.subject))
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1])
     if unsubscribe:             # почтовые программы показывают кнопку «отписаться»; письмо придёт в наш ящик
