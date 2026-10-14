@@ -8,3 +8,7 @@ compose.PUBLIC_DOMAINS = compose.PUBLIC_DOMAINS | {"x.ru"}
 # Копия письма в «Отправленные» по IMAP в тестах не нужна и настоящего imap.mail.ru они трогать не должны: по умолчанию выключена.
 # Тесты копии (test_sentcopy.py) включают её сами и подставляют поддельное IMAP-соединение.
 os.environ.setdefault("SAVE_SENT_COPY", "0")
+
+# Проверка MX почтовых доменов (compose.py) в тестах ходить в настоящий DNS не должна: по умолчанию выключена. Тесты проверки
+# (test_mx.py, test_mx_compose.py) подставляют поддельный DNS сами.
+os.environ.setdefault("CHECK_MX", "0")

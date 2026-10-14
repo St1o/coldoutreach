@@ -162,6 +162,13 @@ def resolve_sent_copy(environ=None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "нет")
 
 
+def resolve_check_mx(environ=None) -> bool:
+    """Проверять ли MX почтовых доменов при сборке писем (адреса на серверах Яндекса не пишем): CHECK_MX в local.env, по
+    умолчанию да; 0 - выключить (тогда такие адреса вносят в стоп-лист вручную)."""
+    raw = (environ if environ is not None else os.environ).get("CHECK_MX", "")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off", "нет")
+
+
 def resolve_imap(environ=None):
     """(хост, порт) IMAP mail.ru: MAILRU_IMAP_HOST и MAILRU_IMAP_PORT из local.env, иначе imap.mail.ru и 993.
     Неверное значение - ValueError с понятным текстом (отправку оно не останавливает: см. mailing/sentcopy.py)."""
