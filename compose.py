@@ -41,7 +41,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from mailing import config, forms, journal
+from mailing import atomic, config, forms, journal
 from mailing.forms import DEFAULT_FORMS, KNOWN_FORMS, OTHER_FORM      # формы организаций: общие с /leads
 from mailing.agentmd import (
     EXCLUDE_ID, FALLBACK_ID, SUBJECT_SLOT, TIME_TAGS, ComposeError, Texts, _key, check_texts, okved_digits,
@@ -537,7 +537,7 @@ def write_okved_report(folder: str, composer: Composer, unmapped: Counter, unkno
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
     return path
 
 
@@ -602,7 +602,7 @@ def write_letters(path: str, letters: list) -> None:
         writer = csv.writer(fh, delimiter=";")
         writer.writerow(OUT_FIELDS)
         writer.writerows(letters)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def project_root(letters_path: str):

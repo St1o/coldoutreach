@@ -34,7 +34,7 @@ from checko_api import (
 from checko_updates import CheckoBlocked, CheckoClient, CheckoError
 from egrul_inn_search import EgrulCaptchaRequired, EgrulClient, EgrulError
 from egrul_pdf import ExtractError, parse_extract, pdf_to_text
-from mailing import journal
+from mailing import atomic, journal
 
 STAGE_COLUMNS = ["Первое письмо", "Дожим", "Закрывающее"]     # в таблице «да» или «нет»: ушло ли письмо этого этапа
 YES, NO = "да", "нет"
@@ -141,7 +141,7 @@ def _write_atomic(path: str, write) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".part"
     write(tmp)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def load_state(path: str) -> dict:
