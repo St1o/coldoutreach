@@ -69,20 +69,32 @@ PUBLIC_DOMAINS = frozenset("""
 MIN_UNIQUE = 25.0           # наименьшая разница письма с любым другим письмом сборки по тексту, % (--min-unique; 0 - не проверять)
 MIN_UNIQUE_SUBJECT = 25.0   # то же по теме, % (--min-unique-subject; 0 - не проверять)
 MAX_WEAK_SHOWN = 5          # сколько пар названо в сообщении, если письма слишком похожи
-_LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle)/\S*")
+_LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle|vk\.cc)/\S*")
+_VK_SHORT_LINK = re.compile(r"https://vk\.cc/[A-Za-z0-9]+")     # короткая ссылка vk.cc на нашу Google Форму (счёт переходов)
+_LINK_TAIL = ".,;:!?)»\"'"                                       # знаки после ссылки в тексте письма, не часть ссылки
 _EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 
 
 # --- значения и подстановка ------------------------------------------------------------------------------
 
+def is_vk_short_link(link: str) -> bool:
+    return bool(_VK_SHORT_LINK.fullmatch((link or "").strip()))
+
+
 def check_link(link: str) -> str:
+    """Ссылка на опрос: полная https://docs.google.com/forms/… или короткая https://vk.cc/<буквы и цифры> (решение
+    владельца 2026-10-14: vk.cc ведёт на нашу Google Форму и считает переходы). Другие сокращатели - ошибка."""
     link = (link or "").strip()
     if not link:
         raise ComposeError("не задана ссылка на опрос (--link или SURVEY_LINK в local.env): письма без неё не отправляем")
+    if is_vk_short_link(link):
+        return link
     if "forms.gle" in link:
-        raise ComposeError("ссылка forms.gle - сокращённая, это спам-признак: нужна полная docs.google.com/forms/…")
+        raise ComposeError("ссылка forms.gle - сокращённая, это спам-признак: нужна полная docs.google.com/forms/… "
+                           "или короткая https://vk.cc/…")
     if not link.startswith("https://docs.google.com/forms/") or re.search(r"\s", link):
-        raise ComposeError("ссылка на опрос должна быть полной и начинаться с https://docs.google.com/forms/")
+        raise ComposeError("ссылка на опрос должна быть полной и начинаться с https://docs.google.com/forms/ "
+                           "или короткой https://vk.cc/… (другие сокращатели, например bit.ly, не принимаем)")
     if re.search(r"/edit\b", link):
         raise ComposeError("это ссылка редактирования формы; нужна ссылка для заполнения (…/viewform)")
     return link
@@ -160,8 +172,11 @@ def fill(template: str, values: dict, slots: dict = None) -> str:
     if "{{" in text or "}}" in text:
         raise ComposeError("в письме остались незаполненные подстановки {{…}}")
     links = _LINK.findall(text)
-    if len(links) != 1 or "docs.google.com/forms/" not in links[0]:
-        raise ComposeError(f"в письме должна быть ровно одна ссылка на docs.google.com/forms/, найдено: {len(links)}")
+    if len(links) != 1:
+        raise ComposeError(f"в письме должна быть ровно одна ссылка (на опрос), найдено: {len(links)}")
+    if links[0].rstrip(_LINK_TAIL) != values.get("ссылка_на_опрос", ""):
+        raise ComposeError("в письме ссылка не совпадает со ссылкой на опрос (--link или SURVEY_LINK): "
+                           "посторонняя ссылка в тексте шаблона")
     return text
 
 
@@ -621,7 +636,7 @@ def main(argv=None, today=None, log=print) -> int:
                         help="файл сегмента (01-Segment/output/….md): таблица групп ОКВЭД, или OUTREACH_SEGMENT")
     parser.add_argument("--stage", type=int, choices=(1, 2, 3), default=1,
                         help="1 - первое письмо, 2 - дожим, 3 - закрывающее (по умолчанию 1)")
-    parser.add_argument("--link", default="", help="полная ссылка на опрос docs.google.com/forms/… (или SURVEY_LINK)")
+    parser.add_argument("--link", default="", help="ссылка на опрос: полная docs.google.com/forms/… или короткая https://vk.cc/… (или SURVEY_LINK)")
     parser.add_argument("--signature", default="",
                         help="подпись (или MAIL_SIGNATURE); нужна, только если в шаблонах есть {{подпись}}")
     parser.add_argument("--subject", type=int, default=0, help="номер темы из файла писем (по умолчанию рекомендованная)")
@@ -786,6 +801,8 @@ def main(argv=None, today=None, log=print) -> int:
                 "в партии (--limit).")
             return 1
     if args.preview:
+        if is_vk_short_link(composer.link):
+            log("ссылка на опрос: короткая vk.cc (спам-признак, следить за недоставленными)")
         shown = set()
         for letter in result.letters:
             if letter[3] not in shown:

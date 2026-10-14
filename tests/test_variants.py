@@ -303,7 +303,7 @@ class FillingTest(unittest.TestCase):
             self.assertNotIn("вид деятельности", text)
             self.assertNotIn("сфера деятельности", text)
             self.assertNotIn("сфера", text)
-            self.assertEqual(text.count("docs.google.com/forms/"), 1)
+            self.assertEqual(text.count(LINK), 1)
 
     def test_the_words_of_a_group_come_into_the_variants(self):
         comp = composer(now=datetime(2026, 10, 12, 14, 0))

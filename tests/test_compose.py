@@ -15,6 +15,7 @@ from mailing import table as lettertable
 from compose import ComposeError
 
 LINK = "https://docs.google.com/forms/d/e/ABC123/viewform"
+VK_LINK = "https://vk.cc/d2TjQx"                  # короткая ссылка на нашу Google Форму (решение владельца 2026-10-14)
 SIGNATURE = "Анна, руководитель"
 
 # Тексты ниже вымышлены, но устроены так же, как файлы агентов (Рассылка/01-Segment, Рассылка/02-Write).
@@ -191,10 +192,26 @@ class ParseLettersTest(unittest.TestCase):
 class ValuesAndFillTest(unittest.TestCase):
     def test_link_rules(self):
         self.assertEqual(compose.check_link(" " + LINK + " "), LINK)
-        for bad in ["", "https://forms.gle/abc", "https://example.com/forms/x",
-                    "https://docs.google.com/forms/d/ABC/edit", "https://docs.google.com/forms/d/e/A B"]:
+        for bad in ["", "https://forms.gle/abc", "https://example.com/forms/x", "https://bit.ly/3abcDE",
+                    "https://tinyurl.com/abc", "https://clck.ru/abc", "https://docs.google.com/forms/d/ABC/edit",
+                    "https://docs.google.com/forms/d/e/A B"]:
             with self.assertRaises(ComposeError, msg=bad):
                 compose.check_link(bad)
+
+    def test_vk_short_link_is_accepted_and_only_in_its_plain_form(self):
+        self.assertEqual(compose.check_link(VK_LINK), VK_LINK)
+        self.assertEqual(compose.check_link(" " + VK_LINK + "\n"), VK_LINK)
+        for bad in ["http://vk.cc/d2TjQx", "https://vk.cc/", "https://vk.cc/d2Tj Qx", "https://vk.cc/d2TjQx/x",
+                    "https://vk.cc/d2Tj-Qx", "https://vk.com/d2TjQx", "https://evil.vk.cc/d2TjQx",
+                    "https://vk.cc.example.com/d2TjQx", "vk.cc/d2TjQx"]:
+            with self.assertRaises(ComposeError, msg=bad):
+                compose.check_link(bad)
+
+    def test_rejected_short_links_are_explained(self):
+        for bad in ("https://forms.gle/abc", "https://bit.ly/3abcDE"):
+            with self.assertRaises(ComposeError) as ctx:
+                compose.check_link(bad)
+            self.assertIn("vk.cc", str(ctx.exception))
 
     def test_signature_rules(self):
         self.assertEqual(compose.check_signature("Анна\\nруководитель"), "Анна\nруководитель")
@@ -245,6 +262,36 @@ class ValuesAndFillTest(unittest.TestCase):
         with self.assertRaises(ComposeError) as ctx:
             composer.letter_text(1, "12")
         self.assertIn("ровно одна ссылка", str(ctx.exception))
+
+    def test_a_letter_must_have_exactly_the_survey_link(self):
+        for link in (LINK, VK_LINK):
+            composer = make_composer(link=link)
+            self.assertEqual(composer.letter_text(1, "1").count(link), 1)
+            composer.texts.templates[1] += "\nА ещё https://vk.cc/Zz9" if link == LINK else "\nА ещё " + LINK
+            with self.assertRaises(ComposeError) as ctx:
+                composer.letter_text(1, "1")
+            self.assertIn("ровно одна ссылка", str(ctx.exception))
+            self.assertIn("найдено: 2", str(ctx.exception))
+
+    def test_a_foreign_link_instead_of_the_survey_link_is_an_error(self):
+        composer = make_composer(link=VK_LINK)
+        composer.texts.templates[1] = composer.texts.templates[1].replace("{{ссылка_на_опрос}}", LINK)
+        with self.assertRaises(ComposeError) as ctx:
+            composer.letter_text(1, "1")
+        self.assertIn("не совпадает", str(ctx.exception))
+
+    def test_a_dot_after_the_survey_link_is_not_part_of_it(self):
+        for link in (LINK, VK_LINK):
+            composer = make_composer(link=link)
+            composer.texts.templates[1] = composer.texts.templates[1].replace("{{ссылка_на_опрос}}", "{{ссылка_на_опрос}}.")
+            self.assertIn(link + ".", composer.letter_text(1, "1"))
+
+    def test_a_bare_vk_cc_address_counts_as_a_link(self):
+        composer = make_composer(link=VK_LINK)
+        composer.texts.templates[1] += "\nили vk.cc/abc"
+        with self.assertRaises(ComposeError) as ctx:
+            composer.letter_text(1, "1")
+        self.assertIn("найдено: 2", str(ctx.exception))
 
 
 class FirstLetterTest(unittest.TestCase):
@@ -542,6 +589,30 @@ class MainTest(unittest.TestCase):
         self.assertEqual({l.subject for l in letters}, {"Вторая тема"})
         self.assertIn("пример, группа 1", self.output())
         self.assertNotIn("a@x.ru", self.output().split("Файл:")[0])           # адресов на экране нет
+        self.assertNotIn("vk.cc", self.output())                              # полная ссылка: предупреждения нет
+
+    def test_preview_warns_about_the_short_vk_link(self):
+        self.logs.clear()
+        code = compose.main([self.leads, "--letters", self.letters, "--segment", self.segment, "--env", self.nowhere,
+                             "--link", VK_LINK, "--signature", SIGNATURE, "--preview"], log=self.logs.append)
+        self.assertEqual(code, 0)
+        self.assertIn("ссылка на опрос: короткая vk.cc (спам-признак, следить за недоставленными)", self.output())
+        letters, _ = lettertable.read_letters(os.path.join(self.work, "letters_1.csv"))
+        self.assertTrue(all(letter.body.count(VK_LINK) == 1 for letter in letters))
+
+    def test_the_short_vk_link_without_preview_builds_letters_quietly(self):
+        code = compose.main([self.leads, "--letters", self.letters, "--segment", self.segment, "--env", self.nowhere,
+                             "--link", VK_LINK, "--signature", SIGNATURE], log=self.logs.append)
+        self.assertEqual(code, 0)
+        self.assertNotIn("спам-признак", self.output())
+
+    def test_forms_gle_and_bit_ly_give_no_file(self):
+        for bad in ("https://forms.gle/abc", "https://bit.ly/3abcDE"):
+            self.logs.clear()
+            code = compose.main([self.leads, "--letters", self.letters, "--segment", self.segment,
+                                 "--env", self.nowhere, "--link", bad, "--signature", SIGNATURE], log=self.logs.append)
+            self.assertEqual(code, 1, bad)
+            self.assertFalse(os.path.exists(os.path.join(self.work, "letters_1.csv")))
 
     def test_test_mode_does_not_read_the_table(self):
         code = self.go("--test-to", "me@x.ru,me2@x.ru", leads=os.path.join(self.work, "нет.csv"))
