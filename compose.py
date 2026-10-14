@@ -14,6 +14,9 @@
 двум знакам ОКВЭД (таблица групп в файле сегмента), запасная группа 12 - для неизвестного. Только адреса из ЕГРЮЛ,
 без повторов, стоп-листа и ответивших на опрос. Нет ссылки на форму (и подписи, если в шаблоне есть {{подпись}}),
 остались {{…}} или больше одной ссылки - письма не собираются. Этапы 2 и 3 строятся по журналам отправки.
+Почта на серверах Яндекса (MX mx.yandex.* у домена, даже своего) не пишется никогда (решение владельца 2026-10-14): домены,
+кроме бесплатных публичных (mail.ru-группа, gmail.com и т. п.), проверяются по DNS, ответ хранится в mx_cache.json в папке
+данных сутки; сбой DNS - домен «не проверен», его адреса пропускаются. Выключить: CHECK_MX=0 или --no-mx-check.
 Ссылка, подпись и пути к файлам агентов берутся из local.env: SURVEY_LINK, MAIL_SIGNATURE, OUTREACH_LETTERS,
 OUTREACH_SEGMENT (ключи командной строки главнее).
 
@@ -41,7 +44,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from mailing import atomic, config, forms, journal
+from mailing import atomic, config, forms, journal, mx
 from mailing.forms import DEFAULT_FORMS, KNOWN_FORMS, OTHER_FORM      # формы организаций: общие с /leads
 from mailing.agentmd import (
     EXCLUDE_ID, FALLBACK_ID, SUBJECT_SLOT, TIME_TAGS, ComposeError, Texts, _key, check_texts, okved_digits,
@@ -72,6 +75,8 @@ MAX_WEAK_SHOWN = 5          # сколько пар названо в сообщ
 _LINK = re.compile(r"https?://\S+|(?:docs\.google\.com|forms\.gle|vk\.cc)/\S*")
 _VK_SHORT_LINK = re.compile(r"https://vk\.cc/[A-Za-z0-9]+")     # короткая ссылка vk.cc на нашу Google Форму (счёт переходов)
 _LINK_TAIL = ".,;:!?)»\"'"                                       # знаки после ссылки в тексте письма, не часть ссылки
+YANDEX_REASON = "почта на серверах Яндекса (вечный блок владельца 2026-10-14)"
+MX_UNCHECKED_REASON = "домен почты не проверен на Яндекс (сбой DNS): письмо не собираем, пока домен не проверен"
 _EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
 
 
@@ -394,8 +399,21 @@ class Result:
     unknown_forms: Counter = field(default_factory=Counter)  # форма организации без решения агента -> компаний
 
 
+def mx_blocked(checker, domain: str, result: Result) -> bool:
+    """Почта домена на серверах Яндекса (по MX) или домен не удалось проверить -> записывает причину пропуска, True. Бесплатные
+    публичные почты (mail.ru-группа, gmail.com и др. из PUBLIC_DOMAINS) по MX не проверяются."""
+    if checker is None or domain in PUBLIC_DOMAINS:
+        return False
+    verdict = checker.status(domain)
+    if verdict == mx.YANDEX:
+        result.skipped[YANDEX_REASON] += 1
+    elif verdict == mx.UNCHECKED:
+        result.skipped[MX_UNCHECKED_REASON] += 1
+    return verdict != mx.CLEAN
+
+
 def compose_first(composer: Composer, leads: list, subject: str, folder: str, stoplist, responded,
-                  limit: int = 0) -> Result:
+                  limit: int = 0, checker=None) -> Result:
     result = Result()
     handled = set()
     for stage in (1, 2, 3):
@@ -426,6 +444,8 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
             result.skipped["в стоп-листе"] += 1
         elif address in responded:
             result.skipped["уже заполнил опрос"] += 1
+        elif mx_blocked(None if limit and len(result.letters) >= limit else checker, domain, result):
+            pass                                  # партия уже набрана: дальше по DNS не спрашиваем, лишние письма отсекутся
         else:
             group_id = composer.group_for(lead["okved"])
             if composer.decision(lead["okved"]) is None:
@@ -452,7 +472,7 @@ def compose_first(composer: Composer, leads: list, subject: str, folder: str, st
 
 
 def compose_next(composer: Composer, stage: int, folder: str, stoplist, responded, today: date,
-                 min_days: int = 0) -> Result:
+                 min_days: int = 0, checker=None) -> Result:
     """Этап 2 или 3 по журналам предыдущих этапов."""
     result = Result()
     previous = journal.load_state(journal_path(folder, stage - 1))
@@ -482,6 +502,8 @@ def compose_next(composer: Composer, stage: int, folder: str, stoplist, responde
             continue
         if address in responded:
             result.skipped["заполнил опрос"] += 1
+            continue
+        if mx_blocked(checker, address.rsplit("@", 1)[-1], result):
             continue
         meta, subject = entry.get("meta", {}), entry.get("subject", "")
         group_id = meta.get("Группа", "")
@@ -625,7 +647,7 @@ def inside(folder: str, root: str) -> bool:
         return False
 
 
-def main(argv=None, today=None, log=print) -> int:
+def main(argv=None, today=None, log=print, mx_lookup=None) -> int:
     parser = argparse.ArgumentParser(description="Сборка писем рассылки из таблицы /leads и текстов агентов")
     parser.add_argument("leads", help="таблица leads_<дата>.csv или папка данных (тогда все таблицы leads_<дата>.csv в ней); "
                                       "рядом лежат и появляются остальные файлы партии")
@@ -664,6 +686,9 @@ def main(argv=None, today=None, log=print) -> int:
     parser.add_argument("--preview", action="store_true", help="показать по одному примеру письма на группу")
     parser.add_argument("--test-to", default="",
                         help="адреса через запятую: собрать letters_test.csv с пробными письмами им (таблица не читается)")
+    parser.add_argument("--no-mx-check", action="store_true",
+                        help="не проверять MX почтовых доменов (по умолчанию адреса на серверах Яндекса пропускаются; "
+                             "то же CHECK_MX=0 в local.env)")
     parser.add_argument("--env", default=config.ENV_FILE, help="файл local.env")
     args = parser.parse_args(argv)
 
@@ -707,6 +732,9 @@ def main(argv=None, today=None, log=print) -> int:
             raise ComposeError(f"нет файла стоп-листа {stop_path}")
         responded = read_responded(resp_path) if (args.responded or os.path.exists(resp_path)) else frozenset()
         when = today or date.today()
+        checker = None
+        if not args.test_to and not args.no_mx_check and (mx_lookup is not None or config.resolve_check_mx()):
+            checker = mx.MxChecker(folder, mx_lookup)          # пробные письма своим ящикам не проверяем
 
         tables_note = ""
         if args.test_to:
@@ -723,10 +751,10 @@ def main(argv=None, today=None, log=print) -> int:
                                + (f" Пропущены без колонок ОКВЭД и источника почты: {', '.join(skipped)}." if skipped else ""))
             else:
                 leads, tables_note = read_leads(args.leads), ""
-            result = compose_first(composer, leads, subject, folder, stoplist, responded, args.limit)
+            result = compose_first(composer, leads, subject, folder, stoplist, responded, args.limit, checker)
             out = os.path.join(folder, "letters_1.csv")
         else:
-            result = compose_next(composer, args.stage, folder, stoplist, responded, when, args.min_days)
+            result = compose_next(composer, args.stage, folder, stoplist, responded, when, args.min_days, checker)
             out = os.path.join(folder, f"letters_{args.stage}.csv")
     except (ComposeError, OSError, ValueError) as exc:
         log(f"Ошибка: {getattr(exc, 'strerror', None) or exc}")
@@ -740,6 +768,17 @@ def main(argv=None, today=None, log=print) -> int:
         log(tables_note)
     for reason, number in result.skipped.most_common():
         log(f"  пропущено: {reason} - {number}")
+    if checker is not None:
+        checker.save()
+        log(f"  проверено MX доменов: {checker.checked}, на Яндексе: {checker.count(mx.YANDEX)}")
+        failed = checker.count(mx.UNCHECKED)
+        if failed:
+            log(f"  внимание: MX не удалось проверить у доменов: {failed} ({checker.cause}). Их адреса пропущены и не "
+                "отправляются, пока домен не проверен: повторите сборку позже. Если DNS недоступен постоянно, впишите "
+                "в local.env свои серверы DNS (MX_DNS_SERVERS=8.8.8.8) или выключите проверку (CHECK_MX=0) и вносите "
+                "адреса на Яндексе в стоп-лист вручную.")
+    elif not args.test_to:
+        log("  проверка MX выключена (CHECK_MX=0 или --no-mx-check): адреса на серверах Яндекса вносите в стоп-лист вручную")
     for group_id, number in sorted(result.unwritten.items()):
         log(f"  не собрано: для группы {group_id} «{names[group_id]}» ещё нет блока боли - {number} "
             "(напишите его или добавьте --include-unwritten)")
