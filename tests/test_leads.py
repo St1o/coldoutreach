@@ -121,6 +121,22 @@ class LeadsTest(LeadsCase):
         statuses = {inn: e["status"] for inn, e in self.state().items()}
         self.assertEqual(statuses, {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
 
+    def test_a_file_read_by_the_page_at_that_moment_does_not_stop_the_run(self):
+        # Windows: os.replace падает с WinError 5, пока страница читает служебный файл при опросе состояния
+        real, failed = os.replace, {}
+
+        def busy(src, dst):
+            failed[dst] = failed.get(dst, 0) + 1
+            if failed[dst] <= 2:
+                raise PermissionError(5, "Отказано в доступе")
+            real(src, dst)
+
+        with mock.patch("os.replace", busy):
+            self.assertEqual(self.run_leads(self.standard_egrul()), 0)
+        self.assertEqual({inn: e["status"] for inn, e in self.state().items()},
+                         {A: leads.OK, B: leads.NO_EMAIL, C: leads.RETRY})
+        self.assertTrue(self.read_csv())
+
     # ---- колонки «Первое письмо», «Дожим», «Закрывающее» ----
 
     def save_journal(self, stage, state):

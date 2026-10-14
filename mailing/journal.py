@@ -7,6 +7,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from . import atomic
 from .config import MSK
 
 
@@ -32,7 +33,7 @@ def save_state(path: str, state: dict) -> None:
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def entry_mailbox(entry: dict) -> str:

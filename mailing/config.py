@@ -4,6 +4,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from . import atomic
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # корень проекта, рядом с mailer.py
 MSK = timezone(timedelta(hours=3))                                        # «сутки» прогрева считаем по Москве, как и в mail_service
@@ -102,7 +103,7 @@ def save_settings(values: dict, path: str = "") -> None:
     tmp = path + ".part"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(values, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def parse_daily_limit(raw) -> int:
