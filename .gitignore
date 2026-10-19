@@ -20,3 +20,6 @@ local.env
 venv/
 # результат диагностики связи с Checko: адреса и имена сетевых карт этого компьютера
 check_checko.txt
+# результат проверки входа в mail.ru (check_login.py): маски адресов и время попыток этого компьютера
+check_login.txt
+check_login.json
