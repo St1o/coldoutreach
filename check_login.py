@@ -196,9 +196,12 @@ def python_processes() -> list:
     return rows
 
 
-def override_findings(file_values: dict, project: str, mtime: float, say, scan_files=True, processes=python_processes) -> list:
-    """Что может перекрывать local.env. scan_files=False пропускает поиск по .idea и соседним папкам (тесты)."""
-    problems = []
+def override_findings(file_values: dict, project: str, mtime: float, say, scan_files=True, processes=python_processes) -> tuple:
+    """Что может перекрывать local.env: (problems, warnings). problems - то, что видит ЭТОТ процесс (переменные окружения):
+    оно влияет на вход, который проверка делает ниже. warnings - то, что касается других процессов (настройки запуска PyCharm,
+    другие копии программы, сайт или терминал, запущенные до правки файла): проверка читает свежий файл, поэтому на её вход они не
+    влияют, но рассылка из тех мест возьмёт старые значения. scan_files=False пропускает поиск по .idea и соседним папкам (тесты)."""
+    problems, warnings = [], []
     watched = sorted(k for k in os.environ if k.upper().startswith(("MAIL", "SMTP")))
     say(f"Переменные окружения этого процесса на MAIL*/SMTP*: {len(watched)}")
     for name in watched:
@@ -226,7 +229,8 @@ def override_findings(file_values: dict, project: str, mtime: float, say, scan_f
                     same = file_values.get(name) == value
                     say(f"В настройках запуска PyCharm ({fname}) задана {name}; совпадает с local.env: {yn(same)}")
                     if not same:
-                        problems.append(f"{name} задана в настройках запуска PyCharm ({fname}) и отличается от local.env")
+                        warnings.append(f"{name} задана в настройках запуска PyCharm ({fname}) и отличается от local.env: "
+                                        "программа, запущенная этой настройкой, возьмёт её значение")
 
     parent = os.path.dirname(os.path.abspath(project))
     others = []
@@ -238,7 +242,7 @@ def override_findings(file_values: dict, project: str, mtime: float, say, scan_f
         if "mailer.py" in files and os.path.abspath(root) != os.path.abspath(project):
             others.append(os.path.relpath(root, parent))
     if others:
-        problems.append("есть другие копии программы (" + ", ".join(others[:5]) + "): mailer.py оттуда читает СВОЙ local.env, "
+        warnings.append("есть другие копии программы (" + ", ".join(others[:5]) + "): mailer.py оттуда читает СВОЙ local.env, "
                         "а не этот; запускали ли вы рассылку оттуда?")
     if scan_files:
         say(f"Другие копии mailer.py рядом (поиск в {parent}, до 3 уровней): {len(others)}")
@@ -248,9 +252,9 @@ def override_findings(file_values: dict, project: str, mtime: float, say, scan_f
         if pid == os.getpid() or not found:
             continue
         if start is not None and start < mtime - 1:
-            problems.append(f"процесс {pid} ({found.group(0)}) запущен ДО последнего сохранения local.env и держит старые "
+            warnings.append(f"процесс {pid} ({found.group(0)}) запущен ДО последнего сохранения local.env и держит старые "
                             "значения: остановите его (для сайта красный квадрат в PyCharm) и запустите заново")
-    return problems
+    return problems, warnings
 
 
 # ---------------------------------------------------------------- вход ----
@@ -321,12 +325,17 @@ def login_once(box, port, connect, ledger, ledger_path, again, clock, say) -> st
                 pass
 
 
-def verdict(problems: list, results: dict) -> list:
-    """Итог простыми словами по найденным замечаниям и результатам входа {номер ящика: ok/auth/conn/skipped}."""
+def verdict(problems: list, results: dict, warnings=()) -> list:
+    """Итог простыми словами: замечания, которые влияют на вход этой проверки (problems), предупреждения о других процессах
+    (warnings) и результаты входа {номер ящика: ok/auth/conn/skipped}."""
     lines = []
     if problems:
-        lines.append(f"Найдено замечаний к настройке: {len(problems)} (список выше, ЧИНИТЕ ИХ ПЕРВЫМИ: они объясняют отказ без "
-                     "всякой вины mail.ru).")
+        lines.append(f"Найдено замечаний к настройке: {len(problems)} (отмечены знаком ! выше). Они действуют и на вход этой "
+                     "проверки, поэтому чините их первыми: без них отказ мог бы пропасть.")
+    if warnings:
+        lines.append(f"Предупреждений о других процессах: {len(warnings)} (знак ~ выше). На вход этой проверки они НЕ влияют "
+                     "(она читает свежий local.env), и объяснить отказ ими нельзя. Но сайт или терминал со старыми значениями "
+                     "отправят с ними: перезапустите их.")
     control, main = results.get(CONTROL), results.get(MAIN)
     if "conn" in results.values():
         lines.append("До проверки пароля не дошло: сбой связи или шифрования. Запустите check_cert.py.")
@@ -334,9 +343,12 @@ def verdict(problems: list, results: dict) -> list:
         lines.append("Оба входа приняты: данные верные. Если рассылка всё равно падает, её запускает процесс со СТАРЫМИ значениями "
                      "(сайт или окно терминала): остановите сайт, закройте терминалы и запустите заново.")
     elif control == "ok" and main == "auth":
-        lines.append("Ящик 2 принят, ящик 1 отклонён: дело в данных или состоянии ящика 1. На mail.ru: тот ли аккаунт; есть ли у "
-                     "пароля приложения доступ «Почтовые программы» (IMAP/SMTP); создайте новый пароль приложения; нет ли "
-                     "ограничения после блокировки. Если замечаний выше нет, это сторона mail.ru.")
+        lines.append("Ящик 2 принят, ящик 1 отклонён тем же способом, с той же связью и шифрованием: программа и сеть исправны, "
+                     "дело в пароле или состоянии ящика 1. "
+                     + ("Формат значения и перекрытия в порядке, значит причина на стороне mail.ru: " if not problems
+                        else "Сначала исправьте замечания выше, а если они не помогут, причина на стороне mail.ru: ")
+                     + "пароль приложения создан в другом аккаунте, аннулирован, или у него нет доступа «Почтовые программы» "
+                     "(IMAP/SMTP), либо ящик ещё в ограничении после блокировки.")
     elif control == "auth":
         lines.append("Контрольный ящик 2 тоже отклонён: причина общая (окружение, код, правило mail.ru), а не в ящике 1. "
                      "Ящик 1 не пробовался.")
@@ -356,7 +368,7 @@ def run(env_path=config.ENV_FILE, project=HERE, login=True, again=False, ledger_
     say(f"Проверка входа в mail.ru, {datetime.datetime.now():%Y-%m-%d %H:%M:%S}. Python {sys.version.split()[0]}, "
         f"{ssl.OPENSSL_VERSION}, {sys.platform}. Письма не отправляются.")
     say(f"local.env, который читает mailer.py: {env_path}")
-    keys, problems = watched_keys(), []
+    keys, problems, warnings = watched_keys(), [], []
     if not os.path.isfile(env_path):
         say("ФАЙЛА НЕТ: программа работает только с переменными окружения.")
         info, file_values = {"defs": {}, "commented": {}, "near": [], "mtime": 0.0, "utf16": False, "bom": False}, {}
@@ -380,8 +392,10 @@ def run(env_path=config.ENV_FILE, project=HERE, login=True, again=False, ledger_
     say(f"Ящики, заданные в файле: {configured or 'нет'}")
 
     say("\n== Что может перекрывать local.env ==")
-    problems += override_findings(file_values, project, info["mtime"], say, scan_files=deep,
-                                  processes=python_processes if deep else (lambda: []))
+    found, notes = override_findings(file_values, project, info["mtime"], say, scan_files=deep,
+                                     processes=python_processes if deep else (lambda: []))
+    problems += found
+    warnings += notes
 
     readable = True
     try:
@@ -420,7 +434,9 @@ def run(env_path=config.ENV_FILE, project=HERE, login=True, again=False, ledger_
     say("\n== ИТОГ ==")
     for text in problems:
         say(f"  ! {text}")
-    for text in verdict(problems, results):
+    for text in warnings:
+        say(f"  ~ {text}")
+    for text in verdict(problems, results, warnings):
         say(text)
     if report_path:
         try:

@@ -238,21 +238,22 @@ class LoginCheckTest(unittest.TestCase):
         self.assertNotIn("ОТЛИЧАЕТСЯ", self.text(lines))
 
     def test_empty_environment_variable_is_reported_because_the_site_would_not_take_the_file(self):
-        found = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, self.dir.name, 0.0, lambda line: None,
-                                              scan_files=False, processes=lambda: [])
+        found, _ = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, self.dir.name, 0.0, lambda line: None,
+                                                 scan_files=False, processes=lambda: [])
         self.assertEqual(found, [])
         os.environ["MAILRU_APP_PASSWORD"] = ""
-        found = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, self.dir.name, 0.0, lambda line: None,
-                                              scan_files=False, processes=lambda: [])
+        found, _ = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, self.dir.name, 0.0, lambda line: None,
+                                                 scan_files=False, processes=lambda: [])
         self.assertTrue(any("пуста в окружении" in item for item in found))
 
     def test_process_started_before_the_last_save_of_local_env_is_reported(self):
         rows = [(1111, 100.0, "python run_local.py"), (2222, 900.0, "python run_local.py"), (3333, 100.0, "python other.py"),
                 (os.getpid(), 100.0, "python mailer.py")]
-        found = check_login.override_findings({}, self.dir.name, 500.0, lambda line: None, scan_files=False,
-                                              processes=lambda: rows)
-        self.assertEqual(len(found), 1)
-        self.assertIn("процесс 1111 (run_local)", found[0])
+        problems, warnings = check_login.override_findings({}, self.dir.name, 500.0, lambda line: None, scan_files=False,
+                                                           processes=lambda: rows)
+        self.assertEqual(problems, [])                                        # на вход самой проверки старый процесс не влияет
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("процесс 1111 (run_local)", warnings[0])
 
     def test_pycharm_run_configuration_with_a_different_value_is_reported(self):
         os.makedirs(os.path.join(self.dir.name, ".idea"))
@@ -262,10 +263,11 @@ class LoginCheckTest(unittest.TestCase):
         project = os.path.join(parent, "proj")
         os.makedirs(os.path.join(project, ".idea"))
         os.replace(os.path.join(self.dir.name, ".idea", "workspace.xml"), os.path.join(project, ".idea", "workspace.xml"))
-        found = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, project, 0.0, lambda line: None,
-                                              processes=lambda: [])
-        self.assertTrue(any("настройках запуска PyCharm" in item for item in found), found)
-        self.assertFalse(any("stale-value" in item for item in found))
+        problems, warnings = check_login.override_findings({"MAILRU_APP_PASSWORD": PASS1}, project, 0.0, lambda line: None,
+                                                           processes=lambda: [])
+        self.assertEqual(problems, [])
+        self.assertTrue(any("настройках запуска PyCharm" in item for item in warnings), warnings)
+        self.assertFalse(any("stale-value" in item for item in warnings))
 
     def test_another_copy_of_the_program_next_door_is_reported(self):
         parent = os.path.join(self.dir.name, "codes")
@@ -274,8 +276,27 @@ class LoginCheckTest(unittest.TestCase):
         os.makedirs(other)
         with open(os.path.join(other, "mailer.py"), "w"):
             pass
-        found = check_login.override_findings({}, project, 0.0, lambda line: None, processes=lambda: [])
-        self.assertTrue(any("другие копии программы (coldoutreach-old)" in item for item in found), found)
+        problems, warnings = check_login.override_findings({}, project, 0.0, lambda line: None, processes=lambda: [])
+        self.assertTrue(any("другие копии программы (coldoutreach-old)" in item for item in warnings), warnings)
+
+    def test_old_site_process_is_a_warning_and_cannot_explain_a_rejection_of_this_check(self):
+        text = "\n".join(check_login.verdict([], {2: "ok", 1: "auth"}, ["процесс 1 (run_local) запущен ДО ..."]))
+        self.assertIn("НЕ влияют", text)
+        self.assertNotIn("ЧИНИТЕ", text.upper().replace("ЧИНИТЕ ИХ ПЕРВЫМИ", "ЧИНИТЕ"))
+        self.assertIn("причина на стороне mail.ru", text)
+        with_problem = "\n".join(check_login.verdict(["MAILRU_APP_PASSWORD указан 2 раза"], {2: "ok", 1: "auth"}))
+        self.assertIn("чините их первыми", with_problem)
+        self.assertIn("Сначала исправьте замечания", with_problem)
+
+    def test_warnings_are_printed_with_their_own_mark(self):
+        self.write(GOOD)
+        with mock.patch.object(check_login, "override_findings", return_value=([], ["процесс 4321 (run_local) запущен ДО ..."])):
+            code, lines = self.run_check(login=False)
+        text = self.text(lines)
+        self.assertIn("  ~ процесс 4321 (run_local)", text)
+        self.assertNotIn("  ! процесс", text)
+        self.assertNotIn("Найдено замечаний", text)
+        self.assertIn("Предупреждений о других процессах: 1", text)
 
     def test_missing_env_file_is_reported_not_a_crash(self):
         code, lines = self.run_check(login=False)
